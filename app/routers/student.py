@@ -1,0 +1,641 @@
+"""Student — dashboard, cursos inscritos, tareas, quizzes, expediente, calendario."""
+from typing import Annotated
+from datetime import datetime, timezone as tz, timedelta
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select, and_, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.security import get_current_user, CurrentUser
+from app.core.db import get_db
+from app.models import (
+    Student, User, Enrollment, Course, Level, Module, Lesson, LessonProgress,
+    Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
+    ClassSession, SessionAttendance, Certificate, Notification, Material,
+    AttendanceState, QuestionType,
+)
+
+router = APIRouter(prefix="/student", tags=["student"])
+
+
+@router.get("/dashboard")
+async def student_dashboard(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403, "Solo estudiantes")
+
+    u = await db.get(User, user.user_id)
+    student = await db.get(Student, user.user_id)
+    if not student:
+        raise HTTPException(404, "Perfil de estudiante no encontrado")
+
+    now = datetime.now(tz.utc)
+    week_ahead = now + timedelta(days=7)
+
+    # Cursos inscritos activos
+    enrollments_stmt = (
+        select(Enrollment, Course, Level)
+        .join(Course, Enrollment.course_id == Course.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True))
+    )
+    enrollments_rows = (await db.execute(enrollments_stmt)).all()
+    enrollments = [{
+        "id": e.id, "course_id": c.id, "course_name": c.name,
+        "level_id": l.id, "level_code": l.code, "level_name": l.name,
+        "color": c.color, "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+        "final_grade": float(e.final_grade) if e.final_grade else None,
+    } for e, c, l in enrollments_rows]
+
+    # Próximas clases
+    next_sessions_stmt = (
+        select(ClassSession)
+        .where(
+            ClassSession.starts_at_utc > now,
+            ClassSession.starts_at_utc < week_ahead,
+            ClassSession.status == "scheduled",
+        )
+        .order_by(ClassSession.starts_at_utc)
+        .limit(5)
+    )
+    # Filtrar a las que correspondan al level del estudiante
+    if enrollments_rows:
+        level_ids = [l.id for e, c, l in enrollments_rows]
+        next_sessions_stmt = next_sessions_stmt.where(ClassSession.level_id.in_(level_ids))
+
+    sessions = (await db.execute(next_sessions_stmt)).scalars().all()
+    next_classes = []
+    for s in sessions:
+        teacher_user = await db.get(User, s.teacher_id)
+        next_classes.append({
+            "id": s.id, "title": s.title, "modality": s.modality.value,
+            "starts_at_utc": s.starts_at_utc.isoformat(),
+            "meeting_url": s.meeting_url,
+            "teacher_name": teacher_user.full_name if teacher_user else "—",
+        })
+
+    # Tareas pendientes
+    pending_assignments_q = (
+        select(Assignment).where(
+            (Assignment.level_id.in_([l.id for _, _, l in enrollments_rows])
+             if enrollments_rows else False)
+        )
+    ) if enrollments_rows else None
+    pending_assignments = 0
+    next_assignment = None
+    if pending_assignments_q is not None:
+        items = (await db.execute(pending_assignments_q.limit(30))).scalars().all()
+        for a in items:
+            sub = (await db.execute(
+                select(AssignmentSubmission).where(
+                    AssignmentSubmission.assignment_id == a.id,
+                    AssignmentSubmission.student_id == user.user_id,
+                )
+            )).scalar_one_or_none()
+            if not sub or sub.submitted_at is None:
+                pending_assignments += 1
+                if not next_assignment:
+                    next_assignment = {
+                        "id": a.id, "title": a.title,
+                        "due_at": a.due_at.isoformat() if a.due_at else None,
+                    }
+
+    # Quizzes disponibles
+    pending_quizzes = 0
+    if enrollments_rows:
+        level_ids = [l.id for _, _, l in enrollments_rows]
+        quizzes = (await db.execute(
+            select(Quiz).where(Quiz.level_id.in_(level_ids), Quiz.is_published.is_(True)).limit(20)
+        )).scalars().all()
+        for q in quizzes:
+            attempts = (await db.execute(
+                select(func.count()).select_from(QuizAttempt).where(
+                    QuizAttempt.quiz_id == q.id,
+                    QuizAttempt.student_id == user.user_id,
+                    QuizAttempt.submitted_at.is_not(None),
+                )
+            )).scalar() or 0
+            if attempts == 0:
+                pending_quizzes += 1
+
+    # Certificados
+    certs_count = (await db.execute(
+        select(func.count()).select_from(Certificate).where(
+            Certificate.student_id == user.user_id, Certificate.revoked.is_(False),
+        )
+    )).scalar() or 0
+
+    # Asistencia
+    attendances = (await db.execute(
+        select(SessionAttendance).where(
+            SessionAttendance.student_id == user.user_id,
+            SessionAttendance.state.is_not(None),
+        )
+    )).scalars().all()
+    total_att = len(attendances)
+    present_count = sum(1 for a in attendances if a.state in (AttendanceState.present, AttendanceState.late))
+    attendance_rate = int(present_count * 100 / total_att) if total_att else 0
+
+    # Última calificación
+    last_grade = (await db.execute(
+        select(AssignmentSubmission).where(
+            AssignmentSubmission.student_id == user.user_id,
+            AssignmentSubmission.score.is_not(None),
+        ).order_by(AssignmentSubmission.graded_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    last_grade_data = None
+    if last_grade:
+        a = await db.get(Assignment, last_grade.assignment_id)
+        last_grade_data = {
+            "assignment_title": a.title if a else "—",
+            "score": float(last_grade.score) if last_grade.score else None,
+            "max_score": float(a.max_score) if a else 100.0,
+        }
+
+    return {
+        "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
+                 "avatar_url": u.avatar_url, "role": "student"},
+        "stats": {
+            "enrolled_courses": len(enrollments),
+            "next_classes": len(next_classes),
+            "pending_assignments": pending_assignments,
+            "pending_quizzes": pending_quizzes,
+            "certificates": certs_count,
+            "attendance_rate": attendance_rate,
+        },
+        "enrollments": enrollments,
+        "next_classes": next_classes,
+        "next_assignment": next_assignment,
+        "last_grade": last_grade_data,
+    }
+
+
+@router.get("/courses")
+async def my_courses(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403)
+    stmt = (
+        select(Enrollment, Course, Level, User)
+        .join(Course, Enrollment.course_id == Course.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .outerjoin(User, Enrollment.teacher_id == User.id)
+        .where(Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True))
+    )
+    rows = (await db.execute(stmt)).all()
+    out = []
+    for e, c, l, t in rows:
+        # Calcular progreso del nivel
+        modules = (await db.execute(
+            select(Module).where(Module.level_id == l.id)
+        )).scalars().all()
+        mod_ids = [m.id for m in modules]
+        total_lessons = (await db.execute(
+            select(func.count()).select_from(Lesson).where(
+                Lesson.module_id.in_(mod_ids) if mod_ids else False,
+                Lesson.is_published.is_(True),
+            )
+        )).scalar() or 0
+        completed = (await db.execute(
+            select(func.count()).select_from(LessonProgress).where(
+                LessonProgress.student_id == user.user_id,
+                LessonProgress.is_completed.is_(True),
+            )
+        )).scalar() or 0
+        out.append({
+            "enrollment_id": e.id, "course_id": c.id, "course_name": c.name,
+            "course_color": c.color, "course_description": c.description,
+            "level_id": l.id, "level_code": l.code, "level_name": l.name,
+            "teacher_name": t.full_name if t else None,
+            "total_lessons": total_lessons,
+            "completed_lessons": min(completed, total_lessons),
+            "progress_pct": int(min(completed, total_lessons) * 100 / total_lessons) if total_lessons else 0,
+        })
+    return out
+
+
+@router.get("/assignments")
+async def my_assignments(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403)
+    enrollments = (await db.execute(
+        select(Enrollment.level_id).where(
+            Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
+        )
+    )).scalars().all()
+    if not enrollments:
+        return []
+    items = (await db.execute(
+        select(Assignment).where(Assignment.level_id.in_(enrollments))
+        .order_by(Assignment.due_at.asc().nullsfirst()).limit(40)
+    )).scalars().all()
+    out = []
+    for a in items:
+        sub = (await db.execute(
+            select(AssignmentSubmission).where(
+                AssignmentSubmission.assignment_id == a.id,
+                AssignmentSubmission.student_id == user.user_id,
+            )
+        )).scalar_one_or_none()
+        out.append({
+            "id": a.id, "title": a.title, "description": a.description,
+            "instructions": a.instructions,
+            "max_score": float(a.max_score),
+            "due_at": a.due_at.isoformat() if a.due_at else None,
+            "submitted": bool(sub and sub.submitted_at),
+            "graded": bool(sub and sub.graded_at),
+            "score": float(sub.score) if sub and sub.score else None,
+            "feedback": sub.feedback if sub else None,
+            "submission_id": sub.id if sub else None,
+            "submitted_at": sub.submitted_at.isoformat() if sub and sub.submitted_at else None,
+        })
+    return out
+
+
+@router.post("/assignments/{assignment_id}/submit")
+async def submit_assignment(
+    assignment_id: int, body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403)
+    a = await db.get(Assignment, assignment_id)
+    if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+    sub = (await db.execute(
+        select(AssignmentSubmission).where(
+            AssignmentSubmission.assignment_id == assignment_id,
+            AssignmentSubmission.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        sub = AssignmentSubmission(assignment_id=assignment_id, student_id=user.user_id)
+        db.add(sub)
+    sub.content = body.get("content")
+    sub.file_url = body.get("file_url")
+    sub.file_name = body.get("file_name")
+    sub.submitted_at = datetime.now(tz.utc)
+    await db.commit()
+    await db.refresh(sub)
+    return {"submission_id": sub.id, "submitted_at": sub.submitted_at.isoformat()}
+
+
+@router.get("/quizzes")
+async def my_quizzes(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403)
+    enrollments = (await db.execute(
+        select(Enrollment.level_id).where(
+            Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
+        )
+    )).scalars().all()
+    if not enrollments:
+        return []
+    items = (await db.execute(
+        select(Quiz).where(Quiz.level_id.in_(enrollments), Quiz.is_published.is_(True))
+        .order_by(Quiz.created_at.desc()).limit(40)
+    )).scalars().all()
+    out = []
+    for q in items:
+        attempts_q = (await db.execute(
+            select(QuizAttempt).where(
+                QuizAttempt.quiz_id == q.id,
+                QuizAttempt.student_id == user.user_id,
+            ).order_by(QuizAttempt.started_at.desc())
+        )).scalars().all()
+        last_attempt = attempts_q[0] if attempts_q else None
+        question_count = (await db.execute(
+            select(func.count()).select_from(QuizQuestion).where(QuizQuestion.quiz_id == q.id)
+        )).scalar() or 0
+        out.append({
+            "id": q.id, "title": q.title, "description": q.description,
+            "passing_score": float(q.passing_score), "max_attempts": q.max_attempts,
+            "question_count": question_count,
+            "attempts_used": len(attempts_q),
+            "last_score": float(last_attempt.score) if last_attempt and last_attempt.score else None,
+            "passed": last_attempt.passed if last_attempt else None,
+        })
+    return out
+
+
+@router.get("/quizzes/{quiz_id}")
+async def get_quiz(
+    quiz_id: int,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403)
+    quiz = await db.get(Quiz, quiz_id)
+    if not quiz or not quiz.is_published:
+        raise HTTPException(404, "Quiz no encontrado")
+    questions = (await db.execute(
+        select(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id).order_by(QuizQuestion.order_index)
+    )).scalars().all()
+    return {
+        "id": quiz.id, "title": quiz.title, "description": quiz.description,
+        "passing_score": float(quiz.passing_score),
+        "questions": [{
+            "id": q.id, "type": q.type.value, "statement": q.statement,
+            "options": q.options, "points": float(q.points),
+        } for q in questions],
+    }
+
+
+@router.post("/quizzes/{quiz_id}/submit")
+async def submit_quiz(
+    quiz_id: int, body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """body = {answers: [{question_id, answer}]}"""
+    if user.role != "student":
+        raise HTTPException(403)
+    quiz = await db.get(Quiz, quiz_id)
+    if not quiz:
+        raise HTTPException(404, "Quiz no encontrado")
+    answers = body.get("answers", [])
+    if not isinstance(answers, list):
+        raise HTTPException(400, "answers debe ser una lista")
+
+    # Crear intento
+    attempt = QuizAttempt(quiz_id=quiz_id, student_id=user.user_id)
+    db.add(attempt)
+    await db.flush()
+
+    total_points = 0.0
+    earned_points = 0.0
+    for ans in answers:
+        qid = ans.get("question_id")
+        student_ans = (ans.get("answer") or "").strip()
+        question = await db.get(QuizQuestion, qid)
+        if not question or question.quiz_id != quiz_id:
+            continue
+        total_points += float(question.points)
+        # Corrección automática
+        is_correct = None
+        if question.type in (QuestionType.multiple_choice, QuestionType.true_false, QuestionType.fill_blank):
+            is_correct = student_ans.lower() == question.correct_answer.strip().lower()
+        elif question.type == QuestionType.short_answer:
+            # exacta o similar simple
+            is_correct = student_ans.lower() == question.correct_answer.strip().lower()
+        pts = float(question.points) if is_correct else 0.0
+        earned_points += pts
+        db.add(QuizAnswer(
+            attempt_id=attempt.id, question_id=qid, answer=student_ans,
+            is_correct=is_correct, points_earned=pts,
+        ))
+
+    score_pct = (earned_points / total_points * 100) if total_points else 0
+    attempt.score = round(score_pct, 2)
+    attempt.passed = score_pct >= float(quiz.passing_score)
+    attempt.submitted_at = datetime.now(tz.utc)
+    await db.commit()
+
+    return {
+        "attempt_id": attempt.id,
+        "score": float(attempt.score),
+        "passed": attempt.passed,
+        "earned_points": earned_points,
+        "total_points": total_points,
+    }
+
+
+@router.get("/calendar")
+async def my_calendar(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Calendario de las próximas 4 semanas: clases + tareas + quizzes."""
+    if user.role != "student":
+        raise HTTPException(403)
+    now = datetime.now(tz.utc)
+    horizon = now + timedelta(days=28)
+
+    enrollments = (await db.execute(
+        select(Enrollment.level_id).where(
+            Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
+        )
+    )).scalars().all()
+
+    events = []
+    if enrollments:
+        sessions = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.level_id.in_(enrollments),
+                ClassSession.starts_at_utc >= now,
+                ClassSession.starts_at_utc < horizon,
+                ClassSession.status == "scheduled",
+            ).order_by(ClassSession.starts_at_utc)
+        )).scalars().all()
+        for s in sessions:
+            events.append({
+                "type": "class", "id": s.id, "title": s.title,
+                "starts_at": s.starts_at_utc.isoformat(),
+                "modality": s.modality.value,
+                "meeting_url": s.meeting_url,
+            })
+        assignments = (await db.execute(
+            select(Assignment).where(
+                Assignment.level_id.in_(enrollments),
+                Assignment.due_at >= now,
+                Assignment.due_at < horizon,
+            )
+        )).scalars().all()
+        for a in assignments:
+            events.append({
+                "type": "assignment", "id": a.id, "title": a.title,
+                "starts_at": a.due_at.isoformat() if a.due_at else None,
+            })
+    events.sort(key=lambda e: e["starts_at"] or "")
+    return events
+
+
+@router.get("/attendance")
+async def my_attendance(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    if user.role != "student":
+        raise HTTPException(403)
+    stmt = (
+        select(SessionAttendance, ClassSession)
+        .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+        .where(SessionAttendance.student_id == user.user_id)
+        .order_by(ClassSession.starts_at_utc.desc()).limit(50)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [{
+        "session_id": s.id, "title": s.title,
+        "date": s.starts_at_utc.isoformat(),
+        "state": a.state.value if a.state else None,
+        "notes": a.notes,
+    } for a, s in rows]
+
+
+@router.get("/certificates")
+async def my_certificates(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    certs = (await db.execute(
+        select(Certificate, Course, Level)
+        .join(Course, Certificate.course_id == Course.id)
+        .join(Level, Certificate.level_id == Level.id)
+        .where(Certificate.student_id == user.user_id, Certificate.revoked.is_(False))
+        .order_by(Certificate.issued_at.desc())
+    )).all()
+    return [{
+        "id": c.id, "code": c.code, "course_name": course.name,
+        "level_code": l.code, "level_name": l.name,
+        "hours": c.hours, "final_grade": float(c.final_grade) if c.final_grade else None,
+        "issued_at": c.issued_at.isoformat(), "color": course.color,
+    } for c, course, l in certs]
+
+
+@router.get("/notifications")
+async def my_notifications(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+    unread_only: bool = False,
+):
+    stmt = select(Notification).where(Notification.user_id == user.user_id)
+    if unread_only:
+        stmt = stmt.where(Notification.is_read.is_(False))
+    items = (await db.execute(stmt.order_by(Notification.created_at.desc()).limit(50))).scalars().all()
+    return [{
+        "id": n.id, "type": n.type.value, "title": n.title, "body": n.body,
+        "link": n.link, "is_read": n.is_read,
+        "created_at": n.created_at.isoformat(),
+    } for n in items]
+
+
+@router.post("/notifications/{notif_id}/read")
+async def mark_notification_read(
+    notif_id: str,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    n = await db.get(Notification, notif_id)
+    if not n or n.user_id != user.user_id:
+        raise HTTPException(404)
+    n.is_read = True
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/library")
+async def my_library(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+    course_id: int | None = None,
+    level_id: int | None = None,
+    type: str | None = None,
+):
+    """Biblioteca filtrable."""
+    stmt = select(Material).where(Material.is_public.is_(True))
+    if course_id:
+        stmt = stmt.where(Material.course_id == course_id)
+    if level_id:
+        stmt = stmt.where(Material.level_id == level_id)
+    if type:
+        stmt = stmt.where(Material.type == type)
+    materials = (await db.execute(stmt.order_by(Material.created_at.desc()).limit(100))).scalars().all()
+    return [{
+        "id": m.id, "title": m.title, "description": m.description,
+        "type": m.type.value, "url": m.url,
+        "course_id": m.course_id, "level_id": m.level_id,
+    } for m in materials]
+
+
+@router.get("/transcript")
+async def academic_transcript(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Expediente académico completo."""
+    if user.role != "student":
+        raise HTTPException(403)
+    u = await db.get(User, user.user_id)
+    st = await db.get(Student, user.user_id)
+
+    # Asistencia agregada
+    attendances = (await db.execute(
+        select(SessionAttendance).where(
+            SessionAttendance.student_id == user.user_id,
+            SessionAttendance.state.is_not(None),
+        )
+    )).scalars().all()
+    total_sessions = len(attendances)
+    present = sum(1 for a in attendances if a.state in (AttendanceState.present, AttendanceState.late))
+    attendance_rate = round(present * 100 / total_sessions, 1) if total_sessions else 0
+
+    # Notas
+    grades = (await db.execute(
+        select(AssignmentSubmission, Assignment)
+        .join(Assignment, AssignmentSubmission.assignment_id == Assignment.id)
+        .where(AssignmentSubmission.student_id == user.user_id,
+               AssignmentSubmission.score.is_not(None))
+    )).all()
+    avg_grade = None
+    if grades:
+        total_pct = sum(float(s.score) * 100 / float(a.max_score) for s, a in grades if a.max_score)
+        avg_grade = round(total_pct / len(grades), 1)
+
+    # Inscripciones (cursos cursados)
+    enrollments = (await db.execute(
+        select(Enrollment, Course, Level)
+        .join(Course, Enrollment.course_id == Course.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(Enrollment.student_id == user.user_id)
+    )).all()
+
+    # Certificados
+    certs = (await db.execute(
+        select(Certificate).where(Certificate.student_id == user.user_id, Certificate.revoked.is_(False))
+    )).scalars().all()
+
+    return {
+        "student": {
+            "id": u.id, "full_name": u.full_name, "email": u.email,
+            "phone": u.phone, "enrolled_at": st.enrolled_at.isoformat() if st else None,
+            "current_level_id": st.current_level_id if st else None,
+            "placement_done": st.placement_done if st else False,
+            "speaking_score": float(st.speaking_score) if st and st.speaking_score else None,
+            "listening_score": float(st.listening_score) if st and st.listening_score else None,
+            "reading_score": float(st.reading_score) if st and st.reading_score else None,
+            "writing_score": float(st.writing_score) if st and st.writing_score else None,
+        },
+        "stats": {
+            "total_sessions": total_sessions,
+            "attendance_rate": attendance_rate,
+            "avg_grade": avg_grade,
+            "total_assignments": len(grades),
+            "total_certificates": len(certs),
+        },
+        "enrollments": [{
+            "course_name": c.name, "level_code": l.code, "level_name": l.name,
+            "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+            "is_active": e.is_active,
+            "final_grade": float(e.final_grade) if e.final_grade else None,
+        } for e, c, l in enrollments],
+        "recent_grades": [{
+            "title": a.title, "score": float(s.score) if s.score else 0,
+            "max_score": float(a.max_score),
+            "graded_at": s.graded_at.isoformat() if s.graded_at else None,
+        } for s, a in grades[:10]],
+        "certificates": [{
+            "code": c.code, "issued_at": c.issued_at.isoformat(),
+        } for c in certs],
+    }
