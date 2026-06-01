@@ -72,6 +72,7 @@ async def main():
             db.add(u)
             await db.flush()
             db.add(Teacher(user_id=u.id, specialties=spec, modalities=mods, bio=bio))
+            await db.flush()  # Teacher debe existir antes de ser referenciado como FK
             teacher_ids[em] = u.id
             print(f"Profesor: {em} / Profe2026!")
 
@@ -204,6 +205,7 @@ async def main():
             s = Student(user_id=u.id, current_level_id=level_id, placement_done=True,
                        speaking_score=70.0, listening_score=72.0, reading_score=75.0, writing_score=68.0)
             db.add(s)
+            await db.flush()  # asegurar que Student exista antes del FK del Enrollment
             student_ids[em] = u.id
             # Inscripción
             db.add(Enrollment(
