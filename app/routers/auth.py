@@ -114,3 +114,25 @@ async def me(user: Annotated[CurrentUser, Depends(get_current_user)], db: AsyncS
             out.current_level_id = st.current_level_id
             out.placement_done = st.placement_done
     return out
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=72)
+
+
+@router.post("/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    u = await db.get(User, user.user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+    if not verify_password(body.current_password, u.password_hash):
+        raise HTTPException(400, "Contraseña actual incorrecta")
+    u.password_hash = hash_password(body.new_password)
+    await log_action(db, user.user_id, "change_password", "auth")
+    await db.commit()
+    return {"ok": True, "message": "Contraseña actualizada"}

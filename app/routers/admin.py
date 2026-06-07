@@ -703,3 +703,41 @@ async def audit_logs(
         } for l in logs],
         "page": page, "limit": limit,
     }
+
+
+@router.get("/levels-by-course/{course_id}")
+async def levels_by_course(
+    course_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista de niveles de un curso específico — para selects."""
+    levels = (await db.execute(
+        select(Level).where(Level.course_id == course_id).order_by(Level.order_index)
+    )).scalars().all()
+    return [{"id": l.id, "code": l.code, "name": l.name} for l in levels]
+
+
+@router.get("/teachers")
+async def list_teachers_simple(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista simple de profesores — para selects de asignación."""
+    teachers = (await db.execute(
+        select(User).where(User.role == UserRole.teacher, User.is_active.is_(True))
+    )).scalars().all()
+    return [{"id": t.id, "full_name": t.full_name, "email": t.email} for t in teachers]
+
+
+@router.get("/students-simple")
+async def list_students_simple(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista simple de estudiantes — para selects de inscripción/certificado."""
+    students = (await db.execute(
+        select(User).where(User.role == UserRole.student, User.is_active.is_(True))
+        .order_by(User.full_name)
+    )).scalars().all()
+    return [{"id": s.id, "full_name": s.full_name, "email": s.email} for s in students]

@@ -439,3 +439,56 @@ class InstituteSetting(Base):
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
 Index("ix_attendance_session", SessionAttendance.session_id)
 Index("ix_progress_student", LessonProgress.student_id)
+
+
+# ============= PLACEMENT TEST V2 =============
+class PlacementQuestion(Base):
+    """Preguntas del placement test. Diseñadas para expansión:
+    - difficulty_level y skill permiten test adaptativo futuro
+    - audio_url e image_url permiten listening/visual en futuro
+    - is_active permite curaduría sin borrar
+    """
+    __tablename__ = "placement_questions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    statement: Mapped[str] = mapped_column(Text)
+    option_a: Mapped[str] = mapped_column(String)
+    option_b: Mapped[str] = mapped_column(String)
+    option_c: Mapped[str] = mapped_column(String)
+    option_d: Mapped[str] = mapped_column(String)
+    correct_option: Mapped[str] = mapped_column(String)  # "a", "b", "c", "d"
+    difficulty_level: Mapped[str] = mapped_column(String)  # "A1","A2","B1","B2","C1"
+    skill: Mapped[str] = mapped_column(String, default="grammar")  # grammar/vocabulary/reading/listening
+    audio_url: Mapped[str | None] = mapped_column(String, nullable=True)  # preparado para listening
+    image_url: Mapped[str | None] = mapped_column(String, nullable=True)  # preparado para visual
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PlacementAnswer(Base):
+    """Cada respuesta del estudiante en su placement test.
+    Permite reconstruir el test y análisis detallado.
+    """
+    __tablename__ = "placement_answers"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    placement_test_id: Mapped[str] = mapped_column(ForeignKey("placement_tests.id", ondelete="CASCADE"))
+    question_id: Mapped[int] = mapped_column(ForeignKey("placement_questions.id"))
+    selected_option: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
+    answered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SpeakingRecording(Base):
+    """Preparada para V2 con IA tipo Whisper.
+    Por ahora vacía, solo estructura."""
+    __tablename__ = "speaking_recordings"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
+    prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    transcription: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fluency_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    pronunciation_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    accuracy_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    evaluated_by_ai: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

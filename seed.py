@@ -10,6 +10,7 @@ sys.path.insert(0, '.')
 from app.core.db import SessionLocal, init_db
 from app.core.security import hash_password
 from app.models import (
+    PlacementQuestion,
     User, Student, Teacher, Course, Level, Module, Lesson,
     Branch, Classroom, ClassSession, Enrollment, Quiz, QuizQuestion,
     Assignment, Material, Plan, Payment, Certificate, Notification,
@@ -340,6 +341,38 @@ async def main():
                 body="Explorá tus clases, tareas y materiales. ¡Mucho éxito!",
                 link="/dashboard/student",
             ))
+
+
+        # === 15. PLACEMENT QUESTIONS (15 preguntas mixtas A1-C1) ===
+        placement_questions = [
+            # A1 (3)
+            ("My name ___ Maria.", "is", "are", "am", "be", "a", "A1", "grammar"),
+            ("How ___ you? — I'm fine, thanks.", "is", "are", "be", "do", "b", "A1", "grammar"),
+            ("This is ___ apple.", "a", "an", "the", "any", "b", "A1", "vocabulary"),
+            # A2 (3)
+            ("I ___ to the store yesterday.", "go", "goes", "went", "gone", "c", "A2", "grammar"),
+            ("She is ___ than her sister.", "tall", "taller", "tallest", "more tall", "b", "A2", "grammar"),
+            ("If it ___ tomorrow, we won't go to the beach.", "rain", "rains", "rained", "will rain", "b", "A2", "grammar"),
+            # B1 (3)
+            ("I ___ here for five years.", "live", "am living", "have lived", "lived", "c", "B1", "grammar"),
+            ("She told me ___ wait for her.", "to", "for", "that", "about", "a", "B1", "grammar"),
+            ("The book ___ I bought yesterday is great.", "what", "which", "who", "whose", "b", "B1", "vocabulary"),
+            # B2 (3)
+            ("If I ___ more money, I would travel the world.", "have", "had", "would have", "had had", "b", "B2", "grammar"),
+            ("By the time you arrive, I ___ finished the report.", "will have", "have", "had", "will", "a", "B2", "grammar"),
+            ("She wishes she ___ taller.", "is", "were", "would be", "had been", "b", "B2", "grammar"),
+            # C1 (3)
+            ("Had I known about the meeting, I ___ attended.", "would have", "had", "have", "will have", "a", "C1", "grammar"),
+            ("She is hardly ___ to manage such complex situations.", "able", "capable", "skilled", "competent", "b", "C1", "vocabulary"),
+            ("The proposal was met with ___ enthusiasm from the committee.", "scarce", "scant", "scarcely", "scantly", "b", "C1", "vocabulary"),
+        ]
+        for i, (stmt, oa, ob, oc, od, correct, lvl, skill) in enumerate(placement_questions):
+            db.add(PlacementQuestion(
+                statement=stmt, option_a=oa, option_b=ob, option_c=oc, option_d=od,
+                correct_option=correct, difficulty_level=lvl, skill=skill,
+                order_index=i,
+            ))
+        print(f"{len(placement_questions)} preguntas de placement test")
 
         await db.commit()
 
