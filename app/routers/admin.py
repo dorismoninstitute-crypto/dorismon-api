@@ -741,3 +741,44 @@ async def list_students_simple(
         .order_by(User.full_name)
     )).scalars().all()
     return [{"id": s.id, "full_name": s.full_name, "email": s.email} for s in students]
+
+
+@router.get("/at-risk-students")
+async def at_risk_students(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Estudiantes con 3+ ausencias en sus últimas 10 clases."""
+    from app.models import AttendanceState as AS
+
+    # Obtener todos los estudiantes
+    students = (await db.execute(
+        select(User).where(User.role == UserRole.student)
+    )).scalars().all()
+
+    at_risk = []
+    for st in students:
+        # Últimos 10 attendance records con state asignado
+        attendances = (await db.execute(
+            select(SessionAttendance, ClassSession)
+            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+            .where(
+                SessionAttendance.student_id == st.id,
+                SessionAttendance.state.is_not(None),
+            )
+            .order_by(ClassSession.starts_at_utc.desc())
+            .limit(10)
+        )).all()
+        if not attendances:
+            continue
+        absent_count = sum(1 for a, _ in attendances if a.state == AS.absent)
+        if absent_count >= 3:
+            at_risk.append({
+                "student_id": st.id,
+                "full_name": st.full_name,
+                "email": st.email,
+                "absent_count": absent_count,
+                "total_recorded": len(attendances),
+                "absent_rate": round(absent_count * 100 / len(attendances), 1),
+            })
+    return at_risk

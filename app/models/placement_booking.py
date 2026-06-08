@@ -228,6 +228,7 @@ class ClassSession(Base):
     capacity: Mapped[int] = mapped_column(Integer, default=15)
     recording_url: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[SessionStatus] = mapped_column(default=SessionStatus.scheduled)
+    is_open_event: Mapped[bool] = mapped_column(Boolean, default=False)  # V1.2: evento abierto a cualquier estudiante
 
 
 class SessionAttendance(Base):
@@ -492,3 +493,15 @@ class SpeakingRecording(Base):
     accuracy_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     evaluated_by_ai: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============= EVENTOS ABIERTOS V1.2 =============
+class EventRegistration(Base):
+    """Registro de estudiante a un evento abierto (clase no-regular)."""
+    __tablename__ = "event_registrations"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id", ondelete="CASCADE"))
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("session_id", "student_id"),)

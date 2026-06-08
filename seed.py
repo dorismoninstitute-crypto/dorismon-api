@@ -343,6 +343,38 @@ async def main():
             ))
 
 
+
+        # === 14b. EVENTOS ABIERTOS (cualquier estudiante puede registrarse) ===
+        events_data = [
+            (1, 19, "english-general", "B1", "ana@dorismon.do", Modality.online,
+             "Conversation Club: Travel Stories",
+             "Practicá tu inglés conversando sobre experiencias de viaje. Abierto a niveles B1+.",
+             "https://meet.google.com/event-conv-1", None, None, 20),
+            (3, 18, "english-general", "A2", "luis@dorismon.do", Modality.presencial,
+             "Taller: Pronunciación del 'th'",
+             "Aprende a pronunciar correctamente el sonido más difícil del inglés. Abierto a todos los niveles.",
+             None, branch_ids[0], None, 12),
+            (5, 17, "business-english", "B2", "sara@dorismon.do", Modality.online,
+             "Office Hours con Sara",
+             "Sesión de preguntas y respuestas con Sara sobre TOEFL. Traé tus dudas.",
+             "https://zoom.us/j/office-hours", None, None, 25),
+            (7, 16, "english-general", "B1", "ana@dorismon.do", Modality.hibrida,
+             "Movie Night: An Inglés Subtitulado",
+             "Vemos una película en inglés y la discutimos. Lugar híbrido.",
+             "https://meet.google.com/event-movie", branch_ids[1], None, 30),
+        ]
+        for day, hour, course_code, lvl_code, t_email, mod, title, desc, mtg_url, b_id, c_id, cap in events_data:
+            start = (now + timedelta(days=day)).replace(hour=hour, minute=0, second=0, microsecond=0)
+            end = start + timedelta(minutes=60)
+            db.add(ClassSession(
+                course_id=course_ids[course_code], level_id=level_ids[(course_code, lvl_code)],
+                teacher_id=teacher_ids[t_email], title=title, description=desc, modality=mod,
+                starts_at_utc=start, ends_at_utc=end,
+                meeting_url=mtg_url, branch_id=b_id, classroom_id=c_id, capacity=cap,
+                is_open_event=True,  # EVENTO ABIERTO
+            ))
+        print(f"{len(events_data)} eventos abiertos creados")
+
         # === 15. PLACEMENT QUESTIONS (15 preguntas mixtas A1-C1) ===
         placement_questions = [
             # A1 (3)
