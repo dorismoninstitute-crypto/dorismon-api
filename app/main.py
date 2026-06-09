@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import auth, catalog, student, teacher, admin, certificates, placement, events
+from app.routers import auth, catalog, student, teacher, admin, certificates, placement, events, progress
 from app.core.db import init_db
 
 
@@ -36,6 +36,7 @@ app.include_router(admin.router)
 app.include_router(certificates.router)
 app.include_router(placement.router)
 app.include_router(events.router)
+app.include_router(progress.router)
 
 
 @app.get("/health", tags=["system"])

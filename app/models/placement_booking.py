@@ -107,6 +107,11 @@ class Student(Base):
     birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     emergency_contact: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pause_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    streak_days: Mapped[int] = mapped_column(Integer, default=0)
+    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Teacher(Base):
@@ -187,6 +192,7 @@ class Enrollment(Base):
     course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"))
     level_id: Mapped[int] = mapped_column(ForeignKey("levels.id"))
     teacher_id: Mapped[str | None] = mapped_column(ForeignKey("teachers.user_id"), nullable=True)
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey("plans.id"), nullable=True)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -229,6 +235,8 @@ class ClassSession(Base):
     recording_url: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[SessionStatus] = mapped_column(default=SessionStatus.scheduled)
     is_open_event: Mapped[bool] = mapped_column(Boolean, default=False)  # V1.2: evento abierto a cualquier estudiante
+    teacher_notes: Mapped[str | None] = mapped_column(Text, nullable=True)  # V1.3 notas del profe post-clase
+    module_id: Mapped[int | None] = mapped_column(ForeignKey("modules.id"), nullable=True)  # V1.3 vincular clase a módulo
 
 
 class SessionAttendance(Base):
@@ -505,3 +513,28 @@ class EventRegistration(Base):
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (UniqueConstraint("session_id", "student_id"),)
+
+
+
+# ============= V1.3 — Progress tracking =============
+class ModuleProgress(Base):
+    """Progreso del estudiante en un módulo (módulos completados/en progreso)."""
+    __tablename__ = "module_progress"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
+    module_id: Mapped[int] = mapped_column(ForeignKey("modules.id", ondelete="CASCADE"))
+    status: Mapped[str] = mapped_column(String, default="locked")  # locked, in_progress, completed
+    attended_count: Mapped[int] = mapped_column(Integer, default=0)
+    quiz_passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("student_id", "module_id"),)
+
+
+class PlanFeature(Base):
+    """Features editables de un plan (mientras más features, más caro)."""
+    __tablename__ = "plan_features"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id", ondelete="CASCADE"))
+    feature: Mapped[str] = mapped_column(String)
+    is_included: Mapped[bool] = mapped_column(Boolean, default=True)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)

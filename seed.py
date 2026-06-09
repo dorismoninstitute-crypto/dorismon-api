@@ -11,6 +11,7 @@ from app.core.db import SessionLocal, init_db
 from app.core.security import hash_password
 from app.models import (
     PlacementQuestion,
+    PlanFeature, ModuleProgress,
     User, Student, Teacher, Course, Level, Module, Lesson,
     Branch, Classroom, ClassSession, Enrollment, Quiz, QuizQuestion,
     Assignment, Material, Plan, Payment, Certificate, Notification,
@@ -174,6 +175,41 @@ async def main():
         db.add_all(plans)
         await db.flush()
         print(f"{len(plans)} planes")
+
+        # === 7b. Features estructuradas por plan (V1.3) ===
+        plan_features_data = {
+            "starter": [
+                ("8 clases grupales al mes (2 por semana)", True, 0),
+                ("Modalidad: solo online", True, 1),
+                ("Acceso a material básico", True, 2),
+                ("Eventos abiertos", False, 3),
+                ("Material descargable", False, 4),
+                ("Certificado al final del nivel", False, 5),
+            ],
+            "professional": [
+                ("16 clases grupales al mes (4 por semana)", True, 0),
+                ("Modalidad: online + híbrida", True, 1),
+                ("Hasta 2 eventos abiertos al mes", True, 2),
+                ("Material descargable completo", True, 3),
+                ("Certificado al final del nivel", True, 4),
+                ("Soporte por email del profesor", True, 5),
+                ("Acceso a TOEFL / Business", False, 6),
+            ],
+            "academy": [
+                ("24 clases grupales al mes (6 por semana)", True, 0),
+                ("Modalidad: online + presencial + híbrida", True, 1),
+                ("Eventos abiertos ilimitados", True, 2),
+                ("Material descargable + recursos premium", True, 3),
+                ("Certificado al final del nivel", True, 4),
+                ("Soporte directo del profesor", True, 5),
+                ("1 clase privada al mes", True, 6),
+                ("Acceso a TOEFL / Business / Conversación", True, 7),
+            ],
+        }
+        for plan in plans:
+            for feature_text, is_inc, idx in plan_features_data.get(plan.code, []):
+                db.add(PlanFeature(plan_id=plan.id, feature=feature_text, is_included=is_inc, order_index=idx))
+        print("Features de planes cargadas")
 
         # === 8. SEDES Y AULAS ===
         branches_data = [

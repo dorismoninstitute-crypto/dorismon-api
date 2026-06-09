@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import require_teacher_or_admin, CurrentUser
+from app.core.security import require_teacher_or_admin, CurrentUser, get_current_user
 from app.core.db import get_db
 from app.services.audit import log_action
 from app.models import (
@@ -166,6 +166,7 @@ async def get_attendance(
             "id": session.id, "title": session.title,
             "starts_at_utc": session.starts_at_utc.isoformat(),
             "modality": session.modality.value,
+            "teacher_notes": session.teacher_notes,
         },
         "students": out_students,
     }
@@ -209,6 +210,30 @@ async def save_attendance(
         updated += 1
     await log_action(db, teacher.user_id, "save_attendance", "teacher", target_id=session_id)
     await db.commit()
+
+    # V1.3: recomputar progreso de módulo para todos los estudiantes presentes
+    if session.module_id:
+        from app.models import ModuleProgress
+        for r in records:
+            sid = r.get("student_id")
+            state = r.get("state")
+            if not sid or state != "present":
+                continue
+            mp = (await db.execute(
+                select(ModuleProgress).where(
+                    ModuleProgress.student_id == sid,
+                    ModuleProgress.module_id == session.module_id,
+                )
+            )).scalar_one_or_none()
+            if not mp:
+                mp = ModuleProgress(student_id=sid, module_id=session.module_id, status="in_progress")
+                db.add(mp)
+            mp.attended_count = (mp.attended_count or 0) + 1
+            mp.status = "completed" if mp.attended_count >= 1 else "in_progress"
+            if mp.status == "completed" and not mp.completed_at:
+                mp.completed_at = now
+        await db.commit()
+
     return {"ok": True, "updated": updated}
 
 
@@ -478,3 +503,37 @@ async def add_observation(
     await log_action(db, teacher.user_id, "add_observation", "teacher", target_id=student_id)
     await db.commit()
     return {"id": o.id}
+
+
+@router.post("/sessions/{session_id}/notes")
+async def save_session_notes(
+    session_id: str, body: dict,
+    teacher: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Profe guarda notas para los estudiantes después de una clase."""
+    if teacher.role != "teacher":
+        raise HTTPException(403)
+    s = await db.get(ClassSession, session_id)
+    if not s: raise HTTPException(404)
+    if s.teacher_id != teacher.user_id:
+        raise HTTPException(403, "No sos el profe de esta clase")
+    s.teacher_notes = body.get("notes", "")
+    # Notificar a estudiantes que asistieron
+    if s.teacher_notes:
+        attendees = (await db.execute(
+            select(SessionAttendance).where(
+                SessionAttendance.session_id == session_id,
+                SessionAttendance.state == AttendanceState.present,
+            )
+        )).scalars().all()
+        for a in attendees:
+            db.add(Notification(
+                user_id=a.student_id,
+                type=NotificationType.info,
+                title=f"📝 Nota del profesor: {s.title}",
+                body=s.teacher_notes[:140] + ("..." if len(s.teacher_notes) > 140 else ""),
+                link="/dashboard/student",
+            ))
+    await db.commit()
+    return {"ok": True}

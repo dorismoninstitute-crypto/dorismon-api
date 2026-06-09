@@ -15,6 +15,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, Material, Plan, Payment,
     Certificate, InstituteSetting, AuditLog, Notification,
     UserRole, Modality, SessionStatus, MaterialType, PaymentStatus, NotificationType,
+    PlanFeature, ModuleProgress, EventRegistration,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -782,3 +783,351 @@ async def at_risk_students(
                 "absent_rate": round(absent_count * 100 / len(attendances), 1),
             })
     return at_risk
+
+
+# ============= V1.3 — EDICIÓN UNIVERSAL =============
+
+# --- Levels ---
+@router.patch("/levels/{level_id}")
+async def update_level(
+    level_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    lvl = await db.get(Level, level_id)
+    if not lvl: raise HTTPException(404)
+    for field in ["code", "name", "order_index", "is_active"]:
+        if field in body and body[field] is not None:
+            setattr(lvl, field, body[field])
+    await log_action(db, admin.user_id, "update_level", "levels", str(level_id))
+    await db.commit()
+    return {"ok": True}
+
+
+# --- Modules ---
+@router.patch("/modules/{module_id}")
+async def update_module(
+    module_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    m = await db.get(Module, module_id)
+    if not m: raise HTTPException(404)
+    for field in ["name", "description", "order_index"]:
+        if field in body and body[field] is not None:
+            setattr(m, field, body[field])
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/modules/{module_id}")
+async def delete_module(
+    module_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    m = await db.get(Module, module_id)
+    if not m: raise HTTPException(404)
+    # Borrar solo si no tiene lecciones
+    has_lessons = (await db.execute(select(func.count()).select_from(Lesson).where(Lesson.module_id == module_id))).scalar()
+    if has_lessons:
+        raise HTTPException(400, "El módulo tiene lecciones. Eliminá las lecciones primero.")
+    await db.delete(m)
+    await db.commit()
+    return {"ok": True}
+
+
+# --- Sessions PATCH (editar clase) ---
+@router.patch("/sessions/{session_id}")
+async def update_session(
+    session_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from datetime import timezone as tz
+    s = await db.get(ClassSession, session_id)
+    if not s: raise HTTPException(404)
+    # ¿Es pasada? Si sí, solo permite editar título/descripción
+    starts = s.starts_at_utc
+    if starts.tzinfo is None:
+        starts = starts.replace(tzinfo=tz.utc)
+    is_past = starts <= datetime.now(tz.utc)
+    allowed_past = {"title", "description", "recording_url", "teacher_notes"}
+    for field, value in body.items():
+        if is_past and field not in allowed_past:
+            continue  # ignorar campos no permitidos para clases pasadas
+        if field == "starts_at_utc" and value:
+            s.starts_at_utc = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        elif field == "ends_at_utc" and value:
+            s.ends_at_utc = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        elif field == "modality" and value:
+            s.modality = Modality(value)
+        elif hasattr(s, field):
+            setattr(s, field, value)
+    await log_action(db, admin.user_id, "update_session", "class_sessions", session_id)
+    await db.commit()
+    return {"ok": True, "is_past": is_past}
+
+
+# --- Enrollments PATCH (cambiar teacher, plan, level del estudiante) ---
+@router.patch("/enrollments/{enroll_id}")
+async def update_enrollment(
+    enroll_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    enr = await db.get(Enrollment, enroll_id)
+    if not enr: raise HTTPException(404)
+    old_teacher = enr.teacher_id
+    old_plan = enr.plan_id
+    old_level = enr.level_id
+    if "teacher_id" in body: enr.teacher_id = body["teacher_id"]
+    if "plan_id" in body: enr.plan_id = body["plan_id"]
+    if "level_id" in body: enr.level_id = body["level_id"]
+    if "is_active" in body: enr.is_active = body["is_active"]
+    # Notificar al estudiante del cambio
+    changes = []
+    if old_teacher != enr.teacher_id: changes.append("profesor")
+    if old_plan != enr.plan_id: changes.append("plan")
+    if old_level != enr.level_id: changes.append("nivel")
+    if changes:
+        db.add(Notification(
+            user_id=enr.student_id,
+            type=NotificationType.info,
+            title="📝 Cambios en tu inscripción",
+            body=f"Se actualizó tu {', '.join(changes)}. Consultá los detalles con un coordinador.",
+        ))
+    await log_action(db, admin.user_id, "update_enrollment", "enrollments", enroll_id)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/enrollments/{enroll_id}")
+async def delete_enrollment(
+    enroll_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Desactiva la inscripción (soft delete)."""
+    enr = await db.get(Enrollment, enroll_id)
+    if not enr: raise HTTPException(404)
+    enr.is_active = False
+    await log_action(db, admin.user_id, "deactivate_enrollment", "enrollments", enroll_id)
+    await db.commit()
+    return {"ok": True}
+
+
+# --- Branches y Classrooms PATCH ---
+@router.patch("/branches/{branch_id}")
+async def update_branch(
+    branch_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    b = await db.get(Branch, branch_id)
+    if not b: raise HTTPException(404)
+    for field in ["name", "address", "phone", "is_active"]:
+        if field in body and body[field] is not None:
+            setattr(b, field, body[field])
+    await db.commit()
+    return {"ok": True}
+
+
+@router.patch("/classrooms/{room_id}")
+async def update_classroom(
+    room_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    r = await db.get(Classroom, room_id)
+    if not r: raise HTTPException(404)
+    for field in ["name", "capacity", "is_active"]:
+        if field in body and body[field] is not None:
+            setattr(r, field, body[field])
+    await db.commit()
+    return {"ok": True}
+
+
+# --- PLANS — CRUD completo con features ---
+@router.patch("/plans/{plan_id}")
+async def update_plan(
+    plan_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    p = await db.get(Plan, plan_id)
+    if not p: raise HTTPException(404)
+    for field in ["name", "description", "price", "billing_cycle", "is_active"]:
+        if field in body and body[field] is not None:
+            setattr(p, field, body[field])
+    await log_action(db, admin.user_id, "update_plan", "plans", str(plan_id))
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/plans/{plan_id}")
+async def delete_plan(
+    plan_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Desactiva el plan (soft) si tiene inscripciones."""
+    p = await db.get(Plan, plan_id)
+    if not p: raise HTTPException(404)
+    # Si tiene enrollments activos, soft delete
+    has_enrollments = (await db.execute(
+        select(func.count()).select_from(Enrollment).where(
+            Enrollment.plan_id == plan_id, Enrollment.is_active.is_(True)
+        )
+    )).scalar()
+    if has_enrollments:
+        p.is_active = False
+        await log_action(db, admin.user_id, "deactivate_plan", "plans", str(plan_id))
+    else:
+        await db.delete(p)
+        await log_action(db, admin.user_id, "delete_plan", "plans", str(plan_id))
+    await db.commit()
+    return {"ok": True, "deactivated": bool(has_enrollments)}
+
+
+@router.get("/plans/{plan_id}/features")
+async def list_plan_features(
+    plan_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    feats = (await db.execute(
+        select(PlanFeature).where(PlanFeature.plan_id == plan_id).order_by(PlanFeature.order_index)
+    )).scalars().all()
+    return [{"id": f.id, "feature": f.feature, "is_included": f.is_included, "order_index": f.order_index} for f in feats]
+
+
+@router.post("/plans/{plan_id}/features", status_code=201)
+async def add_plan_feature(
+    plan_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    f = PlanFeature(
+        plan_id=plan_id,
+        feature=body.get("feature", ""),
+        is_included=body.get("is_included", True),
+        order_index=body.get("order_index", 0),
+    )
+    db.add(f)
+    await db.commit()
+    return {"id": f.id}
+
+
+@router.patch("/plan-features/{feature_id}")
+async def update_plan_feature(
+    feature_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    f = await db.get(PlanFeature, feature_id)
+    if not f: raise HTTPException(404)
+    if "feature" in body: f.feature = body["feature"]
+    if "is_included" in body: f.is_included = body["is_included"]
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/plan-features/{feature_id}")
+async def delete_plan_feature(
+    feature_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    f = await db.get(PlanFeature, feature_id)
+    if not f: raise HTTPException(404)
+    await db.delete(f)
+    await db.commit()
+    return {"ok": True}
+
+
+# --- Courses DELETE (soft) ---
+@router.delete("/courses/{course_id}")
+async def deactivate_course(
+    course_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    c = await db.get(Course, course_id)
+    if not c: raise HTTPException(404)
+    # Si tiene enrollments activos → solo desactiva
+    has_enr = (await db.execute(
+        select(func.count()).select_from(Enrollment).where(
+            Enrollment.course_id == course_id, Enrollment.is_active.is_(True)
+        )
+    )).scalar()
+    c.is_active = False
+    await log_action(db, admin.user_id, "deactivate_course", "courses", str(course_id))
+    await db.commit()
+    return {"ok": True, "had_enrollments": bool(has_enr)}
+
+
+# --- PAUSE/RESUME estudiante ---
+@router.post("/students/{student_id}/pause")
+async def pause_student(
+    student_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from datetime import timezone as tz
+    st = await db.get(Student, student_id)
+    if not st: raise HTTPException(404, "Estudiante no encontrado")
+    if st.is_paused:
+        raise HTTPException(400, "El estudiante ya está pausado")
+    st.is_paused = True
+    st.paused_at = datetime.now(tz.utc)
+    st.pause_reason = body.get("reason", "Sin especificar")
+    # Desactivar enrollments temporalmente? NO — los dejamos activos para que se conserve progreso
+    db.add(Notification(
+        user_id=student_id,
+        type=NotificationType.info,
+        title="⏸ Tu cuenta fue pausada",
+        body=f"Razón: {st.pause_reason}. Reactivá con un coordinador cuando quieras volver.",
+    ))
+    await log_action(db, admin.user_id, "pause_student", "students", student_id)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/students/{student_id}/resume")
+async def resume_student(
+    student_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    st = await db.get(Student, student_id)
+    if not st: raise HTTPException(404)
+    if not st.is_paused:
+        raise HTTPException(400, "El estudiante no está pausado")
+    st.is_paused = False
+    st.paused_at = None
+    st.pause_reason = None
+    db.add(Notification(
+        user_id=student_id,
+        type=NotificationType.info,
+        title="▶ Tu cuenta fue reactivada",
+        body="Bienvenido de vuelta. Continuá donde lo dejaste.",
+    ))
+    await log_action(db, admin.user_id, "resume_student", "students", student_id)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.get("/paused-students")
+async def list_paused_students(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (await db.execute(
+        select(Student, User).join(User, Student.user_id == User.id).where(Student.is_paused.is_(True))
+    )).all()
+    return [{
+        "student_id": s.user_id, "full_name": u.full_name, "email": u.email,
+        "paused_at": s.paused_at.isoformat() if s.paused_at else None,
+        "reason": s.pause_reason,
+    } for s, u in rows]
