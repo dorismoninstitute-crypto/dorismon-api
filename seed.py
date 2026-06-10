@@ -244,10 +244,17 @@ async def main():
             db.add(s)
             await db.flush()  # asegurar que Student exista antes del FK del Enrollment
             student_ids[em] = u.id
-            # Inscripción
+            # V1.5: Asignar profe según nivel (Ana → B1+, Luis → A1/A2, Sara → C1+)
+            if lvl_code in ("A1", "A2"):
+                assigned_teacher = teacher_ids["luis@dorismon.do"]
+            elif lvl_code in ("B1", "B2"):
+                assigned_teacher = teacher_ids["ana@dorismon.do"]
+            else:
+                assigned_teacher = teacher_ids["sara@dorismon.do"]
+            # Inscripción CON profe asignado
             db.add(Enrollment(
                 student_id=u.id, course_id=course_ids[course_code],
-                level_id=level_id, teacher_id=teacher_ids["ana@dorismon.do"],
+                level_id=level_id, teacher_id=assigned_teacher,
             ))
             print(f"Estudiante: {em} / Estudiante2026!")
 
@@ -278,11 +285,17 @@ async def main():
         for day, hour, course_code, lvl_code, t_email, mod, title, mtg_url, b_id, c_id in sessions_data:
             start = (now + timedelta(days=day)).replace(hour=hour, minute=0, second=0, microsecond=0)
             end = start + timedelta(minutes=90)
+            # V1.5: Vincular cada clase al primer módulo de su nivel
+            lvl_id_for_session = level_ids[(course_code, lvl_code)]
+            mod_for_session = (await db.execute(
+                select(Module).where(Module.level_id == lvl_id_for_session).order_by(Module.order_index).limit(1)
+            )).scalar_one_or_none()
             db.add(ClassSession(
-                course_id=course_ids[course_code], level_id=level_ids[(course_code, lvl_code)],
+                course_id=course_ids[course_code], level_id=lvl_id_for_session,
                 teacher_id=teacher_ids[t_email], title=title, modality=mod,
                 starts_at_utc=start, ends_at_utc=end,
                 meeting_url=mtg_url, branch_id=b_id, classroom_id=c_id, capacity=12,
+                module_id=mod_for_session.id if mod_for_session else None,
             ))
         print(f"{len(sessions_data)} clases programadas")
 

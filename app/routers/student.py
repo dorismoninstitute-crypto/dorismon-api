@@ -41,12 +41,19 @@ async def student_dashboard(
         .where(Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True))
     )
     enrollments_rows = (await db.execute(enrollments_stmt)).all()
-    enrollments = [{
-        "id": e.id, "course_id": c.id, "course_name": c.name,
-        "level_id": l.id, "level_code": l.code, "level_name": l.name,
-        "color": c.color, "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
-        "final_grade": float(e.final_grade) if e.final_grade else None,
-    } for e, c, l in enrollments_rows]
+    enrollments = []
+    for e, c, l in enrollments_rows:
+        teacher_name = None
+        if e.teacher_id:
+            t_user = await db.get(User, e.teacher_id)
+            teacher_name = t_user.full_name if t_user else None
+        enrollments.append({
+            "id": e.id, "course_id": c.id, "course_name": c.name,
+            "level_id": l.id, "level_code": l.code, "level_name": l.name,
+            "color": c.color, "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            "final_grade": float(e.final_grade) if e.final_grade else None,
+            "teacher_id": e.teacher_id, "teacher_name": teacher_name,  # V1.5
+        })
 
     # Próximas clases
     next_sessions_stmt = (

@@ -121,6 +121,7 @@ class Teacher(Base):
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
     specialties: Mapped[str] = mapped_column(String, default="")
     modalities: Mapped[str] = mapped_column(String, default="online")
+    levels_taught: Mapped[str | None] = mapped_column(String, nullable=True)  # V1.5.1: "A1,A2,B1" — niveles que enseña
     hire_date: Mapped[date] = mapped_column(Date, default=date.today)
 
 

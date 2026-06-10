@@ -537,3 +537,93 @@ async def save_session_notes(
             ))
     await db.commit()
     return {"ok": True}
+
+
+# ============= V1.5 — MIS ESTUDIANTES =============
+@router.get("/my-students")
+async def teacher_my_students(
+    teacher: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5: Estudiantes asignados a este profesor (vía Enrollment.teacher_id).
+
+    Si el profe no tiene enrollments con teacher_id=él, devolvemos lista vacía.
+    Para que un estudiante aparezca, el admin debe asignar el profe en la inscripción.
+    """
+    if teacher.role != "teacher":
+        raise HTTPException(403)
+
+    rows = (await db.execute(
+        select(Enrollment, User, Student, Course, Level)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Student, Enrollment.student_id == Student.user_id)
+        .join(Course, Enrollment.course_id == Course.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(
+            Enrollment.teacher_id == teacher.user_id,
+            Enrollment.is_active.is_(True),
+        )
+    )).all()
+
+    out = []
+    for enr, u, st, course, level in rows:
+        # Asistencia % del estudiante en clases pasadas del profe
+        from datetime import timezone as tz
+        att_rows = (await db.execute(
+            select(SessionAttendance.state)
+            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+            .where(
+                SessionAttendance.student_id == u.id,
+                ClassSession.teacher_id == teacher.user_id,
+                ClassSession.starts_at_utc < datetime.now(tz.utc),
+            )
+        )).all()
+        total_att = len(att_rows)
+        present = sum(1 for (st_state,) in att_rows if st_state == AttendanceState.present)
+        attendance_pct = round((present / total_att) * 100, 1) if total_att > 0 else None
+
+        out.append({
+            "student_id": u.id,
+            "full_name": u.full_name,
+            "email": u.email,
+            "phone": u.phone,
+            "course_name": course.name,
+            "level_code": level.code,
+            "level_name": level.name,
+            "enrolled_at": enr.enrolled_at.isoformat() if enr.enrolled_at else None,
+            "is_paused": st.is_paused,
+            "attendance_pct": attendance_pct,
+            "total_classes_with_me": total_att,
+        })
+    return out
+
+
+@router.get("/my-students-by-level")
+async def teacher_students_by_level(
+    teacher: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5: Estudiantes del profe agrupados por nivel."""
+    if teacher.role != "teacher":
+        raise HTTPException(403)
+
+    rows = (await db.execute(
+        select(Enrollment, User, Level)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(
+            Enrollment.teacher_id == teacher.user_id,
+            Enrollment.is_active.is_(True),
+        )
+    )).all()
+
+    by_level: dict = {}
+    for enr, u, level in rows:
+        key = (level.id, level.code, level.name)
+        by_level.setdefault(key, []).append({
+            "id": u.id, "full_name": u.full_name, "email": u.email,
+        })
+    return [
+        {"level_id": k[0], "level_code": k[1], "level_name": k[2], "students": v, "count": len(v)}
+        for k, v in by_level.items()
+    ]

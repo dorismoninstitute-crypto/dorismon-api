@@ -81,7 +81,22 @@ async def get_redis():
 
 
 async def init_db():
-    """Crea todas las tablas la primera vez. Se llama al arrancar la app."""
+    """Crea todas las tablas la primera vez. Se llama al arrancar la app.
+
+    V1.5.1: Migración suave — agrega columnas nuevas a tablas existentes sin perder datos.
+    """
     from app.models.placement_booking import Base
+    from sqlalchemy import text as sa_text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # V1.5.1: Migración suave de columnas nuevas (idempotente)
+        # Cada ALTER TABLE puede fallar si la columna ya existe — capturamos y seguimos
+        migrations = [
+            "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS levels_taught VARCHAR",
+        ]
+        for m in migrations:
+            try:
+                await conn.execute(sa_text(m))
+            except Exception:
+                pass  # ignorar si la columna ya existe o no es soportado por SQLite

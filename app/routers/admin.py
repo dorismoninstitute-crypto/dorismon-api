@@ -69,6 +69,22 @@ async def admin_dashboard(
         select(func.count()).select_from(Certificate).where(Certificate.revoked.is_(False))
     )).scalar() or 0
 
+    # V1.5.1: Estudiantes sin profesor asignado
+    unassigned_students = (await db.execute(
+        select(func.count()).select_from(Enrollment).where(
+            Enrollment.teacher_id.is_(None),
+            Enrollment.is_active.is_(True),
+        )
+    )).scalar() or 0
+    # V1.5.1: Profesores sin estudiantes asignados
+    teachers_with_students_q = (await db.execute(
+        select(Enrollment.teacher_id).where(
+            Enrollment.teacher_id.is_not(None), Enrollment.is_active.is_(True),
+        ).distinct()
+    )).scalars().all()
+    teachers_with_students = set(teachers_with_students_q)
+    teachers_without_students = max(0, total_teachers - len(teachers_with_students))
+
     return {
         "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
                  "avatar_url": u.avatar_url, "role": "super_admin"},
@@ -81,6 +97,8 @@ async def admin_dashboard(
             "income_month": income_month,
             "pending_payments": pending_payments,
             "certificates_issued": certs_issued,
+            "unassigned_students": unassigned_students,  # V1.5.1
+            "teachers_without_students": teachers_without_students,  # V1.5.1
         },
     }
 
@@ -423,6 +441,8 @@ async def create_session(
         meeting_url=body.get("meeting_url"),
         branch_id=body.get("branch_id"), classroom_id=body.get("classroom_id"),
         capacity=body.get("capacity", 15),
+        module_id=body.get("module_id"),  # V1.5
+        is_open_event=body.get("is_open_event", False),
     )
     db.add(s)
     await db.flush()
@@ -478,15 +498,27 @@ async def list_enrollments(
         stmt = stmt.where(Enrollment.student_id == student_id)
     stmt = stmt.order_by(Enrollment.enrolled_at.desc()).limit(200)
     rows = (await db.execute(stmt)).all()
-    return [{
-        "id": e.id, "student_id": u.id, "student_name": u.full_name,
-        "course_id": c.id, "course_name": c.name,
-        "level_id": l.id, "level_code": l.code,
-        "teacher_id": e.teacher_id,
-        "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
-        "is_active": e.is_active,
-        "final_grade": float(e.final_grade) if e.final_grade else None,
-    } for e, u, c, l in rows]
+    out = []
+    for e, u, c, l in rows:
+        teacher_name = None
+        plan_name = None
+        if e.teacher_id:
+            t_user = await db.get(User, e.teacher_id)
+            teacher_name = t_user.full_name if t_user else None
+        if e.plan_id:
+            p = await db.get(Plan, e.plan_id)
+            plan_name = p.name if p else None
+        out.append({
+            "id": e.id, "student_id": u.id, "student_name": u.full_name,
+            "course_id": c.id, "course_name": c.name,
+            "level_id": l.id, "level_code": l.code, "level_name": l.name,
+            "teacher_id": e.teacher_id, "teacher_name": teacher_name,  # V1.5
+            "plan_id": e.plan_id, "plan_name": plan_name,  # V1.5
+            "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            "is_active": e.is_active,
+            "final_grade": float(e.final_grade) if e.final_grade else None,
+        })
+    return out
 
 
 @router.post("/enrollments", status_code=201)
@@ -498,18 +530,63 @@ async def create_enrollment(
     for f in ("student_id", "course_id", "level_id"):
         if not body.get(f):
             raise HTTPException(400)
+
+    teacher_id = body.get("teacher_id")
+    auto_assigned = False
+
+    # V1.5.1: Si no se especifica profe, auto-asignar al menos cargado del nivel
+    if not teacher_id:
+        # Buscar el nivel
+        level = await db.get(Level, body["level_id"])
+        if level:
+            # Buscar profes que enseñan ese nivel
+            all_teachers_rows = (await db.execute(
+                select(Teacher, User).join(User, Teacher.user_id == User.id)
+                .where(User.is_active.is_(True), User.role == UserRole.teacher)
+            )).all()
+
+            explicit_candidates = []
+            inferred_candidates = []
+            no_config_candidates = []
+
+            for t, u in all_teachers_rows:
+                explicit = set(s.strip().upper() for s in (t.levels_taught or "").split(",") if s.strip())
+                load = (await db.execute(
+                    select(func.count()).select_from(Enrollment).where(
+                        Enrollment.teacher_id == u.id, Enrollment.is_active.is_(True),
+                    )
+                )).scalar() or 0
+                if level.code in explicit:
+                    explicit_candidates.append((u.id, load, u.full_name))
+                elif not explicit:
+                    no_config_candidates.append((u.id, load, u.full_name))
+                else:
+                    count_in_level = (await db.execute(
+                        select(func.count()).select_from(Enrollment).where(
+                            Enrollment.teacher_id == u.id,
+                            Enrollment.level_id == level.id,
+                            Enrollment.is_active.is_(True),
+                        )
+                    )).scalar() or 0
+                    if count_in_level > 0:
+                        inferred_candidates.append((u.id, load, u.full_name))
+
+            candidates = explicit_candidates or inferred_candidates or no_config_candidates
+            if candidates:
+                candidates.sort(key=lambda x: x[1])
+                teacher_id = candidates[0][0]
+                auto_assigned = True
+
     e = Enrollment(
         student_id=body["student_id"], course_id=body["course_id"],
-        level_id=body["level_id"], teacher_id=body.get("teacher_id"),
+        level_id=body["level_id"], teacher_id=teacher_id,
         plan_id=body.get("plan_id"),
     )
     db.add(e)
     # V1.4.1: Actualizar nivel del estudiante + marcar placement_done
-    # (caso: admin inscribe directamente sin que el estudiante haga test)
     st = await db.get(Student, body["student_id"])
     if st:
         st.current_level_id = body["level_id"]
-        # Si nunca hizo placement test pero admin lo está asignando, lo marcamos como hecho
         if not st.placement_done:
             st.placement_done = True
     # Notificación al estudiante
@@ -520,9 +597,21 @@ async def create_enrollment(
         body="Has sido inscrito en un curso. Revisá tu dashboard.",
         link="/dashboard/student",
     ))
-    await log_action(db, admin.user_id, "enroll", "admin", target_id=e.id)
+    # V1.5.1: Notificar al profe si fue auto-asignado
+    if auto_assigned and teacher_id:
+        st_user = await db.get(User, body["student_id"])
+        level_obj = await db.get(Level, body["level_id"])
+        db.add(Notification(
+            user_id=teacher_id,
+            type=NotificationType.info,
+            title="👥 Nuevo estudiante asignado",
+            body=f"{st_user.full_name if st_user else 'Estudiante'} fue asignado a tu grupo de {level_obj.code if level_obj else ''}.",
+            link="/dashboard/teacher/students",
+        ))
+    await log_action(db, admin.user_id, "enroll", "admin", target_id=e.id,
+                     details=f"auto_assigned={auto_assigned}")
     await db.commit()
-    return {"id": e.id}
+    return {"id": e.id, "auto_assigned_teacher_id": teacher_id if auto_assigned else None}
 
 
 # === PLANES Y PAGOS ===
@@ -1397,4 +1486,266 @@ async def validate_meeting_url(
     return {
         "valid": False, "type": None,
         "reason": "Link no válido. Debe empezar con https:// y ser de Zoom, Google Meet o Microsoft Teams.",
+    }
+
+
+# ============= V1.5.1 — LEVELS TAUGHT + AUTO-ASSIGN =============
+@router.get("/teachers-by-level/{level_code}")
+async def teachers_by_level(
+    level_code: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5.1: Lista profes que enseñan un nivel específico, con carga actual.
+
+    Combina:
+    1. Profes que tienen ese nivel en su campo `levels_taught` (explícito)
+    2. Profes que ya tienen al menos 1 estudiante de ese nivel (inferido)
+    """
+    # Buscar el nivel
+    level = (await db.execute(
+        select(Level).where(Level.code == level_code.upper()).limit(1)
+    )).scalar_one_or_none()
+    if not level:
+        raise HTTPException(404, "Nivel no encontrado")
+
+    # Todos los profes activos
+    all_teachers_rows = (await db.execute(
+        select(Teacher, User).join(User, Teacher.user_id == User.id)
+        .where(User.is_active.is_(True), User.role == UserRole.teacher)
+    )).all()
+
+    out = []
+    for t, u in all_teachers_rows:
+        # ¿Enseña este nivel? (explícito o inferido)
+        explicit_levels = [s.strip().upper() for s in (t.levels_taught or "").split(",") if s.strip()]
+        teaches_explicit = level_code.upper() in explicit_levels
+
+        # Conteo de estudiantes en este nivel asignados a él
+        student_count = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.teacher_id == u.id,
+                Enrollment.level_id == level.id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalar() or 0
+
+        # Total de estudiantes (todos los niveles)
+        total_students = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.teacher_id == u.id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalar() or 0
+
+        # Si tiene marcado el nivel O ya tiene estudiantes ahí, incluirlo
+        if teaches_explicit or student_count > 0 or not explicit_levels:
+            # Si no tiene levels_taught configurado (None), lo incluimos todos como "potencial"
+            out.append({
+                "teacher_id": u.id,
+                "full_name": u.full_name,
+                "email": u.email,
+                "teaches_explicit": teaches_explicit,
+                "student_count_this_level": student_count,
+                "total_students": total_students,
+                "levels_taught": explicit_levels,
+            })
+
+    # Ordenar por carga (menos estudiantes primero)
+    out.sort(key=lambda x: (x["student_count_this_level"], x["total_students"]))
+    return out
+
+
+@router.patch("/teachers/{teacher_id}/levels")
+async def update_teacher_levels(
+    teacher_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5.1: Actualiza los niveles que enseña un profe."""
+    t = await db.get(Teacher, teacher_id)
+    if not t:
+        raise HTTPException(404, "Profesor no encontrado")
+    levels = body.get("levels", [])
+    if not isinstance(levels, list):
+        raise HTTPException(400, "levels debe ser array")
+    # Validar códigos
+    valid_codes = {"A1", "A2", "B1", "B2", "C1", "C2"}
+    cleaned = [str(c).strip().upper() for c in levels if str(c).strip().upper() in valid_codes]
+    t.levels_taught = ",".join(cleaned) if cleaned else None
+    await log_action(db, admin.user_id, "update_teacher_levels", "teachers", teacher_id)
+    await db.commit()
+    return {"ok": True, "levels": cleaned}
+
+
+@router.get("/teachers/{teacher_id}/levels")
+async def get_teacher_levels(
+    teacher_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5.1: Niveles que enseña un profe."""
+    t = await db.get(Teacher, teacher_id)
+    if not t:
+        raise HTTPException(404)
+    explicit = [s.strip().upper() for s in (t.levels_taught or "").split(",") if s.strip()]
+    return {"teacher_id": teacher_id, "levels": explicit}
+
+
+@router.get("/unassigned-students")
+async def list_unassigned_students(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5.1: Inscripciones activas sin profesor asignado."""
+    rows = (await db.execute(
+        select(Enrollment, User, Level, Course)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .join(Course, Enrollment.course_id == Course.id)
+        .where(
+            Enrollment.teacher_id.is_(None),
+            Enrollment.is_active.is_(True),
+        )
+    )).all()
+    return [{
+        "enrollment_id": e.id,
+        "student_id": u.id,
+        "student_name": u.full_name,
+        "student_email": u.email,
+        "course_name": c.name,
+        "level_id": l.id,
+        "level_code": l.code,
+        "level_name": l.name,
+    } for e, u, l, c in rows]
+
+
+@router.post("/auto-assign-teachers")
+async def auto_assign_teachers(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.5.1: Distribuye automáticamente los estudiantes sin profe entre los disponibles.
+
+    Lógica:
+    1. Para cada inscripción sin profe (teacher_id IS NULL, is_active = true)
+    2. Busca profes que enseñan ese nivel (explícito o inferido del histórico)
+    3. Asigna al profe con menos carga total
+    4. Si NO hay profe para ese nivel, lo deja sin asignar
+    5. Notifica al estudiante y al profe
+    """
+    # Obtener inscripciones sin profe
+    rows = (await db.execute(
+        select(Enrollment, Level).join(Level, Enrollment.level_id == Level.id).where(
+            Enrollment.teacher_id.is_(None),
+            Enrollment.is_active.is_(True),
+        )
+    )).all()
+
+    if not rows:
+        return {"ok": True, "assigned": 0, "skipped": 0, "details": []}
+
+    # Obtener todos los profes con su carga actual
+    all_teachers_rows = (await db.execute(
+        select(Teacher, User).join(User, Teacher.user_id == User.id)
+        .where(User.is_active.is_(True), User.role == UserRole.teacher)
+    )).all()
+
+    # Map: teacher_id -> {explicit_levels: set, current_load: int}
+    teacher_info = {}
+    for t, u in all_teachers_rows:
+        explicit = set(s.strip().upper() for s in (t.levels_taught or "").split(",") if s.strip())
+        current_load = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.teacher_id == u.id, Enrollment.is_active.is_(True),
+            )
+        )).scalar() or 0
+        teacher_info[u.id] = {
+            "user": u,
+            "explicit_levels": explicit,
+            "current_load": current_load,
+        }
+
+    assigned_count = 0
+    skipped = []
+    details = []
+
+    for e, level in rows:
+        # Candidatos: profes que enseñan este nivel
+        # Prioridad: 1) Explícito 2) Ya tiene estudiantes del nivel
+        explicit_candidates = []
+        inferred_candidates = []
+        no_config_candidates = []
+
+        for tid, info in teacher_info.items():
+            if level.code in info["explicit_levels"]:
+                explicit_candidates.append((tid, info))
+            elif not info["explicit_levels"]:
+                # Profe sin levels_taught configurado → puede enseñar cualquier nivel
+                no_config_candidates.append((tid, info))
+            else:
+                # Verificar si ya tiene estudiantes del nivel
+                count_in_level = (await db.execute(
+                    select(func.count()).select_from(Enrollment).where(
+                        Enrollment.teacher_id == tid,
+                        Enrollment.level_id == level.id,
+                        Enrollment.is_active.is_(True),
+                    )
+                )).scalar() or 0
+                if count_in_level > 0:
+                    inferred_candidates.append((tid, info))
+
+        # Elegir el candidato con menos carga
+        candidates = explicit_candidates or inferred_candidates or no_config_candidates
+        if not candidates:
+            skipped.append({
+                "enrollment_id": e.id, "level_code": level.code,
+                "reason": "No hay profesor configurado para este nivel",
+            })
+            continue
+
+        # Ordenar por carga (menos primero)
+        candidates.sort(key=lambda x: x[1]["current_load"])
+        chosen_tid, chosen_info = candidates[0]
+
+        # Asignar
+        e.teacher_id = chosen_tid
+        teacher_info[chosen_tid]["current_load"] += 1
+        assigned_count += 1
+
+        # Notificar al estudiante
+        db.add(Notification(
+            user_id=e.student_id,
+            type=NotificationType.info,
+            title="👨‍🏫 Profesor asignado",
+            body=f"Tu profesor para {level.code} es {chosen_info['user'].full_name}.",
+            link="/dashboard/student",
+        ))
+        # Notificar al profe
+        student_u = await db.get(User, e.student_id)
+        db.add(Notification(
+            user_id=chosen_tid,
+            type=NotificationType.info,
+            title="👥 Nuevo estudiante asignado",
+            body=f"Tenés un nuevo estudiante en {level.code}: {student_u.full_name if student_u else 'Estudiante'}.",
+            link="/dashboard/teacher/students",
+        ))
+
+        details.append({
+            "enrollment_id": e.id,
+            "student_name": student_u.full_name if student_u else None,
+            "level_code": level.code,
+            "assigned_teacher": chosen_info["user"].full_name,
+        })
+
+    await log_action(db, admin.user_id, "auto_assign_teachers", "system",
+                     details=f"assigned={assigned_count}, skipped={len(skipped)}")
+    await db.commit()
+
+    return {
+        "ok": True,
+        "assigned": assigned_count,
+        "skipped": len(skipped),
+        "details": details,
+        "skipped_details": skipped,
     }
