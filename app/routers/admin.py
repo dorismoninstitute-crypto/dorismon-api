@@ -501,12 +501,25 @@ async def create_enrollment(
     e = Enrollment(
         student_id=body["student_id"], course_id=body["course_id"],
         level_id=body["level_id"], teacher_id=body.get("teacher_id"),
+        plan_id=body.get("plan_id"),
     )
     db.add(e)
-    # Actualizar nivel del estudiante
+    # V1.4.1: Actualizar nivel del estudiante + marcar placement_done
+    # (caso: admin inscribe directamente sin que el estudiante haga test)
     st = await db.get(Student, body["student_id"])
     if st:
         st.current_level_id = body["level_id"]
+        # Si nunca hizo placement test pero admin lo está asignando, lo marcamos como hecho
+        if not st.placement_done:
+            st.placement_done = True
+    # Notificación al estudiante
+    db.add(Notification(
+        user_id=body["student_id"],
+        type=NotificationType.info,
+        title="🎓 Inscripción confirmada",
+        body="Has sido inscrito en un curso. Revisá tu dashboard.",
+        link="/dashboard/student",
+    ))
     await log_action(db, admin.user_id, "enroll", "admin", target_id=e.id)
     await db.commit()
     return {"id": e.id}
@@ -1353,22 +1366,35 @@ async def validate_meeting_url(
     body: dict,
     admin: Annotated[CurrentUser, Depends(require_admin)],
 ):
-    """Valida que un link de meeting tenga formato válido (Meet/Zoom/Teams)."""
+    """Valida y detecta el tipo de link de meeting (Zoom/Meet/Teams).
+
+    V1.4.1: Mejor detección de subdominios de Zoom (us05web, us02web, etc.)
+    """
     import re
     url = (body.get("url") or "").strip()
     if not url:
-        return {"valid": False, "reason": "URL vacía"}
-    patterns = {
-        "google_meet": r"^https://meet\.google\.com/[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}",
-        "zoom": r"^https://([a-z0-9-]+\.)?zoom\.us/(j|my)/\d+",
-        "teams": r"^https://teams\.microsoft\.com/l/meetup-join/",
-        "generic_https": r"^https://[^\s]+",
+        return {"valid": False, "type": None, "reason": "URL vacía"}
+
+    # Zoom: cualquier subdominio.zoom.us con /j/{id} o /my/{nombre} o /webinar/
+    if re.match(r"^https?://[a-z0-9-]+(\.[a-z0-9-]+)*\.zoom\.us/(j|my|webinar|s)/[\w?=&.-]+", url, re.IGNORECASE):
+        return {"valid": True, "type": "zoom", "label": "Zoom"}
+
+    # Google Meet
+    if re.match(r"^https?://meet\.google\.com/[a-z0-9-]+", url, re.IGNORECASE):
+        return {"valid": True, "type": "google_meet", "label": "Google Meet"}
+
+    # Microsoft Teams
+    if re.match(r"^https?://teams\.microsoft\.com/l/meetup-join/", url, re.IGNORECASE):
+        return {"valid": True, "type": "teams", "label": "Microsoft Teams"}
+
+    # Otros HTTPS (advertencia)
+    if re.match(r"^https?://[^\s]+", url, re.IGNORECASE):
+        return {
+            "valid": True, "type": "other", "label": "Link genérico",
+            "warning": "El link no es de Zoom, Meet ni Teams. Verificá que sea correcto antes de guardar.",
+        }
+
+    return {
+        "valid": False, "type": None,
+        "reason": "Link no válido. Debe empezar con https:// y ser de Zoom, Google Meet o Microsoft Teams.",
     }
-    matched = None
-    for kind, pat in patterns.items():
-        if re.match(pat, url):
-            matched = kind
-            break
-    if not matched:
-        return {"valid": False, "reason": "Link no reconocido. Asegurate de copiar el link completo de Google Meet, Zoom o Teams."}
-    return {"valid": True, "type": matched}

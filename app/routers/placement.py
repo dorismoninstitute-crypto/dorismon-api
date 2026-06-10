@@ -307,7 +307,11 @@ async def my_placement_result(
     user: Annotated[CurrentUser, Depends(get_current_user)],
     db: AsyncSession = Depends(get_db),
 ):
-    """Resultado del placement del estudiante actual."""
+    """Resultado del placement del estudiante.
+
+    V1.4.1: Si no hay test pero hay nivel asignado, devuelve el nivel
+    (caso: admin asignó nivel sin que el estudiante hiciera test).
+    """
     if user.role != "student":
         raise HTTPException(403)
     test = (await db.execute(
@@ -316,15 +320,54 @@ async def my_placement_result(
             PlacementTest.completed_at.is_not(None),
         ).order_by(PlacementTest.completed_at.desc()).limit(1)
     )).scalar_one_or_none()
-    if not test:
-        return None
-    level = await db.get(Level, test.suggested_level_id) if test.suggested_level_id else None
-    return {
-        "test_id": test.id,
-        "completed_at": test.completed_at.isoformat() if test.completed_at else None,
-        "grammar_score": float(test.grammar_score) if test.grammar_score else 0,
-        "reading_score": float(test.reading_score) if test.reading_score else 0,
-        "listening_score": float(test.listening_score) if test.listening_score else 0,
-        "suggested_level_code": level.code if level else None,
-        "suggested_level_name": level.name if level else None,
-    }
+
+    # Caso 1: hay test completado
+    if test:
+        level = await db.get(Level, test.suggested_level_id) if test.suggested_level_id else None
+        return {
+            "completed": True,
+            "has_test": True,
+            "test_id": test.id,
+            "completed_at": test.completed_at.isoformat() if test.completed_at else None,
+            "grammar_score": float(test.grammar_score) if test.grammar_score is not None else None,
+            "reading_score": float(test.reading_score) if test.reading_score is not None else None,
+            "listening_score": None,
+            "writing_score": None,
+            "speaking_score": None,
+            "score_pct": None,  # no se guarda en el modelo, lo calculamos si querés
+            "correct_count": None, "total_questions": None,
+            "suggested_level_code": level.code if level else None,
+            "suggested_level_name": level.name if level else None,
+        }
+
+    # Caso 2: no hay test pero hay nivel asignado por admin
+    st = await db.get(Student, user.user_id)
+    level = None
+    if st and st.current_level_id:
+        level = await db.get(Level, st.current_level_id)
+    else:
+        # V1.4.1 fallback: buscar el nivel desde una inscripción activa
+        from app.models import Enrollment
+        active_enr = (await db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == user.user_id,
+                Enrollment.is_active.is_(True),
+            ).order_by(Enrollment.enrolled_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if active_enr:
+            level = await db.get(Level, active_enr.level_id)
+
+    if level:
+        return {
+            "completed": True,
+            "has_test": False,
+            "assigned_by_admin": True,
+            "suggested_level_code": level.code,
+            "suggested_level_name": level.name,
+            "completed_at": None,
+            "grammar_score": None, "reading_score": None,
+            "listening_score": None, "writing_score": None, "speaking_score": None,
+        }
+
+    # Caso 3: no hay test ni nivel
+    return {"completed": False, "has_test": False}
