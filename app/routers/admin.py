@@ -106,13 +106,27 @@ async def list_users(
         stmt = stmt.where(or_(User.full_name.ilike(f"%{q}%"), User.email.ilike(f"%{q}%")))
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar() or 0
     items = (await db.execute(stmt.order_by(User.created_at.desc()).offset(offset).limit(limit))).scalars().all()
-    return {
-        "items": [{
+    # V1.4: enriquecer estudiantes con su nivel y estado de pausa
+    out_items = []
+    for u in items:
+        item = {
             "id": u.id, "email": u.email, "full_name": u.full_name,
             "phone": u.phone, "role": u.role.value, "is_active": u.is_active,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
-        } for u in items],
+            "level_code": None, "is_paused": False, "placement_done": False,
+        }
+        if u.role == UserRole.student:
+            st = await db.get(Student, u.id)
+            if st:
+                item["is_paused"] = st.is_paused
+                item["placement_done"] = st.placement_done
+                if st.current_level_id:
+                    lvl = await db.get(Level, st.current_level_id)
+                    item["level_code"] = lvl.code if lvl else None
+        out_items.append(item)
+    return {
+        "items": out_items,
         "total": total, "page": page, "limit": limit,
     }
 
@@ -1131,3 +1145,230 @@ async def list_paused_students(
         "paused_at": s.paused_at.isoformat() if s.paused_at else None,
         "reason": s.pause_reason,
     } for s, u in rows]
+
+
+# ============= V1.4 — PLACEMENT RESULTS =============
+@router.get("/placement-results")
+async def list_placement_results(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    status: str = "all",  # all, pending, enrolled
+):
+    """Lista estudiantes que completaron placement test, con su nivel sugerido."""
+    from app.models import PlacementTest
+    q = select(PlacementTest, User, Student, Level).join(
+        Student, PlacementTest.student_id == Student.user_id
+    ).join(User, Student.user_id == User.id).outerjoin(
+        Level, PlacementTest.suggested_level_id == Level.id
+    ).where(PlacementTest.completed_at.is_not(None)).order_by(PlacementTest.completed_at.desc())
+    rows = (await db.execute(q)).all()
+    out = []
+    for test, u, s, lvl in rows:
+        # ¿Tiene inscripción activa?
+        has_enrollment = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.student_id == u.id, Enrollment.is_active.is_(True)
+            )
+        )).scalar() > 0
+        if status == "pending" and has_enrollment: continue
+        if status == "enrolled" and not has_enrollment: continue
+        out.append({
+            "test_id": test.id,
+            "student_id": u.id,
+            "student_name": u.full_name,
+            "student_email": u.email,
+            "phone": u.phone,
+            "completed_at": test.completed_at.isoformat() if test.completed_at else None,
+            "suggested_level_id": test.suggested_level_id,
+            "suggested_level_code": lvl.code if lvl else None,
+            "suggested_level_name": lvl.name if lvl else None,
+            "grammar_score": float(test.grammar_score) if test.grammar_score is not None else None,
+            "reading_score": float(test.reading_score) if test.reading_score is not None else None,
+            "is_enrolled": has_enrollment,
+            "is_paused": s.is_paused,
+        })
+    return out
+
+
+@router.get("/placement-results/{test_id}")
+async def get_placement_detail(
+    test_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Detalle completo del placement test con cada respuesta."""
+    from app.models import PlacementTest, PlacementAnswer, PlacementQuestion
+    test = await db.get(PlacementTest, test_id)
+    if not test: raise HTTPException(404)
+    u = await db.get(User, test.student_id)
+    lvl = await db.get(Level, test.suggested_level_id) if test.suggested_level_id else None
+    answers = (await db.execute(
+        select(PlacementAnswer, PlacementQuestion).join(
+            PlacementQuestion, PlacementAnswer.question_id == PlacementQuestion.id
+        ).where(PlacementAnswer.placement_test_id == test_id)
+    )).all()
+    return {
+        "test_id": test.id,
+        "student_name": u.full_name if u else None,
+        "student_email": u.email if u else None,
+        "completed_at": test.completed_at.isoformat() if test.completed_at else None,
+        "suggested_level_code": lvl.code if lvl else None,
+        "suggested_level_name": lvl.name if lvl else None,
+        "scores": {
+            "grammar": float(test.grammar_score) if test.grammar_score is not None else None,
+            "reading": float(test.reading_score) if test.reading_score is not None else None,
+            "listening": None, "writing": None, "speaking": None,
+        },
+        "answers": [{
+            "statement": q.statement,
+            "skill": q.skill, "difficulty": q.difficulty_level,
+            "selected": a.selected_option,
+            "correct": q.correct_option,
+            "is_correct": a.is_correct,
+        } for a, q in answers],
+    }
+
+
+# ============= V1.4 — MÓDULOS Y LECCIONES (CRUD admin) =============
+@router.get("/levels/{level_id}/modules")
+async def list_level_modules(
+    level_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    mods = (await db.execute(
+        select(Module).where(Module.level_id == level_id).order_by(Module.order_index)
+    )).scalars().all()
+    out = []
+    for m in mods:
+        lessons_count = (await db.execute(
+            select(func.count()).select_from(Lesson).where(Lesson.module_id == m.id)
+        )).scalar() or 0
+        out.append({
+            "id": m.id, "name": m.name, "description": m.description,
+            "order_index": m.order_index, "lessons_count": lessons_count,
+        })
+    return out
+
+
+@router.post("/modules", status_code=201)
+async def create_module(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    if not body.get("level_id") or not body.get("name"):
+        raise HTTPException(400, "level_id y name requeridos")
+    m = Module(
+        level_id=body["level_id"], name=body["name"],
+        description=body.get("description"),
+        order_index=body.get("order_index", 0),
+    )
+    db.add(m)
+    await db.commit()
+    return {"id": m.id, "name": m.name}
+
+
+@router.get("/modules/{module_id}/lessons")
+async def list_module_lessons(
+    module_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    lessons = (await db.execute(
+        select(Lesson).where(Lesson.module_id == module_id).order_by(Lesson.order_index)
+    )).scalars().all()
+    return [{
+        "id": l.id, "title": l.title, "description": l.description,
+        "duration_min": l.duration_min, "order_index": l.order_index,
+        "video_url": l.video_url, "pdf_url": l.pdf_url, "audio_url": l.audio_url,
+        "is_published": l.is_published,
+    } for l in lessons]
+
+
+@router.post("/lessons", status_code=201)
+async def create_lesson(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    if not body.get("module_id") or not body.get("title"):
+        raise HTTPException(400, "module_id y title requeridos")
+    l = Lesson(
+        module_id=body["module_id"], title=body["title"],
+        description=body.get("description"),
+        objectives=body.get("objectives"),
+        can_do=body.get("can_do"),
+        video_url=body.get("video_url"),
+        pdf_url=body.get("pdf_url"),
+        audio_url=body.get("audio_url"),
+        duration_min=body.get("duration_min", 15),
+        order_index=body.get("order_index", 0),
+        is_published=body.get("is_published", True),
+    )
+    db.add(l)
+    await db.commit()
+    return {"id": l.id, "title": l.title}
+
+
+# ============= V1.4 — PAGOS MANUALES =============
+@router.post("/payments", status_code=201)
+async def register_payment(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Registra un pago manualmente (transferencia, efectivo, etc.)"""
+    from app.models import Payment, PaymentStatus
+    from datetime import timezone as tz
+    if not body.get("student_id") or not body.get("amount"):
+        raise HTTPException(400, "student_id y amount requeridos")
+    pay = Payment(
+        student_id=body["student_id"],
+        plan_id=body.get("plan_id"),
+        amount=float(body["amount"]),
+        currency=body.get("currency", "USD"),
+        status=PaymentStatus.paid,  # Si lo registra el admin manualmente, es porque ya cobró
+        method=body.get("method", "cash"),  # cash, transfer, deposit
+        reference=body.get("reference"),
+        paid_at=datetime.now(tz.utc),
+    )
+    db.add(pay)
+    # Notificación al estudiante
+    db.add(Notification(
+        user_id=body["student_id"],
+        type=NotificationType.info,
+        title="💰 Pago registrado",
+        body=f"Se registró tu pago de ${float(body['amount']):.2f} {body.get('currency','USD')}. ¡Gracias!",
+        link="/dashboard/student",
+    ))
+    await log_action(db, admin.user_id, "register_payment", "payments", pay.id)
+    await db.commit()
+    return {"id": pay.id, "ok": True}
+
+
+# ============= V1.4 — VALIDADOR DE LINKS DE MEETING =============
+@router.post("/validate-meeting-url")
+async def validate_meeting_url(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+):
+    """Valida que un link de meeting tenga formato válido (Meet/Zoom/Teams)."""
+    import re
+    url = (body.get("url") or "").strip()
+    if not url:
+        return {"valid": False, "reason": "URL vacía"}
+    patterns = {
+        "google_meet": r"^https://meet\.google\.com/[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}",
+        "zoom": r"^https://([a-z0-9-]+\.)?zoom\.us/(j|my)/\d+",
+        "teams": r"^https://teams\.microsoft\.com/l/meetup-join/",
+        "generic_https": r"^https://[^\s]+",
+    }
+    matched = None
+    for kind, pat in patterns.items():
+        if re.match(pat, url):
+            matched = kind
+            break
+    if not matched:
+        return {"valid": False, "reason": "Link no reconocido. Asegurate de copiar el link completo de Google Meet, Zoom o Teams."}
+    return {"valid": True, "type": matched}

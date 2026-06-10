@@ -411,28 +411,94 @@ async def main():
             ))
         print(f"{len(events_data)} eventos abiertos creados")
 
-        # === 15. PLACEMENT QUESTIONS (15 preguntas mixtas A1-C1) ===
+        # === 15. PLACEMENT QUESTIONS (60 preguntas balanceadas A1-C1) ===
+        # Distribución: A1=12, A2=12, B1=14, B2=14, C1=8
+        # Por skill: grammar=30, reading=20, use_of_english=10
         placement_questions = [
-            # A1 (3)
+            # ============ A1 (12 preguntas) ============
+            # Grammar (6)
             ("My name ___ Maria.", "is", "are", "am", "be", "a", "A1", "grammar"),
             ("How ___ you? — I'm fine, thanks.", "is", "are", "be", "do", "b", "A1", "grammar"),
-            ("This is ___ apple.", "a", "an", "the", "any", "b", "A1", "vocabulary"),
-            # A2 (3)
+            ("She ___ a teacher.", "are", "is", "am", "be", "b", "A1", "grammar"),
+            ("I ___ from Mexico.", "am", "is", "are", "be", "a", "A1", "grammar"),
+            ("They ___ students.", "is", "am", "are", "be", "c", "A1", "grammar"),
+            ("___ you like coffee?", "Are", "Is", "Do", "Does", "c", "A1", "grammar"),
+            # Vocabulary / Use of English (3)
+            ("This is ___ apple.", "a", "an", "the", "any", "b", "A1", "use_of_english"),
+            ("I have ___ brother.", "a", "an", "one", "any", "a", "A1", "use_of_english"),
+            ("There ___ a cat in the garden.", "is", "are", "am", "be", "a", "A1", "use_of_english"),
+            # Reading (3) — frases cortas, comprensión inmediata
+            ("Read: 'Tom is 8 years old. He goes to school.' Tom is a...", "teacher", "child", "doctor", "father", "b", "A1", "reading"),
+            ("Read: 'Anna lives in Paris. She speaks French.' What language does Anna speak?", "English", "Spanish", "French", "German", "c", "A1", "reading"),
+            ("Read: 'I eat breakfast at 8 AM.' When do I eat breakfast?", "at night", "in the morning", "in the afternoon", "at lunch", "b", "A1", "reading"),
+
+            # ============ A2 (12 preguntas) ============
+            # Grammar (6)
             ("I ___ to the store yesterday.", "go", "goes", "went", "gone", "c", "A2", "grammar"),
             ("She is ___ than her sister.", "tall", "taller", "tallest", "more tall", "b", "A2", "grammar"),
             ("If it ___ tomorrow, we won't go to the beach.", "rain", "rains", "rained", "will rain", "b", "A2", "grammar"),
-            # B1 (3)
+            ("They ___ TV when I arrived.", "watched", "were watching", "watch", "are watching", "b", "A2", "grammar"),
+            ("I ___ to swim when I was 6.", "can", "could", "must", "should", "b", "A2", "grammar"),
+            ("This is the ___ movie I've ever seen.", "good", "better", "best", "more good", "c", "A2", "grammar"),
+            # Use of English (3)
+            ("She's afraid ___ spiders.", "of", "to", "with", "from", "a", "A2", "use_of_english"),
+            ("I'm looking ___ my keys.", "at", "to", "for", "on", "c", "A2", "use_of_english"),
+            ("Could you ___ me a favor?", "make", "do", "take", "have", "b", "A2", "use_of_english"),
+            # Reading (3)
+            ("Read: 'The restaurant opens at 7 PM and closes at midnight.' How many hours is it open?", "3", "5", "7", "10", "b", "A2", "reading"),
+            ("Read: 'Sara loves reading. She has more than 200 books at home.' Sara probably enjoys...", "sports", "literature", "cooking", "music", "b", "A2", "reading"),
+            ("Read: 'Don't enter. Wet floor.' This sign means you should...", "be careful", "leave quickly", "clean the floor", "wait outside", "a", "A2", "reading"),
+
+            # ============ B1 (14 preguntas) ============
+            # Grammar (7)
             ("I ___ here for five years.", "live", "am living", "have lived", "lived", "c", "B1", "grammar"),
             ("She told me ___ wait for her.", "to", "for", "that", "about", "a", "B1", "grammar"),
-            ("The book ___ I bought yesterday is great.", "what", "which", "who", "whose", "b", "B1", "vocabulary"),
-            # B2 (3)
+            ("If I had time, I ___ help you.", "will", "would", "had", "have", "b", "B1", "grammar"),
+            ("The car ___ in Germany.", "made", "is made", "is making", "makes", "b", "B1", "grammar"),
+            ("I'm used ___ early.", "to wake up", "to waking up", "waking up", "wake up", "b", "B1", "grammar"),
+            ("You ___ work today, it's a holiday.", "don't have to", "mustn't", "shouldn't", "won't", "a", "B1", "grammar"),
+            ("Neither John ___ his brother came to the party.", "or", "nor", "and", "but", "b", "B1", "grammar"),
+            # Use of English (3)
+            ("The book ___ I bought yesterday is great.", "what", "which", "who", "whose", "b", "B1", "use_of_english"),
+            ("She apologized ___ being late.", "of", "about", "for", "with", "c", "B1", "use_of_english"),
+            ("I'd rather ___ home tonight.", "stay", "to stay", "staying", "stayed", "a", "B1", "use_of_english"),
+            # Reading (4)
+            ("Read: 'Despite the heavy rain, the concert continued.' What happened?", "concert was cancelled", "concert continued", "rain stopped", "people left", "b", "B1", "reading"),
+            ("Read: 'Recycling helps reduce waste and protect natural resources.' Recycling is...", "expensive", "beneficial", "complicated", "rare", "b", "B1", "reading"),
+            ("Read: 'The restaurant offers a 20% discount for students with valid ID.' Who gets the discount?", "everyone", "tourists", "students with ID", "regular customers", "c", "B1", "reading"),
+            ("Read: 'Online learning is becoming increasingly popular among working adults.' What does this say?", "Adults dislike learning", "Adults learn more online", "Online learning is decreasing", "Adults can't study", "b", "B1", "reading"),
+
+            # ============ B2 (14 preguntas) ============
+            # Grammar (7)
             ("If I ___ more money, I would travel the world.", "have", "had", "would have", "had had", "b", "B2", "grammar"),
             ("By the time you arrive, I ___ finished the report.", "will have", "have", "had", "will", "a", "B2", "grammar"),
             ("She wishes she ___ taller.", "is", "were", "would be", "had been", "b", "B2", "grammar"),
-            # C1 (3)
+            ("___ I had studied more, I would have passed.", "If", "Had", "When", "While", "b", "B2", "grammar"),
+            ("The report needs ___ before Friday.", "finish", "to finish", "finishing", "finished", "c", "B2", "grammar"),
+            ("I don't mind ___ overtime if needed.", "to work", "working", "work", "worked", "b", "B2", "grammar"),
+            ("He's not ___ to drive yet.", "old enough", "enough old", "as old", "so old", "a", "B2", "grammar"),
+            # Use of English (3)
+            ("She managed ___ the meeting despite traffic.", "attending", "to attend", "attend", "attended", "b", "B2", "use_of_english"),
+            ("___ of the students passed the exam.", "Each", "Every", "All", "Whole", "c", "B2", "use_of_english"),
+            ("The decision was made ___ careful consideration.", "without", "after", "during", "since", "b", "B2", "use_of_english"),
+            # Reading (4)
+            ("Read: 'The new policy aims to streamline operations and reduce overhead costs by 15%.' The policy intends to...", "increase costs", "make work more efficient", "hire more staff", "change products", "b", "B2", "reading"),
+            ("Read: 'Although the proposal seemed promising, it lacked sufficient supporting data.' The proposal was...", "fully approved", "rejected outright", "incomplete", "implemented", "c", "B2", "reading"),
+            ("Read: 'The candidate's qualifications, albeit impressive, did not align with the position's requirements.' The candidate was...", "perfect for the job", "not a match", "rejected for low skills", "hired immediately", "b", "B2", "reading"),
+            ("Read: 'Researchers contend that excessive screen time may impair cognitive development in children.' Researchers...", "support screens", "are uncertain", "argue screens harm kids", "found no link", "c", "B2", "reading"),
+
+            # ============ C1 (8 preguntas) ============
+            # Grammar (4)
             ("Had I known about the meeting, I ___ attended.", "would have", "had", "have", "will have", "a", "C1", "grammar"),
-            ("She is hardly ___ to manage such complex situations.", "able", "capable", "skilled", "competent", "b", "C1", "vocabulary"),
-            ("The proposal was met with ___ enthusiasm from the committee.", "scarce", "scant", "scarcely", "scantly", "b", "C1", "vocabulary"),
+            ("Not until later ___ the true cost of the project.", "we realized", "did we realize", "we did realize", "realized we", "b", "C1", "grammar"),
+            ("Rarely ___ such a remarkable performance.", "I have seen", "have I seen", "I had seen", "had I seen", "b", "C1", "grammar"),
+            ("Were it not ___ your help, I would have failed.", "for", "of", "to", "with", "a", "C1", "grammar"),
+            # Use of English (1)
+            ("She is hardly ___ to manage such complex situations.", "able", "capable", "skilled", "competent", "b", "C1", "use_of_english"),
+            # Reading (3)
+            ("Read: 'The author's nuanced critique transcends mere partisan rhetoric, offering substantive policy alternatives.' The critique is...", "biased", "shallow", "thoughtful and constructive", "purely political", "c", "C1", "reading"),
+            ("Read: 'Notwithstanding the initial setbacks, the company has demonstrated remarkable resilience.' The company...", "failed completely", "recovered well despite problems", "had no problems", "is still struggling", "b", "C1", "reading"),
+            ("Read: 'The proposal was met with scant enthusiasm from the committee, prompting a thorough revision.' The reaction was...", "very positive", "neutral", "lukewarm at best", "hostile", "c", "C1", "reading"),
         ]
         for i, (stmt, oa, ob, oc, od, correct, lvl, skill) in enumerate(placement_questions):
             db.add(PlacementQuestion(

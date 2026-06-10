@@ -99,6 +99,7 @@ class Student(Base):
     user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     current_level_id: Mapped[int | None] = mapped_column(ForeignKey("levels.id"), nullable=True)
     placement_done: Mapped[bool] = mapped_column(Boolean, default=False)
+    grammar_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     speaking_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     listening_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     reading_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)

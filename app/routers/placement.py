@@ -38,23 +38,106 @@ async def get_placement_questions(
     user: Annotated[CurrentUser, Depends(get_current_user)],
     db: AsyncSession = Depends(get_db),
 ):
-    """Devuelve las preguntas del placement (sin la respuesta correcta).
-    Diseño preparado para adaptativo: se podría devolver una a una.
+    """V1.4: Devuelve 15 preguntas aleatorias balanceadas por destreza,
+    con orden de opciones mezclado para evitar trampas.
+
+    Distribución:
+    - 8 Grammar
+    - 5 Reading Comprehension
+    - 2 Use of English
+
+    Por nivel de dificultad:
+    - 2 A1, 2 A2, 4 B1, 4 B2, 3 C1 (curva de Cambridge style)
     """
+    import random
     if user.role != "student":
         raise HTTPException(403, "Solo estudiantes")
-    questions = (await db.execute(
+
+    # Obtener TODAS las preguntas activas agrupadas
+    all_questions = (await db.execute(
         select(PlacementQuestion).where(PlacementQuestion.is_active.is_(True))
-        .order_by(PlacementQuestion.order_index)
     )).scalars().all()
-    return [{
-        "id": q.id,
-        "statement": q.statement,
-        "option_a": q.option_a, "option_b": q.option_b,
-        "option_c": q.option_c, "option_d": q.option_d,
-        "skill": q.skill,
-        "audio_url": q.audio_url, "image_url": q.image_url,
-    } for q in questions]
+
+    # Agrupar por (skill, difficulty)
+    by_skill_level = {}
+    for q in all_questions:
+        key = (q.skill, q.difficulty_level)
+        by_skill_level.setdefault(key, []).append(q)
+
+    # Plan de selección: cantidad por (skill, nivel)
+    selection_plan = [
+        # Grammar (8 total)
+        ("grammar", "A1", 1), ("grammar", "A2", 1),
+        ("grammar", "B1", 2), ("grammar", "B2", 2), ("grammar", "C1", 2),
+        # Reading (5 total)
+        ("reading", "A1", 1), ("reading", "A2", 1),
+        ("reading", "B1", 1), ("reading", "B2", 1), ("reading", "C1", 1),
+        # Use of English (2 total)
+        ("use_of_english", "B1", 1), ("use_of_english", "B2", 1),
+    ]
+
+    selected = []
+    for skill, level, count in selection_plan:
+        bucket = by_skill_level.get((skill, level), [])
+        if bucket:
+            picks = random.sample(bucket, min(count, len(bucket)))
+            selected.extend(picks)
+
+    # Si quedaron menos de 15 (algún bucket vacío), rellenar con random del resto
+    if len(selected) < 15:
+        already_ids = {q.id for q in selected}
+        remaining = [q for q in all_questions if q.id not in already_ids]
+        fill_needed = min(15 - len(selected), len(remaining))
+        selected.extend(random.sample(remaining, fill_needed))
+
+    # Mezclar el orden de las 15
+    random.shuffle(selected)
+
+    # Para cada pregunta, mezclar el orden de las opciones a/b/c/d
+    out = []
+    for q in selected:
+        # Construir lista de [(letra original, texto)]
+        options = [
+            ("a", q.option_a), ("b", q.option_b),
+            ("c", q.option_c), ("d", q.option_d),
+        ]
+        random.shuffle(options)
+        # Re-mapear: la nueva posición es a, b, c, d
+        # Guardamos la respuesta correcta DENTRO de la sesión usando un mapping
+        # PERO no podemos guardar estado del lado servidor sin sesión,
+        # así que devolvemos el mapping al cliente y al evaluar comparamos.
+        # Mejor enfoque: devolver options ya en orden mezclado con letras nuevas,
+        # y guardar correct_option mapeada a nueva letra.
+        new_correct_letter = None
+        new_options = {}
+        for new_idx, (orig_letter, text) in enumerate(options):
+            new_letter = ["a", "b", "c", "d"][new_idx]
+            new_options[new_letter] = text
+            if orig_letter == q.correct_option:
+                new_correct_letter = new_letter
+
+        # En lugar de exponer correct, mandamos un "answer_key" cifrado simple
+        # Para simplificar, devolvemos el nuevo correct_option encriptado simple (base64 del id+letter)
+        # Pero más simple aún: el frontend manda el orden que vio, y el backend re-mapea al evaluar.
+        # → Devolvemos el orden de letras originales para que el frontend nos lo devuelva al submit.
+        out.append({
+            "id": q.id,
+            "statement": q.statement,
+            "option_a": new_options.get("a", ""),
+            "option_b": new_options.get("b", ""),
+            "option_c": new_options.get("c", ""),
+            "option_d": new_options.get("d", ""),
+            "skill": q.skill,
+            "difficulty_level": q.difficulty_level,
+            "audio_url": q.audio_url, "image_url": q.image_url,
+            # mapping privado: nueva letra → letra original
+            # Se devuelve al backend en el submit
+            "_option_map": {
+                "a": options[0][0], "b": options[1][0],
+                "c": options[2][0], "d": options[3][0],
+            },
+        })
+    return out
 
 
 @router.post("/submit")
@@ -92,26 +175,37 @@ async def submit_placement(
     correct_count = 0
     correct_by_level = {"A1": 0, "A2": 0, "B1": 0, "B2": 0, "C1": 0}
     total_by_level = {"A1": 0, "A2": 0, "B1": 0, "B2": 0, "C1": 0}
-    correct_by_skill = {"grammar": 0, "vocabulary": 0, "reading": 0, "listening": 0}
+    correct_by_skill = {"grammar": 0, "reading": 0, "use_of_english": 0, "vocabulary": 0, "listening": 0}
+    total_by_skill = {"grammar": 0, "reading": 0, "use_of_english": 0, "vocabulary": 0, "listening": 0}
 
     for ans in answers:
         qid = ans.get("question_id")
         sel = (ans.get("selected_option") or "").lower().strip()
+        # V1.4: El frontend devuelve _option_map para que mapeemos la nueva letra
+        # a la letra original que tiene la respuesta correcta en la DB.
+        option_map = ans.get("option_map") or {}  # {"a":"c","b":"a","c":"d","d":"b"}
         q = await db.get(PlacementQuestion, qid)
         if not q:
             continue
-        is_correct = sel == q.correct_option.lower()
+        # Si hay option_map, traducir la letra seleccionada a la letra original
+        if option_map and sel in option_map:
+            sel_original = option_map[sel].lower()
+        else:
+            sel_original = sel
+        is_correct = sel_original == q.correct_option.lower()
         if q.difficulty_level in total_by_level:
             total_by_level[q.difficulty_level] += 1
             if is_correct:
                 correct_by_level[q.difficulty_level] += 1
+        if q.skill in total_by_skill:
+            total_by_skill[q.skill] += 1
         if is_correct:
             correct_count += 1
             if q.skill in correct_by_skill:
                 correct_by_skill[q.skill] += 1
         db.add(PlacementAnswer(
             placement_test_id=test.id, question_id=qid,
-            selected_option=sel, is_correct=is_correct,
+            selected_option=sel_original, is_correct=is_correct,
         ))
 
     # Algoritmo de nivel sugerido
@@ -133,25 +227,32 @@ async def submit_placement(
         select(Level).where(Level.code == suggested_code).order_by(Level.course_id).limit(1)
     )).scalar_one_or_none()
 
-    # Guardar resultado en placement_tests
-    test.grammar_score = round((correct_by_skill.get("grammar", 0) / max(1, total)) * 100, 2)
-    test.reading_score = round((correct_by_skill.get("reading", 0) / max(1, total)) * 100, 2)
-    test.listening_score = round((correct_by_skill.get("listening", 0) / max(1, total)) * 100, 2)
-    test.writing_score = 0.0
-    test.speaking_score = 0.0
+    # V1.4: Guardar scores REALES por destreza (correct/total de esa skill, no del total)
+    def pct(skill_key):
+        t = total_by_skill.get(skill_key, 0)
+        if t == 0: return None
+        return round((correct_by_skill.get(skill_key, 0) / t) * 100, 2)
+
+    test.grammar_score = pct("grammar")
+    test.reading_score = pct("reading")
+    # use_of_english se mezcla en vocabulary para el modelo
+    use_eng_score = pct("use_of_english")
+    test.listening_score = None  # V1.4: NO evaluamos (honestidad)
+    test.writing_score = None
+    test.speaking_score = None
     test.suggested_level_id = level.id if level else None
     test.completed_at = datetime.now(tz.utc)
 
     # Marcar el estudiante como con placement completo
     student.placement_done = True
     student.current_level_id = level.id if level else None
-    student.grammar_score = test.grammar_score if hasattr(student, 'grammar_score') else None
+    student.grammar_score = test.grammar_score
     student.reading_score = test.reading_score
-    student.listening_score = test.listening_score
-    student.writing_score = 50.0  # default por ahora
-    student.speaking_score = 50.0  # default por ahora
+    student.listening_score = None
+    student.writing_score = None
+    student.speaking_score = None
 
-    # Notificación de bienvenida con nivel asignado
+    # Notificación al estudiante
     db.add(Notification(
         user_id=user.user_id,
         type=NotificationType.info,
@@ -159,6 +260,22 @@ async def submit_placement(
         body=f"Tu nivel sugerido es {suggested_code}. Pronto te asignaremos un profesor.",
         link="/dashboard/student",
     ))
+
+    # V1.4: Notificación a TODOS los admins
+    from app.models import User, UserRole
+    admins = (await db.execute(
+        select(User).where(User.role == UserRole.super_admin, User.is_active.is_(True))
+    )).scalars().all()
+    user_data = await db.get(User, user.user_id)
+    student_name = user_data.full_name if user_data else "Un estudiante"
+    for admin in admins:
+        db.add(Notification(
+            user_id=admin.id,
+            type=NotificationType.info,
+            title=f"🎯 Nuevo placement: {student_name}",
+            body=f"Completó el test → nivel sugerido {suggested_code}. Pendiente de inscripción.",
+            link="/dashboard/admin/placement-results",
+        ))
 
     await db.commit()
 
@@ -173,7 +290,8 @@ async def submit_placement(
         "skill_breakdown": {
             "grammar": test.grammar_score,
             "reading": test.reading_score,
-            "listening": test.listening_score,
+            "use_of_english": use_eng_score,
+            # listening / speaking / writing → NO evaluados, los muestra el front
         },
         "level_breakdown": {
             lvl: {
