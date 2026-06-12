@@ -136,3 +136,51 @@ async def change_password(
     await log_action(db, user.user_id, "change_password", "auth")
     await db.commit()
     return {"ok": True, "message": "Contraseña actualizada"}
+
+
+class UpdateProfileRequest(BaseModel):
+    """V1.6.3: Actualizar perfil propio (cualquier rol)."""
+    full_name: str | None = Field(default=None, min_length=2, max_length=100)
+    phone: str | None = Field(default=None, max_length=30)
+    avatar_url: str | None = Field(default=None, max_length=500)
+    bio: str | None = Field(default=None, max_length=500)  # solo profes
+
+
+@router.patch("/me")
+async def update_my_profile(
+    body: UpdateProfileRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.6.3: Actualizar perfil propio. Cualquier campo es opcional."""
+    u = await db.get(User, user.user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+
+    if body.full_name is not None:
+        u.full_name = body.full_name.strip()
+    if body.phone is not None:
+        u.phone = body.phone.strip() or None
+    if body.avatar_url is not None:
+        # Validar que sea URL HTTPS básica o vacío
+        url = body.avatar_url.strip()
+        if url and not (url.startswith("https://") or url.startswith("http://")):
+            raise HTTPException(400, "La URL del avatar debe empezar con https://")
+        u.avatar_url = url or None
+
+    # bio solo aplica a profes (Teacher.bio)
+    if body.bio is not None and user.role == "teacher":
+        from app.models import Teacher
+        t = await db.get(Teacher, user.user_id)
+        if t:
+            t.bio = body.bio.strip() or None
+
+    await log_action(db, user.user_id, "update_profile", "auth")
+    await db.commit()
+    return {
+        "ok": True,
+        "user": {
+            "id": u.id, "email": u.email, "full_name": u.full_name,
+            "phone": u.phone, "avatar_url": u.avatar_url, "role": u.role.value,
+        },
+    }

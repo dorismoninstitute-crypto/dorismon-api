@@ -1749,3 +1749,176 @@ async def auto_assign_teachers(
         "details": details,
         "skipped_details": skipped,
     }
+
+
+# ============= V1.6.3 — DETECTOR CANDIDATOS A CERTIFICACIÓN =============
+@router.get("/certification-candidates")
+async def list_certification_candidates(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.6.3: Detecta estudiantes que cumplen criterios para certificar.
+
+    Criterios (combinación inteligente):
+    - Todos los módulos del nivel completados (ModuleProgress.status = 'completed')
+    - Asistencia promedio ≥ 70%
+    - No tiene certificado activo para ese curso+nivel
+    """
+    from app.models import ModuleProgress, Module
+    from sqlalchemy import and_
+
+    # Obtener todas las inscripciones activas
+    enrollments = (await db.execute(
+        select(Enrollment, User, Course, Level)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Course, Enrollment.course_id == Course.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(Enrollment.is_active.is_(True))
+    )).all()
+
+    candidates = []
+    for e, u, c, l in enrollments:
+        # ¿Ya tiene certificado activo para este curso+nivel?
+        existing_cert = (await db.execute(
+            select(func.count()).select_from(Certificate).where(
+                Certificate.student_id == u.id,
+                Certificate.course_id == c.id,
+                Certificate.level_id == l.id,
+                Certificate.revoked.is_(False),
+            )
+        )).scalar() or 0
+        if existing_cert > 0:
+            continue
+
+        # Total de módulos del nivel
+        total_modules = (await db.execute(
+            select(func.count()).select_from(Module).where(Module.level_id == l.id)
+        )).scalar() or 0
+        if total_modules == 0:
+            continue  # Sin módulos definidos, no podemos evaluar
+
+        # Módulos completados por el estudiante
+        completed_modules = (await db.execute(
+            select(func.count()).select_from(ModuleProgress)
+            .join(Module, ModuleProgress.module_id == Module.id)
+            .where(
+                ModuleProgress.student_id == u.id,
+                Module.level_id == l.id,
+                ModuleProgress.status == "completed",
+            )
+        )).scalar() or 0
+
+        # ¿Todos los módulos completados?
+        if completed_modules < total_modules:
+            continue
+
+        # Asistencia promedio del estudiante en clases de este nivel
+        att_rows = (await db.execute(
+            select(SessionAttendance.state)
+            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+            .where(
+                SessionAttendance.student_id == u.id,
+                ClassSession.level_id == l.id,
+            )
+        )).all()
+        total_att = len(att_rows)
+        if total_att > 0:
+            present = sum(1 for (s,) in att_rows if s == AttendanceState.present)
+            attendance_pct = round((present / total_att) * 100, 1)
+        else:
+            attendance_pct = None
+
+        # Criterio: si tiene asistencia registrada, debe ser ≥ 70%
+        meets_attendance = attendance_pct is None or attendance_pct >= 70
+
+        if not meets_attendance:
+            continue
+
+        # Es candidato — incluirlo
+        candidates.append({
+            "enrollment_id": e.id,
+            "student_id": u.id,
+            "student_name": u.full_name,
+            "student_email": u.email,
+            "avatar_url": u.avatar_url,
+            "course_id": c.id,
+            "course_name": c.name,
+            "level_id": l.id,
+            "level_code": l.code,
+            "level_name": l.name,
+            "teacher_id": e.teacher_id,
+            "modules_completed": completed_modules,
+            "total_modules": total_modules,
+            "attendance_pct": attendance_pct,
+            "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+        })
+
+    return candidates
+
+
+@router.post("/certification-candidates/{enrollment_id}/issue")
+async def issue_certification_quick(
+    enrollment_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.6.3: Emite certificado para un candidato con 1 click.
+
+    Body opcional: { final_grade: float, hours_completed: int }
+    """
+    e = await db.get(Enrollment, enrollment_id)
+    if not e:
+        raise HTTPException(404, "Inscripción no encontrada")
+
+    # Verificar que no exista certificado activo
+    existing = (await db.execute(
+        select(Certificate).where(
+            Certificate.student_id == e.student_id,
+            Certificate.course_id == e.course_id,
+            Certificate.level_id == e.level_id,
+            Certificate.revoked.is_(False),
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(400, "Este estudiante ya tiene certificado activo para este nivel")
+
+    # Generar código único
+    code = token_urlsafe(8).replace("_", "").replace("-", "").upper()[:12]
+    while (await db.execute(select(Certificate).where(Certificate.code == code))).scalar_one_or_none():
+        code = token_urlsafe(8).replace("_", "").replace("-", "").upper()[:12]
+
+    final_grade = body.get("final_grade", 80.0)
+    hours_completed = body.get("hours_completed", 60)
+
+    cert = Certificate(
+        code=code,
+        student_id=e.student_id,
+        course_id=e.course_id,
+        level_id=e.level_id,
+        final_grade=final_grade,
+        hours_completed=hours_completed,
+        issued_by=admin.user_id,
+    )
+    db.add(cert)
+
+    # Notificar al estudiante
+    level = await db.get(Level, e.level_id)
+    course = await db.get(Course, e.course_id)
+    db.add(Notification(
+        user_id=e.student_id,
+        type=NotificationType.success,
+        title="🎓 ¡Tu certificado está listo!",
+        body=f"¡Felicitaciones! Completaste {course.name if course else ''} nivel {level.code if level else ''}. Tu código de certificado es {code}.",
+        link="/dashboard/student/certificates",
+    ))
+
+    await log_action(db, admin.user_id, "issue_certificate", "certificates", target_id=cert.id)
+    await db.commit()
+
+    return {
+        "ok": True,
+        "certificate_id": cert.id,
+        "code": code,
+        "verify_url": f"/certificate/{code}",
+    }
