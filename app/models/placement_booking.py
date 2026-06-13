@@ -240,6 +240,35 @@ class ClassSession(Base):
     is_open_event: Mapped[bool] = mapped_column(Boolean, default=False)  # V1.2: evento abierto a cualquier estudiante
     teacher_notes: Mapped[str | None] = mapped_column(Text, nullable=True)  # V1.3 notas del profe post-clase
     module_id: Mapped[int | None] = mapped_column(ForeignKey("modules.id"), nullable=True)  # V1.3 vincular clase a módulo
+    # V1.7: Serie y clase privada
+    series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id", ondelete="SET NULL"), nullable=True)  # V1.7: pertenece a una serie
+    student_id: Mapped[str | None] = mapped_column(ForeignKey("students.user_id"), nullable=True)  # V1.7: si está seteado = clase privada 1-a-1
+    counts_for_progress: Mapped[bool] = mapped_column(Boolean, default=True)  # V1.7: privadas pueden no contar para CEFR
+
+
+class ClassSeries(Base):
+    """V1.7: Serie de clases recurrentes. Una serie genera N clases automáticamente."""
+    __tablename__ = "class_series"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String)  # "B1 Nocturno"
+    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"))
+    level_id: Mapped[int] = mapped_column(ForeignKey("levels.id"))
+    teacher_id: Mapped[str] = mapped_column(ForeignKey("teachers.user_id"))
+    plan_id: Mapped[int | None] = mapped_column(ForeignKey("plans.id"), nullable=True)
+    days_of_week: Mapped[str] = mapped_column(String)  # CSV: "mon,wed,fri" (0=mon...6=sun)
+    start_time_hhmm: Mapped[str] = mapped_column(String)  # "19:00"
+    duration_min: Mapped[int] = mapped_column(Integer, default=90)
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # opcional si num_classes está seteado
+    num_classes: Mapped[int | None] = mapped_column(Integer, nullable=True)  # opcional si end_date está seteado
+    modality: Mapped[Modality] = mapped_column()
+    meeting_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True)
+    classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True)
+    module_rotation: Mapped[str | None] = mapped_column(String, nullable=True)  # CSV de module_ids para rotar
+    capacity: Mapped[int] = mapped_column(Integer, default=15)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SessionAttendance(Base):

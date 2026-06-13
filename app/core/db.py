@@ -95,6 +95,9 @@ async def init_db():
         migrations = [
             "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS levels_taught VARCHAR",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR",  # V1.6.4: male/female/other/NULL
+            "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS series_id VARCHAR",  # V1.7
+            "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS student_id VARCHAR",  # V1.7: clase privada 1-a-1
+            "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS counts_for_progress BOOLEAN DEFAULT TRUE",  # V1.7
         ]
         for m in migrations:
             try:

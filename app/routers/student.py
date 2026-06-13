@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, timezone as tz, timedelta
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -56,6 +56,9 @@ async def student_dashboard(
         })
 
     # Próximas clases
+    # V1.7: filtrar correctamente:
+    #   - Grupales: student_id IS NULL + level_id en enrollments
+    #   - Privadas: student_id == este estudiante
     next_sessions_stmt = (
         select(ClassSession)
         .where(
@@ -66,10 +69,20 @@ async def student_dashboard(
         .order_by(ClassSession.starts_at_utc)
         .limit(5)
     )
-    # Filtrar a las que correspondan al level del estudiante
+    # V1.7: condición compleja: (grupal de su nivel) OR (privada para él)
     if enrollments_rows:
         level_ids = [l.id for e, c, l in enrollments_rows]
-        next_sessions_stmt = next_sessions_stmt.where(ClassSession.level_id.in_(level_ids))
+        next_sessions_stmt = next_sessions_stmt.where(
+            or_(
+                # Grupales del nivel correcto (no privadas)
+                (ClassSession.level_id.in_(level_ids)) & (ClassSession.student_id.is_(None)),
+                # Privadas para este estudiante
+                ClassSession.student_id == user.user_id,
+            )
+        )
+    else:
+        # Sin enrollments solo ve sus privadas
+        next_sessions_stmt = next_sessions_stmt.where(ClassSession.student_id == user.user_id)
 
     sessions = (await db.execute(next_sessions_stmt)).scalars().all()
     next_classes = []
@@ -78,8 +91,10 @@ async def student_dashboard(
         next_classes.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
+            "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
             "meeting_url": s.meeting_url,
             "teacher_name": teacher_user.full_name if teacher_user else "—",
+            "is_private": s.student_id is not None,  # V1.7
         })
 
     # Tareas pendientes

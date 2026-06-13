@@ -212,7 +212,9 @@ async def save_attendance(
     await db.commit()
 
     # V1.3: recomputar progreso de módulo para todos los estudiantes presentes
-    if session.module_id:
+    # V1.7: solo si la clase counts_for_progress (default True)
+    counts = getattr(session, "counts_for_progress", True)
+    if session.module_id and counts:
         from app.models import ModuleProgress
         for r in records:
             sid = r.get("student_id")

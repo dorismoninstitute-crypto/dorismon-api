@@ -11,7 +11,7 @@ from app.core.db import get_db
 from app.services.audit import log_action
 from app.models import (
     User, Teacher, Student, Course, Level, Module, Lesson, LessonProgress,
-    Enrollment, Branch, Classroom, ClassSession, SessionAttendance,
+    Enrollment, Branch, Classroom, ClassSession, ClassSeries, SessionAttendance,
     Assignment, AssignmentSubmission, Quiz, Material, Plan, Payment,
     Certificate, InstituteSetting, AuditLog, Notification,
     UserRole, Modality, SessionStatus, MaterialType, PaymentStatus, NotificationType,
@@ -2078,3 +2078,359 @@ async def load_module_templates(
         "processed_levels": processed_levels,
         "skipped_levels": skipped_levels,
     }
+
+
+# ============= V1.7 — SERIES RECURRENTES + CLASES PRIVADAS =============
+
+DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+DAY_NAMES_REV = {v: k for k, v in DAY_NAMES.items()}
+
+
+def _generate_session_dates(start_date, end_date, num_classes, days_of_week, start_time_hhmm):
+    """Genera fechas+hora local para clases de una serie."""
+    from datetime import datetime as dt, time, timedelta as td
+
+    # Parse hora
+    hh, mm = map(int, start_time_hhmm.split(":"))
+
+    # Convertir días CSV → set de ints
+    days = set()
+    for d in days_of_week.split(","):
+        d = d.strip().lower()
+        if d in DAY_NAMES:
+            days.add(DAY_NAMES[d])
+
+    if not days:
+        return []
+
+    dates = []
+    cur = start_date
+    safety_limit = 365 * 2  # 2 años máximo
+
+    while safety_limit > 0:
+        if cur.weekday() in days:
+            naive = dt.combine(cur, time(hh, mm))
+            dates.append(naive)
+            if num_classes and len(dates) >= num_classes:
+                break
+        cur = cur + td(days=1)
+        if end_date and cur > end_date:
+            break
+        safety_limit -= 1
+
+    return dates
+
+
+@router.post("/class-series", status_code=201)
+async def create_class_series(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.7: Crea una serie recurrente y genera N clases automáticamente.
+
+    Body:
+    {
+      "name": "B1 Nocturno",
+      "course_id": 1, "level_id": 4, "teacher_id": "uuid",
+      "days_of_week": "mon,wed,fri",
+      "start_time_hhmm": "19:00",
+      "duration_min": 90,
+      "start_date": "2026-06-15",  // YYYY-MM-DD
+      "end_date": "2026-08-15",     // O num_classes
+      "num_classes": 24,
+      "modality": "online",
+      "meeting_url": "https://...",
+      "module_rotation": "1,2,3,4,5",  // opcional CSV de module_ids
+      "capacity": 15,
+      "plan_id": null
+    }
+    """
+    from datetime import datetime as dt, time, date as ddate, timedelta as td
+
+    # Validaciones básicas
+    for f in ("name", "course_id", "level_id", "teacher_id", "days_of_week",
+              "start_time_hhmm", "start_date", "modality"):
+        if not body.get(f):
+            raise HTTPException(400, f"Falta campo: {f}")
+
+    if not body.get("end_date") and not body.get("num_classes"):
+        raise HTTPException(400, "Especifica end_date O num_classes")
+
+    # Parse fechas
+    try:
+        start_date = dt.strptime(body["start_date"], "%Y-%m-%d").date()
+        end_date = dt.strptime(body["end_date"], "%Y-%m-%d").date() if body.get("end_date") else None
+    except Exception:
+        raise HTTPException(400, "Formato de fecha inválido (usá YYYY-MM-DD)")
+
+    num_classes = body.get("num_classes")
+
+    # Validar modalidad
+    try:
+        modality = Modality(body["modality"])
+    except Exception:
+        raise HTTPException(400, "Modalidad inválida (online/onsite/hybrid)")
+
+    # Crear la serie
+    series = ClassSeries(
+        name=body["name"],
+        course_id=body["course_id"],
+        level_id=body["level_id"],
+        teacher_id=body["teacher_id"],
+        plan_id=body.get("plan_id"),
+        days_of_week=body["days_of_week"],
+        start_time_hhmm=body["start_time_hhmm"],
+        duration_min=body.get("duration_min", 90),
+        start_date=start_date,
+        end_date=end_date,
+        num_classes=num_classes,
+        modality=modality,
+        meeting_url=body.get("meeting_url"),
+        branch_id=body.get("branch_id"),
+        classroom_id=body.get("classroom_id"),
+        module_rotation=body.get("module_rotation"),
+        capacity=body.get("capacity", 15),
+    )
+    db.add(series)
+    await db.flush()
+
+    # Generar fechas
+    dates = _generate_session_dates(start_date, end_date, num_classes, body["days_of_week"], body["start_time_hhmm"])
+    if not dates:
+        raise HTTPException(400, "No se pudieron generar fechas. Verificá los días y rango.")
+
+    # Rotación de módulos
+    module_ids = []
+    if body.get("module_rotation"):
+        module_ids = [int(m.strip()) for m in body["module_rotation"].split(",") if m.strip().isdigit()]
+
+    # Distribuir módulos: si hay 5 módulos y 24 clases → cada módulo ~5 clases
+    def assign_module(idx, total_classes, modules_list):
+        if not modules_list:
+            return None
+        # Distribución balanceada
+        per_module = max(1, total_classes // len(modules_list))
+        mod_idx = min(idx // per_module, len(modules_list) - 1)
+        return modules_list[mod_idx]
+
+    # Crear las clases
+    duration = body.get("duration_min", 90)
+    created_classes = 0
+    for i, naive_dt in enumerate(dates):
+        starts_at = naive_dt.replace(tzinfo=tz.utc)  # Asumimos UTC; conversión TZ ya se hace en frontend
+        ends_at = starts_at + timedelta(minutes=duration)
+        mod_id = assign_module(i, len(dates), module_ids) if module_ids else None
+
+        session = ClassSession(
+            course_id=body["course_id"],
+            level_id=body["level_id"],
+            teacher_id=body["teacher_id"],
+            title=f"{body['name']} — Clase {i+1}",
+            modality=modality,
+            starts_at_utc=starts_at,
+            ends_at_utc=ends_at,
+            meeting_url=body.get("meeting_url"),
+            branch_id=body.get("branch_id"),
+            classroom_id=body.get("classroom_id"),
+            capacity=body.get("capacity", 15),
+            module_id=mod_id,
+            series_id=series.id,
+        )
+        db.add(session)
+        created_classes += 1
+
+    await log_action(db, admin.user_id, "create_class_series", "sessions",
+                     target_id=series.id, details=f"classes={created_classes}")
+    await db.commit()
+
+    return {
+        "ok": True,
+        "series_id": series.id,
+        "classes_created": created_classes,
+        "first_date": dates[0].isoformat() if dates else None,
+        "last_date": dates[-1].isoformat() if dates else None,
+    }
+
+
+@router.get("/class-series")
+async def list_class_series(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.7: Lista todas las series con conteo de clases."""
+    series_list = (await db.execute(
+        select(ClassSeries).order_by(ClassSeries.created_at.desc())
+    )).scalars().all()
+
+    out = []
+    now = datetime.now(tz.utc)
+    for s in series_list:
+        total = (await db.execute(
+            select(func.count()).select_from(ClassSession).where(ClassSession.series_id == s.id)
+        )).scalar() or 0
+        future = (await db.execute(
+            select(func.count()).select_from(ClassSession).where(
+                ClassSession.series_id == s.id,
+                ClassSession.ends_at_utc > now,
+            )
+        )).scalar() or 0
+        # Teacher name
+        t_user = await db.get(User, s.teacher_id)
+        level = await db.get(Level, s.level_id)
+        course = await db.get(Course, s.course_id)
+        out.append({
+            "id": s.id,
+            "name": s.name,
+            "course_id": s.course_id,
+            "course_name": course.name if course else None,
+            "level_id": s.level_id,
+            "level_code": level.code if level else None,
+            "teacher_id": s.teacher_id,
+            "teacher_name": t_user.full_name if t_user else None,
+            "days_of_week": s.days_of_week,
+            "start_time_hhmm": s.start_time_hhmm,
+            "duration_min": s.duration_min,
+            "start_date": s.start_date.isoformat() if s.start_date else None,
+            "end_date": s.end_date.isoformat() if s.end_date else None,
+            "modality": s.modality.value,
+            "is_active": s.is_active,
+            "total_classes": total,
+            "future_classes": future,
+            "past_classes": total - future,
+        })
+    return out
+
+
+@router.delete("/class-series/{series_id}")
+async def delete_class_series(
+    series_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    future_only: bool = True,
+):
+    """V1.7: Elimina una serie. Por default elimina solo clases futuras.
+
+    ?future_only=false → elimina TODAS las clases de la serie + la serie misma
+    ?future_only=true (default) → elimina solo clases futuras + desactiva serie
+    """
+    s = await db.get(ClassSeries, series_id)
+    if not s:
+        raise HTTPException(404, "Serie no encontrada")
+
+    now = datetime.now(tz.utc)
+    if future_only:
+        # Eliminar solo clases futuras
+        future_sessions = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.series_id == series_id,
+                ClassSession.starts_at_utc > now,
+            )
+        )).scalars().all()
+        count = len(future_sessions)
+        for sess in future_sessions:
+            await db.delete(sess)
+        s.is_active = False
+    else:
+        # Eliminar TODAS las clases de la serie
+        all_sessions = (await db.execute(
+            select(ClassSession).where(ClassSession.series_id == series_id)
+        )).scalars().all()
+        count = len(all_sessions)
+        for sess in all_sessions:
+            await db.delete(sess)
+        await db.delete(s)
+
+    await log_action(db, admin.user_id, "delete_class_series", "sessions",
+                     target_id=series_id, details=f"deleted_classes={count}, future_only={future_only}")
+    await db.commit()
+    return {"ok": True, "deleted_classes": count}
+
+
+# === CLASES PRIVADAS 1-a-1 ===
+@router.post("/private-classes", status_code=201)
+async def create_private_class(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.7: Crea una clase privada (1-a-1) asignada a un estudiante específico.
+
+    Body:
+    {
+      "student_id": "uuid",
+      "teacher_id": "uuid",
+      "course_id": 1, "level_id": 4,
+      "title": "Clase particular María - Refuerzo grammar",
+      "starts_at_utc": "2026-06-20T19:00:00Z",
+      "duration_min": 60,
+      "modality": "online",
+      "meeting_url": "https://...",
+      "module_id": null,  // opcional
+      "counts_for_progress": false  // admin elige
+    }
+    """
+    for f in ("student_id", "teacher_id", "course_id", "level_id", "title",
+              "starts_at_utc", "modality"):
+        if not body.get(f):
+            raise HTTPException(400, f"Falta campo: {f}")
+
+    # Validar que el estudiante existe
+    student = await db.get(Student, body["student_id"])
+    if not student:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    try:
+        modality = Modality(body["modality"])
+    except Exception:
+        raise HTTPException(400, "Modalidad inválida")
+
+    # Parse fecha
+    starts_at = datetime.fromisoformat(body["starts_at_utc"].replace("Z", "+00:00"))
+    duration = body.get("duration_min", 60)
+    ends_at = starts_at + timedelta(minutes=duration)
+
+    session = ClassSession(
+        course_id=body["course_id"],
+        level_id=body["level_id"],
+        teacher_id=body["teacher_id"],
+        title=body["title"],
+        description=body.get("description"),
+        modality=modality,
+        starts_at_utc=starts_at,
+        ends_at_utc=ends_at,
+        meeting_url=body.get("meeting_url"),
+        branch_id=body.get("branch_id"),
+        classroom_id=body.get("classroom_id"),
+        capacity=1,  # privada → siempre 1
+        module_id=body.get("module_id"),
+        student_id=body["student_id"],  # V1.7 marca como privada
+        counts_for_progress=body.get("counts_for_progress", True),
+    )
+    db.add(session)
+    await db.flush()
+
+    # Notificar al estudiante
+    teacher = await db.get(User, body["teacher_id"])
+    db.add(Notification(
+        user_id=body["student_id"],
+        type=NotificationType.info,
+        title="👤 Nueva clase privada agendada",
+        body=f"Tu profesor {teacher.full_name if teacher else ''} agendó una clase privada: {body['title']}",
+        link="/dashboard/student",
+    ))
+    # Notificar al profesor
+    student_user = await db.get(User, body["student_id"])
+    db.add(Notification(
+        user_id=body["teacher_id"],
+        type=NotificationType.info,
+        title="📅 Clase privada agendada",
+        body=f"Clase privada con {student_user.full_name if student_user else ''}: {body['title']}",
+        link="/dashboard/teacher",
+    ))
+
+    await log_action(db, admin.user_id, "create_private_class", "sessions",
+                     target_id=session.id)
+    await db.commit()
+
+    return {"ok": True, "session_id": session.id}

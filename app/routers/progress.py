@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, timezone as tz
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -74,9 +74,15 @@ async def my_course_progress(
         modules_out[next_idx]["status"] = "in_progress"
 
     # Próxima clase del estudiante
+    # V1.7: filtrar grupales de su nivel + privadas asignadas a él
     next_session = (await db.execute(
         select(ClassSession).where(
-            ClassSession.level_id == enr.level_id,
+            or_(
+                # Grupal del nivel correcto (no privada)
+                (ClassSession.level_id == enr.level_id) & (ClassSession.student_id.is_(None)),
+                # Privada para este estudiante
+                ClassSession.student_id == user.user_id,
+            ),
             ClassSession.ends_at_utc > datetime.now(tz.utc),  # V1.6.4
             ClassSession.is_open_event.is_(False),
         ).order_by(ClassSession.starts_at_utc).limit(1)
@@ -87,11 +93,13 @@ async def my_course_progress(
         next_session_data = {
             "id": next_session.id, "title": next_session.title,
             "starts_at_utc": next_session.starts_at_utc.isoformat() if next_session.starts_at_utc else None,
+            "ends_at_utc": next_session.ends_at_utc.isoformat() if next_session.ends_at_utc else None,
             "modality": next_session.modality.value,
             "meeting_url": next_session.meeting_url,
             "teacher_name": teacher.full_name if teacher else None,
             "teacher_notes": next_session.teacher_notes,
             "module_id": next_session.module_id,
+            "is_private": next_session.student_id is not None,  # V1.7
         }
 
     # Última clase asistida con notas del profe
