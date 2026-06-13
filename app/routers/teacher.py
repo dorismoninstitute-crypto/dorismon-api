@@ -46,7 +46,7 @@ async def teacher_dashboard(
     next_week = (await db.execute(
         select(func.count()).select_from(ClassSession).where(
             base_filter,
-            ClassSession.starts_at_utc > now,
+            ClassSession.ends_at_utc > now,  # V1.6.4
             ClassSession.starts_at_utc < week_ahead,
             ClassSession.status == SessionStatus.scheduled,
         )

@@ -26,7 +26,7 @@ async def list_open_events(
         select(ClassSession)
         .where(
             ClassSession.is_open_event.is_(True),
-            ClassSession.starts_at_utc > now,
+            ClassSession.ends_at_utc > now,  # V1.6.4
             ClassSession.status == SessionStatus.scheduled,
         )
         .order_by(ClassSession.starts_at_utc)

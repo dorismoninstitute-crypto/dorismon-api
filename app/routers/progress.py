@@ -77,7 +77,7 @@ async def my_course_progress(
     next_session = (await db.execute(
         select(ClassSession).where(
             ClassSession.level_id == enr.level_id,
-            ClassSession.starts_at_utc > datetime.now(tz.utc),
+            ClassSession.ends_at_utc > datetime.now(tz.utc),  # V1.6.4
             ClassSession.is_open_event.is_(False),
         ).order_by(ClassSession.starts_at_utc).limit(1)
     )).scalar_one_or_none()

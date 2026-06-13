@@ -23,6 +23,7 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=72)
     full_name: str = Field(min_length=2, max_length=160)
     phone: Optional[str] = None
+    gender: Optional[str] = None  # V1.6.4: 'male', 'female', 'other' o None
 
 
 class LoginRequest(BaseModel):
@@ -47,6 +48,7 @@ class UserOut(BaseModel):
     phone: Optional[str] = None
     role: str
     avatar_url: Optional[str] = None
+    gender: Optional[str] = None  # V1.6.4
     current_level_id: Optional[int] = None
     placement_done: Optional[bool] = None
 
@@ -56,9 +58,16 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
     existing = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe una cuenta con este email")
+    # V1.6.4: Validar gender
+    gender = None
+    if body.gender:
+        if body.gender not in ("male", "female", "other"):
+            raise HTTPException(400, "gender debe ser 'male', 'female' u 'other'")
+        gender = body.gender
     user = User(
         email=body.email, password_hash=hash_password(body.password),
         full_name=body.full_name, phone=body.phone, role=UserRole.student,
+        gender=gender,
     )
     db.add(user)
     await db.flush()
@@ -107,7 +116,7 @@ async def me(user: Annotated[CurrentUser, Depends(get_current_user)], db: AsyncS
     if not u:
         raise HTTPException(404, "Usuario no encontrado")
     out = UserOut(id=u.id, email=u.email, full_name=u.full_name, phone=u.phone,
-                  role=u.role.value, avatar_url=u.avatar_url)
+                  role=u.role.value, avatar_url=u.avatar_url, gender=u.gender)
     if u.role == UserRole.student:
         st = await db.get(Student, u.id)
         if st:
@@ -139,10 +148,10 @@ async def change_password(
 
 
 class UpdateProfileRequest(BaseModel):
-    """V1.6.3: Actualizar perfil propio (cualquier rol)."""
+    """V1.6.4: Actualizar perfil propio (cualquier rol)."""
     full_name: str | None = Field(default=None, min_length=2, max_length=100)
     phone: str | None = Field(default=None, max_length=30)
-    avatar_url: str | None = Field(default=None, max_length=500)
+    gender: str | None = Field(default=None)  # V1.6.4: 'male', 'female', 'other' o "" para limpiar
     bio: str | None = Field(default=None, max_length=500)  # solo profes
 
 
@@ -152,7 +161,7 @@ async def update_my_profile(
     user: Annotated[CurrentUser, Depends(get_current_user)],
     db: AsyncSession = Depends(get_db),
 ):
-    """V1.6.3: Actualizar perfil propio. Cualquier campo es opcional."""
+    """V1.6.4: Actualizar perfil propio. Cualquier campo es opcional."""
     u = await db.get(User, user.user_id)
     if not u:
         raise HTTPException(404, "Usuario no encontrado")
@@ -161,12 +170,12 @@ async def update_my_profile(
         u.full_name = body.full_name.strip()
     if body.phone is not None:
         u.phone = body.phone.strip() or None
-    if body.avatar_url is not None:
-        # Validar que sea URL HTTPS básica o vacío
-        url = body.avatar_url.strip()
-        if url and not (url.startswith("https://") or url.startswith("http://")):
-            raise HTTPException(400, "La URL del avatar debe empezar con https://")
-        u.avatar_url = url or None
+    if body.gender is not None:
+        # V1.6.4: Validar gender
+        g = body.gender.strip().lower()
+        if g and g not in ("male", "female", "other"):
+            raise HTTPException(400, "gender debe ser 'male', 'female' u 'other'")
+        u.gender = g or None
 
     # bio solo aplica a profes (Teacher.bio)
     if body.bio is not None and user.role == "teacher":
@@ -181,6 +190,7 @@ async def update_my_profile(
         "ok": True,
         "user": {
             "id": u.id, "email": u.email, "full_name": u.full_name,
-            "phone": u.phone, "avatar_url": u.avatar_url, "role": u.role.value,
+            "phone": u.phone, "avatar_url": u.avatar_url, "gender": u.gender,
+            "role": u.role.value,
         },
     }

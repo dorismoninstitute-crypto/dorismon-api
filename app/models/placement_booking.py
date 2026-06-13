@@ -88,6 +88,7 @@ class User(Base):
     phone: Mapped[str | None] = mapped_column(String, nullable=True)
     role: Mapped[UserRole] = mapped_column(default=UserRole.student)
     avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    gender: Mapped[str | None] = mapped_column(String, nullable=True)  # V1.6.4: 'male', 'female', 'other', NULL
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     timezone: Mapped[str] = mapped_column(String, default="America/Santo_Domingo")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

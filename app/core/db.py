@@ -94,6 +94,7 @@ async def init_db():
         # Cada ALTER TABLE puede fallar si la columna ya existe — capturamos y seguimos
         migrations = [
             "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS levels_taught VARCHAR",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS gender VARCHAR",  # V1.6.4: male/female/other/NULL
         ]
         for m in migrations:
             try:

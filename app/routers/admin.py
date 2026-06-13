@@ -44,7 +44,7 @@ async def admin_dashboard(
     )).scalar() or 0
     scheduled = (await db.execute(
         select(func.count()).select_from(ClassSession).where(
-            ClassSession.starts_at_utc > now,
+            ClassSession.ends_at_utc > now,  # V1.6.4
             ClassSession.starts_at_utc < week_ahead,
             ClassSession.status == SessionStatus.scheduled,
         )
@@ -85,6 +85,11 @@ async def admin_dashboard(
     teachers_with_students = set(teachers_with_students_q)
     teachers_without_students = max(0, total_teachers - len(teachers_with_students))
 
+    # V1.6.4: Total módulos cargados (para detectar sistema vacío)
+    total_modules = (await db.execute(
+        select(func.count()).select_from(Module)
+    )).scalar() or 0
+
     return {
         "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
                  "avatar_url": u.avatar_url, "role": "super_admin"},
@@ -99,6 +104,7 @@ async def admin_dashboard(
             "certificates_issued": certs_issued,
             "unassigned_students": unassigned_students,  # V1.5.1
             "teachers_without_students": teachers_without_students,  # V1.5.1
+            "total_modules": total_modules,  # V1.6.4
         },
     }
 
@@ -324,6 +330,22 @@ async def update_lesson(
               "video_url", "pdf_url", "audio_url", "duration_min", "is_published"):
         if f in body:
             setattr(lesson, f, body[f])
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/lessons/{lesson_id}")
+async def delete_lesson(
+    lesson_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.6.4: Eliminar una lección."""
+    lesson = await db.get(Lesson, lesson_id)
+    if not lesson:
+        raise HTTPException(404, "Lección no encontrada")
+    await log_action(db, admin.user_id, "delete_lesson", "catalog", target_id=str(lesson_id))
+    await db.delete(lesson)
     await db.commit()
     return {"ok": True}
 
@@ -1841,6 +1863,7 @@ async def list_certification_candidates(
             "student_name": u.full_name,
             "student_email": u.email,
             "avatar_url": u.avatar_url,
+            "gender": u.gender,
             "course_id": c.id,
             "course_name": c.name,
             "level_id": l.id,
@@ -1921,4 +1944,137 @@ async def issue_certification_quick(
         "certificate_id": cert.id,
         "code": code,
         "verify_url": f"/certificate/{code}",
+    }
+
+
+# ============= V1.6.4 — PLANTILLA DE MÓDULOS PRE-HECHOS =============
+MODULE_TEMPLATES = {
+    "A1": [
+        ("Greetings & Introductions", "Saludos básicos, presentarse, decir nombre/edad/origen.", "Can introduce themself and others, ask and answer questions about personal details."),
+        ("Numbers, Colors, Days", "Vocabulario básico: números 1-100, colores, días de la semana, meses.", "Can use basic vocabulary for everyday situations."),
+        ("Daily Routine", "Presente simple, rutina diaria, vocabulario de hogar y trabajo.", "Can describe daily activities using simple present tense."),
+        ("Family & Friends", "Vocabulario de relaciones, posesivos, descripción física básica.", "Can talk about family members and describe people using simple terms."),
+        ("Food & Restaurant", "Comida, bebidas, ordenar en restaurante, gustos básicos.", "Can order food and drinks, express preferences with like/don't like."),
+    ],
+    "A2": [
+        ("Past Simple", "Pasado simple regular e irregular, rutina del pasado.", "Can describe past events and past routines."),
+        ("Travel & Transportation", "Vocabulario de viajes, transportes, direcciones, hotel.", "Can ask for and give directions, describe travel experiences."),
+        ("Shopping & Money", "Precios, compras, ropa, comparativos básicos.", "Can shop for basic items and compare products."),
+        ("Health & Body", "Partes del cuerpo, dolencias, consejos con should/shouldn't.", "Can describe health problems and give simple advice."),
+        ("Weather & Hobbies", "Clima, tiempo libre, futuro con going to.", "Can talk about weather, hobbies and future plans."),
+    ],
+    "B1": [
+        ("Present Perfect", "Present Perfect Simple y Continuous, experiencias de vida.", "Can describe life experiences and recent events using present perfect."),
+        ("Conditionals 1st & 2nd", "Primera y segunda condicional, situaciones hipotéticas.", "Can talk about real and imaginary situations using conditionals."),
+        ("Reported Speech", "Discurso indirecto, cambios de tiempo verbal.", "Can report what other people said using reported speech."),
+        ("Phrasal Verbs Common", "Phrasal verbs frecuentes en conversación diaria.", "Can understand and use common phrasal verbs in conversation."),
+        ("Work & Career", "Vocabulario profesional, entrevistas, CV, trabajo en equipo.", "Can discuss work-related topics and describe career experiences."),
+    ],
+    "B2": [
+        ("Modal Verbs Advanced", "Modales avanzados: must/can't (deduction), should have, could have.", "Can express deduction, regret and criticism using modal verbs."),
+        ("Passive Voice", "Voz pasiva en todos los tiempos verbales, causative have.", "Can use passive voice appropriately in formal and informal contexts."),
+        ("Conditionals 3rd & Mixed", "Tercera condicional y condicionales mixtas, regret.", "Can talk about hypothetical past situations and their consequences."),
+        ("Idioms & Expressions", "Idioms comunes, expresiones idiomáticas, vocabulario coloquial.", "Can understand and use common idioms in everyday speech."),
+        ("Complex Discussions", "Debates, opiniones, argumentación, vocabulario formal.", "Can participate in extended discussions and defend opinions."),
+    ],
+    "C1": [
+        ("Inversion Structures", "Inversión gramatical, estructuras enfáticas (never have I).", "Can use inverted structures for emphasis in formal contexts."),
+        ("Advanced Relative Clauses", "Cláusulas relativas reducidas, defining vs non-defining.", "Can construct complex sentences with multiple relative clauses."),
+        ("Academic Writing", "Redacción académica, ensayos, párrafos argumentativos.", "Can write structured academic essays with clear arguments."),
+        ("Nuanced Vocabulary", "Sinónimos sutiles, collocations, registros formales/informales.", "Can choose vocabulary with nuance and appropriate register."),
+        ("Professional Contexts", "Inglés de negocios avanzado, presentaciones, negociación.", "Can perform professionally in business meetings and presentations."),
+    ],
+    "C2": [
+        ("Subtle Grammar Distinctions", "Distinciones gramaticales sutiles, native-like accuracy.", "Can use grammar with native-level precision and subtlety."),
+        ("Native-like Idioms", "Idioms avanzados, slang, referencias culturales.", "Can understand and use idiomatic expressions like a native speaker."),
+        ("Cross-cultural Communication", "Comunicación intercultural, sensibilidad cultural.", "Can navigate cross-cultural communication with sensitivity."),
+        ("Argumentative Essays", "Ensayos argumentativos complejos, retórica.", "Can write sophisticated argumentative essays with rhetorical devices."),
+        ("Specialized Vocabulary", "Vocabulario especializado por dominio (legal, médico, técnico).", "Can use specialized vocabulary in professional and academic domains."),
+    ],
+}
+
+LESSON_TEMPLATES_PER_MODULE = [
+    ("Introducción y teoría", "Presentación del tema, conceptos clave, ejemplos guiados.", 30),
+    ("Práctica y aplicación", "Ejercicios prácticos, role-plays, situaciones reales.", 45),
+]
+
+
+@router.post("/load-module-templates")
+async def load_module_templates(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.6.4: Carga plantilla de 30 módulos + 60 lecciones en niveles VACÍOS.
+
+    No toca niveles que ya tengan módulos. Devuelve resumen.
+    """
+    # Obtener todos los niveles
+    levels = (await db.execute(select(Level).order_by(Level.id))).scalars().all()
+    if not levels:
+        raise HTTPException(400, "No hay niveles configurados. Creá los cursos primero.")
+
+    created_modules = 0
+    created_lessons = 0
+    skipped_levels = []
+    processed_levels = []
+
+    for level in levels:
+        # ¿Este nivel ya tiene módulos?
+        existing = (await db.execute(
+            select(func.count()).select_from(Module).where(Module.level_id == level.id)
+        )).scalar() or 0
+        if existing > 0:
+            skipped_levels.append({
+                "level_code": level.code,
+                "existing_modules": existing,
+            })
+            continue
+
+        # Buscar plantilla
+        template = MODULE_TEMPLATES.get(level.code.upper())
+        if not template:
+            continue
+
+        # Crear módulos
+        for idx, (name, description, can_do) in enumerate(template):
+            module = Module(
+                level_id=level.id,
+                name=name,
+                description=description,
+                order_index=idx + 1,
+            )
+            db.add(module)
+            await db.flush()  # para obtener el ID
+            created_modules += 1
+
+            # Crear 2 lecciones template por módulo
+            for lidx, (l_title, l_desc, l_duration) in enumerate(LESSON_TEMPLATES_PER_MODULE):
+                lesson = Lesson(
+                    module_id=module.id,
+                    title=f"{l_title}",
+                    description=l_desc,
+                    objectives=can_do,
+                    can_do=can_do,
+                    duration_min=l_duration,
+                    is_published=True,
+                    order_index=lidx + 1,
+                )
+                db.add(lesson)
+                created_lessons += 1
+
+        processed_levels.append({
+            "level_code": level.code,
+            "modules_created": len(template),
+        })
+
+    await log_action(db, admin.user_id, "load_module_templates", "catalog",
+                     details=f"modules={created_modules}, lessons={created_lessons}")
+    await db.commit()
+
+    return {
+        "ok": True,
+        "modules_created": created_modules,
+        "lessons_created": created_lessons,
+        "processed_levels": processed_levels,
+        "skipped_levels": skipped_levels,
     }

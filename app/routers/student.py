@@ -59,7 +59,7 @@ async def student_dashboard(
     next_sessions_stmt = (
         select(ClassSession)
         .where(
-            ClassSession.starts_at_utc > now,
+            ClassSession.ends_at_utc > now,  # V1.6.4: hasta fin de clase
             ClassSession.starts_at_utc < week_ahead,
             ClassSession.status == "scheduled",
         )
@@ -440,7 +440,7 @@ async def my_calendar(
         sessions = (await db.execute(
             select(ClassSession).where(
                 ClassSession.level_id.in_(enrollments),
-                ClassSession.starts_at_utc >= now,
+                ClassSession.ends_at_utc >= now,  # V1.6.4
                 ClassSession.starts_at_utc < horizon,
                 ClassSession.status == "scheduled",
             ).order_by(ClassSession.starts_at_utc)
