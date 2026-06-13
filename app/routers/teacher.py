@@ -78,15 +78,97 @@ async def teacher_dashboard(
     today_data = []
     for s in today_classes:
         teacher_user = await db.get(User, s.teacher_id)
+        # V1.8: agregar más info útil
+        level = await db.get(Level, s.level_id) if s.level_id else None
         today_data.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
+            "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
             "meeting_url": s.meeting_url, "teacher_name": teacher_user.full_name if teacher_user else "—",
+            "level_code": level.code if level else None,
+            "is_private": s.student_id is not None,  # V1.7
+            "module_id": s.module_id,
         })
+
+    # V1.8: Próximas clases de la semana (no solo hoy)
+    week_classes_q = (await db.execute(
+        select(ClassSession).where(
+            base_filter,
+            ClassSession.starts_at_utc >= today_end,
+            ClassSession.starts_at_utc < week_ahead,
+            ClassSession.status == SessionStatus.scheduled,
+        ).order_by(ClassSession.starts_at_utc).limit(10)
+    )).scalars().all()
+    week_schedule = []
+    for s in week_classes_q:
+        level = await db.get(Level, s.level_id) if s.level_id else None
+        week_schedule.append({
+            "id": s.id, "title": s.title, "modality": s.modality.value,
+            "starts_at_utc": s.starts_at_utc.isoformat(),
+            "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
+            "level_code": level.code if level else None,
+            "is_private": s.student_id is not None,
+        })
+
+    # V1.8: Distribución de estudiantes por nivel
+    levels_distribution = []
+    if teacher.role == "teacher":
+        level_counts = (await db.execute(
+            select(Level.code, Level.name, func.count(func.distinct(Enrollment.student_id)))
+            .join(Enrollment, Enrollment.level_id == Level.id)
+            .where(
+                Enrollment.teacher_id == teacher.user_id,
+                Enrollment.is_active.is_(True),
+            )
+            .group_by(Level.code, Level.name)
+        )).all()
+        for code, name, count in level_counts:
+            levels_distribution.append({
+                "level_code": code, "level_name": name,
+                "student_count": count,
+            })
+
+    # V1.8: Estudiantes con asistencia baja (<70%)
+    students_at_risk = []
+    if teacher.role == "teacher":
+        # Mis estudiantes
+        my_students_q = (await db.execute(
+            select(User, Enrollment, Level)
+            .join(Enrollment, Enrollment.student_id == User.id)
+            .join(Level, Enrollment.level_id == Level.id)
+            .where(
+                Enrollment.teacher_id == teacher.user_id,
+                Enrollment.is_active.is_(True),
+            )
+        )).all()
+        for u, e, l in my_students_q:
+            # Asistencia del estudiante en mis clases
+            att_rows = (await db.execute(
+                select(SessionAttendance.state)
+                .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+                .where(
+                    SessionAttendance.student_id == u.id,
+                    ClassSession.teacher_id == teacher.user_id,
+                )
+            )).all()
+            total = len(att_rows)
+            if total < 3:
+                continue  # ignorar si tiene menos de 3 clases tomadas (poca data)
+            present = sum(1 for (s,) in att_rows if s == AttendanceState.present)
+            pct = round((present / total) * 100, 1)
+            if pct < 70:
+                students_at_risk.append({
+                    "student_id": u.id,
+                    "student_name": u.full_name,
+                    "gender": u.gender,
+                    "level_code": l.code,
+                    "attendance_pct": pct,
+                    "total_classes": total,
+                })
 
     return {
         "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
-                 "avatar_url": u.avatar_url, "role": teacher.role},
+                 "avatar_url": u.avatar_url, "gender": u.gender, "role": teacher.role},
         "stats": {
             "today_classes": len(today_classes),
             "next_week_classes": next_week,
@@ -94,6 +176,9 @@ async def teacher_dashboard(
             "total_students": student_count,
         },
         "today_schedule": today_data,
+        "week_schedule": week_schedule,  # V1.8
+        "levels_distribution": levels_distribution,  # V1.8
+        "students_at_risk": students_at_risk,  # V1.8
     }
 
 
