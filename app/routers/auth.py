@@ -61,7 +61,7 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
         raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe una cuenta con este email")
 
     # V2.1: Validar que el email tenga dominio real (MX records)
-    from app.services.email_service import validate_email_domain, send_email, tpl_welcome, gen_verification_code, is_email_configured
+    from app.services.email_service import validate_email_domain, send_email, tpl_welcome, tpl_welcome_simple, gen_verification_code, is_email_configured
     from app.models import EmailVerification
     valid, err = await validate_email_domain(body.email)
     if not valid:
@@ -74,35 +74,28 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
             raise HTTPException(400, "gender debe ser 'male', 'female' u 'other'")
         gender = body.gender
 
-    # V2.1: usuario empieza con email_verified=False (se verifica con código)
-    # Si no hay servicio email configurado, lo dejamos verificado automáticamente
-    email_verified = not is_email_configured()
-
+    # V2.4: UX SIN FRICCIÓN
+    # Si el email pasó la validación MX, ya sabemos que es real.
+    # Marcamos email_verified=true automáticamente para no bloquear al usuario.
+    # El usuario puede usar la plataforma de inmediato.
+    # El email de bienvenida se envía en segundo plano (informativo, sin código).
     user = User(
         email=body.email, password_hash=hash_password(body.password),
         full_name=body.full_name, phone=body.phone, role=UserRole.student,
         gender=gender,
-        email_verified=email_verified,
+        email_verified=True,  # V2.4: sin fricción, validación MX ya fue hecha
     )
     db.add(user)
     await db.flush()
     db.add(Student(user_id=user.id))
 
-    # V2.1: si hay servicio email, crear código de verificación
+    # V2.4: Email de bienvenida INFORMATIVO en segundo plano (no bloquea)
     if is_email_configured():
-        code = gen_verification_code()
-        ev = EmailVerification(
-            user_id=user.id,
-            code=code,
-            expires_at=datetime.now(tz.utc) + timedelta(minutes=30),
-        )
-        db.add(ev)
-        # Enviar email asíncronamente (no bloqueamos el registro si falla el envío)
         try:
             await send_email(
                 to=body.email,
-                subject="Verificá tu email — Dorismon Language Institute",
-                html=tpl_welcome(body.full_name, code),
+                subject="¡Bienvenido a Dorismon Language Institute!",
+                html=tpl_welcome_simple(body.full_name),
             )
         except Exception:
             pass  # No rompemos el registro si el email falla

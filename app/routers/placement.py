@@ -55,12 +55,9 @@ async def get_placement_questions(
     if user.role != "student":
         raise HTTPException(403, "Solo estudiantes")
 
-    # V2.1.1: Verificar email obligatorio (si Resend configurado)
-    from app.services.email_service import is_email_configured
-    if is_email_configured():
-        u = await db.get(User, user.user_id)
-        if u and not u.email_verified:
-            raise HTTPException(403, "Debes verificar tu email antes de hacer el test. Revisa tu correo o pide un nuevo código.")
+    # V2.4: Verificación de email es OPCIONAL — el usuario puede hacer placement
+    # sin verificar. La verificación se hace en segundo plano por banner suave.
+    # NO bloqueamos al usuario para no perder conversión.
 
     # Obtener TODAS las preguntas activas agrupadas
     all_questions = (await db.execute(

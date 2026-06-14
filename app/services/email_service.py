@@ -118,7 +118,7 @@ def _base_html(content: str) -> str:
     <div class="footer">
       <p>Dorismon Language Institute · Santo Domingo, República Dominicana</p>
       <p>Este email fue enviado automáticamente, no respondas a esta dirección.<br>
-      Si necesitás ayuda, ingresá a la plataforma y andá a la sección "Ayuda".</p>
+      Si necesitas ayuda, entra a la plataforma y ve a la sección "Ayuda".</p>
     </div>
   </div>
 </body>
@@ -132,7 +132,33 @@ def tpl_welcome(name: str, code: str) -> str:
       <p>Tu código de verificación es:</p>
       <div class="code-box">{code}</div>
       <p>Ingresa este código en la pantalla de verificación. <strong>El código vence en 30 minutos.</strong></p>
-      <p>Si no te registraste vos, ignorá este email y la cuenta no se activará.</p>
+      <p>Si no te registraste tú, ignora este email y la cuenta no se activará.</p>
+    """)
+
+
+def tpl_welcome_simple(name: str) -> str:
+    """V2.4: Email de bienvenida informativo, sin código de verificación.
+
+    El usuario ya está activo. Este email es solo confirmación + información útil.
+    """
+    return _base_html(f"""
+      <h2>¡Bienvenido a Dorismon Language Institute, {name}! 🎓</h2>
+      <p>Tu cuenta ya está activa. Te damos la bienvenida a nuestra plataforma de aprendizaje de inglés.</p>
+
+      <h3 style="color: #2563eb; margin-top: 24px;">¿Qué sigue?</h3>
+      <ol style="line-height: 2;">
+        <li><strong>Haz tu test de nivel</strong> — Te toma alrededor de 10 minutos y nos ayuda a ubicarte en el grupo correcto.</li>
+        <li><strong>Espera la asignación</strong> — Nuestro coordinador te asignará un profesor según tu nivel.</li>
+        <li><strong>¡Empieza tus clases!</strong> — Recibirás los enlaces y horarios por la plataforma.</li>
+      </ol>
+
+      <p style="text-align: center; margin-top: 24px;">
+        <a href="{APP_URL}/dashboard" class="button">Ir a mi dashboard</a>
+      </p>
+
+      <p style="font-size: 12px; color: #64748b; margin-top: 24px;">
+        <strong>¿Tienes dudas?</strong> Entra a la sección "Ayuda" en la plataforma y nuestro equipo te responde rápido.
+      </p>
     """)
 
 
@@ -279,12 +305,12 @@ async def validate_email_domain(email: str) -> tuple[bool, str]:
         "correo.com", "email.com",  # genéricos sospechosos
     }
     if domain_lower in blacklist_domains:
-        return False, f"El dominio {domain} no está permitido. Usá tu email real."
+        return False, f"El dominio {domain} no está permitido. Usa tu email real."
 
     # V2.1.1: Bloquear TLDs sospechosos
     suspicious_tlds = (".test", ".invalid", ".localhost", ".local", ".example")
     if any(domain_lower.endswith(t) for t in suspicious_tlds):
-        return False, f"El dominio {domain} no es válido. Usá tu email real."
+        return False, f"El dominio {domain} no es válido. Usa tu email real."
 
     # V2.1.1: Bloquear TLDs raros si el dominio es corto (5-7 chars y TLD raro)
     # Esto bloquea cosas como asdfasdf.xyz, qwerty.io, random.io
