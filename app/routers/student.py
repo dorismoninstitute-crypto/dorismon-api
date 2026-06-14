@@ -1,12 +1,13 @@
 """Student — dashboard, cursos inscritos, tareas, quizzes, expediente, calendario."""
 from typing import Annotated
-from datetime import datetime, timezone as tz, timedelta
+from datetime import datetime, date, timezone as tz, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
 from app.core.db import get_db
+from app.services.audit import log_action  # V2.2
 from app.models import (
     Student, User, Enrollment, Course, Level, Module, Lesson, LessonProgress,
     Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
@@ -661,3 +662,137 @@ async def academic_transcript(
             "code": c.code, "issued_at": c.issued_at.isoformat(),
         } for c in certs],
     }
+
+
+# ============= V2.2 — PERFIL COMPLETO ESTUDIANTE =============
+
+@router.get("/profile")
+async def get_student_profile(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.2: Devuelve el perfil completo del estudiante (datos personales + tutor + emergencia)."""
+    u = await db.get(User, user.user_id)
+    if not u:
+        raise HTTPException(404)
+    s = await db.get(Student, user.user_id)
+
+    # Calcular edad si tiene fecha de nacimiento
+    age = None
+    is_minor = False
+    if s and s.birth_date:
+        today = date.today()
+        age = today.year - s.birth_date.year - ((today.month, today.day) < (s.birth_date.month, s.birth_date.day))
+        is_minor = age < 18
+
+    return {
+        # Datos del User
+        "user_id": u.id,
+        "email": u.email,
+        "full_name": u.full_name,
+        "phone": u.phone,
+        "gender": u.gender,
+        "avatar_url": u.avatar_url,
+        "email_verified": u.email_verified,
+        # Datos personales
+        "birth_date": s.birth_date.isoformat() if s and s.birth_date else None,
+        "age": age,
+        "is_minor": is_minor,
+        "document_type": s.document_type if s else None,
+        "document_number": s.document_number if s else None,
+        "address": s.address if s else None,
+        "city": s.city if s else None,
+        "sector": s.sector if s else None,
+        "nationality": s.nationality if s else None,
+        # Contacto emergencia
+        "emergency_contact_name": s.emergency_contact_name if s else None,
+        "emergency_contact_relationship": s.emergency_contact_relationship if s else None,
+        "emergency_contact_phone": s.emergency_contact_phone if s else None,
+        # Tutor (si es menor)
+        "tutor_name": s.tutor_name if s else None,
+        "tutor_relationship": s.tutor_relationship if s else None,
+        "tutor_document": s.tutor_document if s else None,
+        "tutor_phone": s.tutor_phone if s else None,
+        "tutor_email": s.tutor_email if s else None,
+        # Info adicional
+        "how_found_us": s.how_found_us if s else None,
+        "referred_by": s.referred_by if s else None,
+        "special_notes": s.special_notes if s else None,
+        # Estado de completitud
+        "profile_complete": _is_profile_complete(s) if s else False,
+    }
+
+
+def _is_profile_complete(s) -> bool:
+    """V2.2: Verifica si el perfil está completo."""
+    if not s:
+        return False
+    required = [s.birth_date, s.document_type, s.document_number, s.address,
+                s.emergency_contact_name, s.emergency_contact_phone]
+    if not all(required):
+        return False
+    # Si es menor, validar también datos de tutor
+    if s.birth_date:
+        today = date.today()
+        age = today.year - s.birth_date.year - ((today.month, today.day) < (s.birth_date.month, s.birth_date.day))
+        if age < 18:
+            tutor_required = [s.tutor_name, s.tutor_phone, s.tutor_document]
+            if not all(tutor_required):
+                return False
+    return True
+
+
+@router.patch("/profile")
+async def update_student_profile(
+    body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.2: Actualiza el perfil completo del estudiante.
+
+    Body puede tener cualquier campo del perfil. Solo los enviados se actualizan.
+    """
+    s = await db.get(Student, user.user_id)
+    if not s:
+        raise HTTPException(404, "Perfil de estudiante no encontrado")
+
+    # Campos editables
+    str_fields = [
+        "document_type", "document_number", "address", "city", "sector", "nationality",
+        "emergency_contact_name", "emergency_contact_relationship", "emergency_contact_phone",
+        "tutor_name", "tutor_relationship", "tutor_document", "tutor_phone", "tutor_email",
+        "how_found_us", "referred_by", "special_notes",
+    ]
+    for f in str_fields:
+        if f in body:
+            val = body[f]
+            if val == "":
+                val = None
+            setattr(s, f, val)
+
+    # Birth date
+    if "birth_date" in body:
+        val = body["birth_date"]
+        if val:
+            try:
+                s.birth_date = date.fromisoformat(val)
+            except Exception:
+                raise HTTPException(400, "Fecha de nacimiento inválida (formato: YYYY-MM-DD)")
+        else:
+            s.birth_date = None
+
+    # Validar: si es menor, datos de tutor son obligatorios
+    if s.birth_date:
+        today = date.today()
+        age = today.year - s.birth_date.year - ((today.month, today.day) < (s.birth_date.month, s.birth_date.day))
+        if age < 18:
+            # Si el usuario está intentando completar el perfil (mandó al menos un campo de tutor)
+            # validamos que estén todos
+            tutor_fields_sent = any(f in body for f in ["tutor_name", "tutor_phone", "tutor_document"])
+            if tutor_fields_sent and not all([s.tutor_name, s.tutor_phone, s.tutor_document]):
+                raise HTTPException(400,
+                    "Como sos menor de edad, los datos del tutor son obligatorios: nombre, teléfono y documento")
+
+    await log_action(db, user.user_id, "update_profile", "students", target_id=user.user_id)
+    await db.commit()
+    return {"ok": True, "profile_complete": _is_profile_complete(s)}

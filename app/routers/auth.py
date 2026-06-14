@@ -349,13 +349,31 @@ async def forgot_password(
 ):
     """V2.1: Envía email con link para resetear contraseña.
 
+    V2.1.2: Con logging detallado para diagnóstico.
     Por seguridad SIEMPRE retorna ok=True (no revela si el email existe).
     """
+    import logging
+    log = logging.getLogger(__name__)
+    log.info(f"[FORGOT-PASSWORD] Pedido recibido para email: {body.email}")
+
     from app.models import PasswordReset
     from app.services.email_service import send_email, tpl_password_reset, gen_reset_token, is_email_configured
 
+    # V2.1.2: log para diagnóstico
+    if not is_email_configured():
+        log.warning("[FORGOT-PASSWORD] is_email_configured() = False — RESEND_API_KEY no está cargada en runtime")
+
     user = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
-    if user and user.is_active and is_email_configured():
+
+    if not user:
+        log.warning(f"[FORGOT-PASSWORD] Usuario NO encontrado en DB para email: {body.email}")
+    elif not user.is_active:
+        log.warning(f"[FORGOT-PASSWORD] Usuario {body.email} está inactivo")
+    elif not is_email_configured():
+        log.warning(f"[FORGOT-PASSWORD] Usuario {body.email} existe pero servicio email no configurado")
+    else:
+        log.info(f"[FORGOT-PASSWORD] Usuario {body.email} encontrado y activo — generando token")
+
         # Invalidar tokens anteriores no usados
         old_tokens = (await db.execute(
             select(PasswordReset).where(
@@ -373,16 +391,68 @@ async def forgot_password(
             expires_at=datetime.now(tz.utc) + timedelta(hours=2),
         )
         db.add(pr)
-        await send_email(
+        log.info(f"[FORGOT-PASSWORD] Llamando a send_email para {user.email}")
+        result = await send_email(
             to=user.email,
             subject="Recuperá tu contraseña — Dorismon",
             html=tpl_password_reset(user.full_name, token),
         )
+        log.info(f"[FORGOT-PASSWORD] send_email retornó: {result}")
         await log_action(db, user.id, "forgot_password_request", "auth", target_id=user.id)
         await db.commit()
 
     # Respuesta uniforme aunque no exista el usuario
     return {"ok": True, "message": "Si el email existe, recibirás un link de recuperación."}
+
+
+@router.post("/test-email")
+async def test_email_endpoint(body: dict):
+    """V2.1.2: Endpoint público de diagnóstico — envía un email de prueba.
+
+    USO: POST /auth/test-email con body {"to": "tu@email.com"}
+    Sirve para probar Resend SIN depender de usuarios existentes.
+
+    Logs detallados: si falla, los logs de Render te dicen exactamente por qué.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    from app.services.email_service import send_email, is_email_configured, _base_html
+
+    to = body.get("to")
+    if not to or "@" not in to:
+        raise HTTPException(400, "Falta campo 'to' con un email válido")
+
+    log.info(f"[TEST-EMAIL] Intentando enviar email de prueba a: {to}")
+
+    if not is_email_configured():
+        log.error("[TEST-EMAIL] is_email_configured() = False")
+        return {
+            "ok": False,
+            "error": "Servicio de email no configurado (RESEND_API_KEY no cargada)",
+            "debug": "Verificar variable RESEND_API_KEY en Render → Environment → forzar redeploy"
+        }
+
+    html = _base_html("""
+        <h2>✅ Email de prueba</h2>
+        <p>Si recibiste este email, Resend está funcionando correctamente.</p>
+        <p>El sistema de emails de Dorismon está operativo.</p>
+    """)
+
+    try:
+        result = await send_email(
+            to=to,
+            subject="✅ Test de email — Dorismon",
+            html=html,
+        )
+        log.info(f"[TEST-EMAIL] Resultado: {result}")
+        return {
+            "ok": result,
+            "to": to,
+            "message": "Email enviado a Resend. Revisá tu inbox + spam en 1-2 min. También revisá Resend Logs."
+        }
+    except Exception as e:
+        log.error(f"[TEST-EMAIL] Excepción: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 class ResetPasswordRequest(BaseModel):

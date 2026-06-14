@@ -104,6 +104,23 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE",  # V2.1
             # V2.1: marcar usuarios existentes como verificados (no romper acceso)
             "UPDATE users SET email_verified = TRUE WHERE email_verified IS NULL OR email_verified = FALSE",
+            # V2.2: Perfil completo estudiante
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS document_type VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS document_number VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS city VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS sector VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS nationality VARCHAR DEFAULT 'Dominicana'",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS emergency_contact_name VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS emergency_contact_relationship VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS emergency_contact_phone VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS tutor_name VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS tutor_relationship VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS tutor_document VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS tutor_phone VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS tutor_email VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS how_found_us VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS referred_by VARCHAR",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS special_notes TEXT",
         ]
         for m in migrations:
             try:

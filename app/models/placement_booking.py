@@ -116,6 +116,30 @@ class Student(Base):
     streak_days: Mapped[int] = mapped_column(Integer, default=0)
     last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # V2.2: Datos personales adicionales
+    document_type: Mapped[str | None] = mapped_column(String, nullable=True)  # cedula/pasaporte/otro
+    document_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    city: Mapped[str | None] = mapped_column(String, nullable=True)
+    sector: Mapped[str | None] = mapped_column(String, nullable=True)
+    nationality: Mapped[str | None] = mapped_column(String, nullable=True, default="Dominicana")
+
+    # V2.2: Contacto de emergencia detallado
+    emergency_contact_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    emergency_contact_relationship: Mapped[str | None] = mapped_column(String, nullable=True)  # padre/madre/etc
+    emergency_contact_phone: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # V2.2: Tutor (obligatorio si menor de edad)
+    tutor_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    tutor_relationship: Mapped[str | None] = mapped_column(String, nullable=True)
+    tutor_document: Mapped[str | None] = mapped_column(String, nullable=True)
+    tutor_phone: Mapped[str | None] = mapped_column(String, nullable=True)
+    tutor_email: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # V2.2: Información adicional
+    how_found_us: Mapped[str | None] = mapped_column(String, nullable=True)  # google/facebook/referred/etc
+    referred_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    special_notes: Mapped[str | None] = mapped_column(Text, nullable=True)  # alergias, condiciones, etc.
+
 
 class Teacher(Base):
     __tablename__ = "teachers"

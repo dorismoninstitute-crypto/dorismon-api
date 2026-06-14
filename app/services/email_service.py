@@ -33,33 +33,36 @@ async def send_email(to: str, subject: str, html: str, text: str = "") -> bool:
     Si no hay API key configurada, loguea y retorna False (no rompe).
     """
     if not RESEND_API_KEY:
-        logger.info(f"[EMAIL SKIPPED — no RESEND_API_KEY] to={to}, subject={subject}")
+        logger.warning(f"[EMAIL] ⚠️ NO HAY RESEND_API_KEY configurada. Email a {to} NO se envió.")
         return False
+
+    logger.info(f"[EMAIL] Enviando a Resend: to={to}, subject={subject[:50]}, from={EMAIL_FROM}, key_len={len(RESEND_API_KEY)}")
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            payload = {
+                "from": EMAIL_FROM,
+                "to": [to],
+                "subject": subject,
+                "html": html,
+                "text": text or _html_to_text(html),
+            }
             r = await client.post(
                 "https://api.resend.com/emails",
                 headers={
                     "Authorization": f"Bearer {RESEND_API_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "from": EMAIL_FROM,
-                    "to": [to],
-                    "subject": subject,
-                    "html": html,
-                    "text": text or _html_to_text(html),
-                },
+                json=payload,
             )
             if r.status_code in (200, 201, 202):
-                logger.info(f"[EMAIL OK] to={to}, subject={subject}")
+                logger.info(f"[EMAIL ✅ OK] to={to}, resend_status={r.status_code}, response={r.text[:200]}")
                 return True
             else:
-                logger.error(f"[EMAIL FAIL] to={to}, status={r.status_code}, body={r.text[:200]}")
+                logger.error(f"[EMAIL ❌ FAIL] to={to}, resend_status={r.status_code}, body={r.text[:500]}")
                 return False
     except Exception as e:
-        logger.error(f"[EMAIL EXCEPTION] to={to}, error={e}")
+        logger.error(f"[EMAIL ❌ EXCEPTION] to={to}, error={type(e).__name__}: {e}")
         return False
 
 

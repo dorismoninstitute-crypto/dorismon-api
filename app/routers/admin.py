@@ -1,6 +1,6 @@
 """Admin — gestión completa del instituto."""
 from typing import Annotated
-from datetime import datetime, timedelta, timezone as tz
+from datetime import datetime, date, timedelta, timezone as tz
 from secrets import token_urlsafe
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_
@@ -2789,3 +2789,91 @@ async def teacher_payment_history(
         "notes": p.notes,
         "paid_at": p.paid_at.isoformat() if p.paid_at else None,
     } for p in payments]
+
+
+# ============= V2.2 — PERFIL DETALLADO DE ESTUDIANTE (ADMIN) =============
+
+@router.get("/students/{student_id}/profile")
+async def admin_get_student_profile(
+    student_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.2: Admin obtiene el perfil completo de un estudiante."""
+    u = await db.get(User, student_id)
+    if not u or u.role != UserRole.student:
+        raise HTTPException(404, "Estudiante no encontrado")
+    s = await db.get(Student, student_id)
+
+    age = None
+    is_minor = False
+    if s and s.birth_date:
+        today = date.today()
+        age = today.year - s.birth_date.year - ((today.month, today.day) < (s.birth_date.month, s.birth_date.day))
+        is_minor = age < 18
+
+    return {
+        "user_id": u.id, "email": u.email, "full_name": u.full_name, "phone": u.phone,
+        "gender": u.gender, "avatar_url": u.avatar_url, "email_verified": u.email_verified,
+        "is_active": u.is_active,
+        "birth_date": s.birth_date.isoformat() if s and s.birth_date else None,
+        "age": age, "is_minor": is_minor,
+        "document_type": s.document_type if s else None,
+        "document_number": s.document_number if s else None,
+        "address": s.address if s else None,
+        "city": s.city if s else None,
+        "sector": s.sector if s else None,
+        "nationality": s.nationality if s else None,
+        "emergency_contact_name": s.emergency_contact_name if s else None,
+        "emergency_contact_relationship": s.emergency_contact_relationship if s else None,
+        "emergency_contact_phone": s.emergency_contact_phone if s else None,
+        "tutor_name": s.tutor_name if s else None,
+        "tutor_relationship": s.tutor_relationship if s else None,
+        "tutor_document": s.tutor_document if s else None,
+        "tutor_phone": s.tutor_phone if s else None,
+        "tutor_email": s.tutor_email if s else None,
+        "how_found_us": s.how_found_us if s else None,
+        "referred_by": s.referred_by if s else None,
+        "special_notes": s.special_notes if s else None,
+        "enrolled_at": s.enrolled_at.isoformat() if s and s.enrolled_at else None,
+        "is_paused": s.is_paused if s else False,
+    }
+
+
+@router.patch("/students/{student_id}/profile")
+async def admin_update_student_profile(
+    student_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.2: Admin edita el perfil completo de un estudiante."""
+    s = await db.get(Student, student_id)
+    if not s:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    str_fields = [
+        "document_type", "document_number", "address", "city", "sector", "nationality",
+        "emergency_contact_name", "emergency_contact_relationship", "emergency_contact_phone",
+        "tutor_name", "tutor_relationship", "tutor_document", "tutor_phone", "tutor_email",
+        "how_found_us", "referred_by", "special_notes",
+    ]
+    for f in str_fields:
+        if f in body:
+            val = body[f]
+            if val == "":
+                val = None
+            setattr(s, f, val)
+
+    if "birth_date" in body:
+        val = body["birth_date"]
+        if val:
+            try:
+                s.birth_date = date.fromisoformat(val)
+            except Exception:
+                raise HTTPException(400, "Fecha de nacimiento inválida")
+        else:
+            s.birth_date = None
+
+    await log_action(db, admin.user_id, "admin_update_student_profile", "students", target_id=student_id)
+    await db.commit()
+    return {"ok": True}

@@ -1,8 +1,18 @@
 """Dorismon API V1.0 — academia de inglés (online/presencial/hibrida)."""
 import os
+import logging
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# V2.1.2: configurar logging visible en Render
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 
 from app.routers import auth, catalog, student, teacher, admin, certificates, placement, events, progress, calendar, messages
 from app.core.db import init_db
