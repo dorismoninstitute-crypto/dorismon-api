@@ -714,3 +714,57 @@ async def teacher_students_by_level(
         {"level_id": k[0], "level_code": k[1], "level_name": k[2], "students": v, "count": len(v)}
         for k, v in by_level.items()
     ]
+
+
+# ============= V1.9 — INGRESOS DEL PROFESOR =============
+
+@router.get("/income")
+async def teacher_income(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+    year: int | None = None,
+    month: int | None = None,
+):
+    """V1.9: Lo que el profe ganó/va a ganar en un período."""
+    # Reusamos el helper de admin
+    from app.routers.admin import _calculate_teacher_period
+    now = datetime.now(tz.utc)
+    y = year or now.year
+    m = month or now.month
+
+    period = await _calculate_teacher_period(db, teacher.user_id, y, m)
+    if not period:
+        raise HTTPException(404, "Datos no disponibles")
+
+    u = await db.get(User, teacher.user_id)
+    period["teacher_name"] = u.full_name if u else "—"
+
+    # No revelamos al profe el classes_detail con detalles de pago de OTROS profes, pero acá es del propio profe → OK
+    return period
+
+
+@router.get("/income-history")
+async def teacher_income_history(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.9: Historial de pagos recibidos."""
+    from app.models import TeacherPayment
+    payments = (await db.execute(
+        select(TeacherPayment).where(TeacherPayment.teacher_id == teacher.user_id)
+        .order_by(TeacherPayment.period_year.desc(), TeacherPayment.period_month.desc())
+    )).scalars().all()
+    return [{
+        "id": p.id,
+        "period_year": p.period_year,
+        "period_month": p.period_month,
+        "classes_count": p.classes_count,
+        "group_count": p.group_count,
+        "private_count": p.private_count,
+        "event_count": p.event_count,
+        "total_amount": p.total_amount,
+        "currency": p.currency,
+        "payment_method": p.payment_method,
+        "reference": p.reference,
+        "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+    } for p in payments]

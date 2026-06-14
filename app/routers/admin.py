@@ -13,9 +13,9 @@ from app.models import (
     User, Teacher, Student, Course, Level, Module, Lesson, LessonProgress,
     Enrollment, Branch, Classroom, ClassSession, ClassSeries, SessionAttendance,
     Assignment, AssignmentSubmission, Quiz, Material, Plan, Payment,
-    Certificate, InstituteSetting, AuditLog, Notification,
+    Certificate, InstituteSetting, AuditLog, Notification, TeacherPayment,
     UserRole, Modality, SessionStatus, MaterialType, PaymentStatus, NotificationType,
-    PlanFeature, ModuleProgress, EventRegistration,
+    PlanFeature, ModuleProgress, EventRegistration, AttendanceState,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -2434,3 +2434,337 @@ async def create_private_class(
     await db.commit()
 
     return {"ok": True, "session_id": session.id}
+
+
+# ============= V1.9 — PAGOS A PROFESORES =============
+
+def _classify_class_type(session: ClassSession) -> str:
+    """Determina el tipo de clase para tarifa: group / private / event."""
+    if session.is_open_event:
+        return "event"
+    if session.student_id is not None:
+        return "private"
+    return "group"
+
+
+async def _calculate_teacher_period(db: AsyncSession, teacher_id: str, year: int, month: int):
+    """V1.9: Calcula lo que el profe ganó en un período (año/mes).
+
+    Solo cuenta clases con asistencia tomada (al menos 1 registro de asistencia).
+    Si la clase está cancelada, NO cuenta.
+
+    Retorna dict con conteo y totales.
+    """
+    from datetime import datetime as dt
+    # Rango del mes
+    period_start = dt(year, month, 1, tzinfo=tz.utc)
+    if month == 12:
+        period_end = dt(year + 1, 1, 1, tzinfo=tz.utc)
+    else:
+        period_end = dt(year, month + 1, 1, tzinfo=tz.utc)
+
+    # Obtener tarifas del profe
+    t = await db.get(Teacher, teacher_id)
+    if not t:
+        return None
+    rates = {"group": t.rate_group, "private": t.rate_private, "event": t.rate_event}
+
+    # Clases del profe en el período (no canceladas)
+    sessions = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.teacher_id == teacher_id,
+            ClassSession.starts_at_utc >= period_start,
+            ClassSession.starts_at_utc < period_end,
+            ClassSession.status != SessionStatus.cancelled,
+        ).order_by(ClassSession.starts_at_utc)
+    )).scalars().all()
+
+    classes_detail = []
+    group_count = 0
+    private_count = 0
+    event_count = 0
+    total = 0.0
+    classes_paid_for = 0
+    now_aware = datetime.now(tz.utc)
+
+    for s in sessions:
+        # ¿Tiene asistencia tomada?
+        att_count = (await db.execute(
+            select(func.count()).select_from(SessionAttendance).where(SessionAttendance.session_id == s.id)
+        )).scalar() or 0
+        has_attendance = att_count > 0
+
+        ctype = _classify_class_type(s)
+        rate = rates.get(ctype, 0)
+
+        # Solo cobra si:
+        # 1. Hay asistencia tomada (profe dio la clase)
+        # 2. La clase ya pasó (ends_at_utc < ahora) o tiene asistencia
+        # Fix V1.9: normalizar tzinfo si vino naive (SQLite a veces lo entrega así)
+        already_ended = False
+        if s.ends_at_utc:
+            ends = s.ends_at_utc if s.ends_at_utc.tzinfo else s.ends_at_utc.replace(tzinfo=tz.utc)
+            already_ended = ends < now_aware
+        counts = has_attendance and already_ended
+
+        if counts:
+            total += rate
+            classes_paid_for += 1
+            if ctype == "group": group_count += 1
+            elif ctype == "private": private_count += 1
+            elif ctype == "event": event_count += 1
+
+        classes_detail.append({
+            "session_id": s.id,
+            "title": s.title,
+            "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+            "type": ctype,
+            "rate": rate,
+            "has_attendance": has_attendance,
+            "already_ended": already_ended,
+            "counts_for_pay": counts,
+        })
+
+    # ¿Ya está pagado este período?
+    existing_payment = (await db.execute(
+        select(TeacherPayment).where(
+            TeacherPayment.teacher_id == teacher_id,
+            TeacherPayment.period_year == year,
+            TeacherPayment.period_month == month,
+        )
+    )).scalar_one_or_none()
+
+    return {
+        "teacher_id": teacher_id,
+        "year": year,
+        "month": month,
+        "total_amount": round(total, 2),
+        "currency": "DOP",
+        "classes_count": classes_paid_for,
+        "group_count": group_count,
+        "private_count": private_count,
+        "event_count": event_count,
+        "rates": rates,
+        "classes_detail": classes_detail,
+        "is_paid": existing_payment is not None,
+        "paid_at": existing_payment.paid_at.isoformat() if existing_payment else None,
+        "payment_id": existing_payment.id if existing_payment else None,
+        "payment_method": existing_payment.payment_method if existing_payment else None,
+        "reference": existing_payment.reference if existing_payment else None,
+    }
+
+
+@router.get("/teacher-payments")
+async def list_teacher_payments(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    year: int | None = None,
+    month: int | None = None,
+):
+    """V1.9: Lista lo que se debe pagar a CADA profe en el período (default mes actual)."""
+    now = datetime.now(tz.utc)
+    y = year or now.year
+    m = month or now.month
+
+    teachers = (await db.execute(select(Teacher))).scalars().all()
+    out = []
+    for t in teachers:
+        u = await db.get(User, t.user_id)
+        if not u or not u.is_active:
+            continue
+        period = await _calculate_teacher_period(db, t.user_id, y, m)
+        if not period:
+            continue
+        out.append({
+            "teacher_id": t.user_id,
+            "teacher_name": u.full_name,
+            "gender": u.gender,
+            "rate_group": t.rate_group,
+            "rate_private": t.rate_private,
+            "rate_event": t.rate_event,
+            "year": y,
+            "month": m,
+            "total_amount": period["total_amount"],
+            "classes_count": period["classes_count"],
+            "group_count": period["group_count"],
+            "private_count": period["private_count"],
+            "event_count": period["event_count"],
+            "is_paid": period["is_paid"],
+            "paid_at": period["paid_at"],
+            "payment_id": period["payment_id"],
+        })
+    # Ordenar de mayor a menor
+    out.sort(key=lambda x: -x["total_amount"])
+    return {
+        "year": y, "month": m,
+        "items": out,
+        "summary": {
+            "total_to_pay": round(sum(o["total_amount"] for o in out if not o["is_paid"]), 2),
+            "total_paid": round(sum(o["total_amount"] for o in out if o["is_paid"]), 2),
+            "teachers_pending": sum(1 for o in out if not o["is_paid"] and o["total_amount"] > 0),
+            "teachers_paid": sum(1 for o in out if o["is_paid"]),
+        },
+    }
+
+
+@router.get("/teacher-payments/{teacher_id}/{year}/{month}")
+async def get_teacher_payment_detail(
+    teacher_id: str, year: int, month: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.9: Detalle clase x clase de lo que el profe va a cobrar."""
+    period = await _calculate_teacher_period(db, teacher_id, year, month)
+    if not period:
+        raise HTTPException(404, "Profesor no encontrado")
+    u = await db.get(User, teacher_id)
+    period["teacher_name"] = u.full_name if u else "—"
+    period["teacher_email"] = u.email if u else None
+    return period
+
+
+@router.post("/teacher-payments/mark-paid")
+async def mark_teacher_payment_paid(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.9: Marca un pago como realizado.
+
+    Body:
+    {
+      "teacher_id": "uuid",
+      "year": 2026, "month": 6,
+      "payment_method": "transferencia",  // opcional
+      "reference": "TRX-12345",            // opcional
+      "notes": "Pago de junio"             // opcional
+    }
+    """
+    teacher_id = body.get("teacher_id")
+    year = body.get("year")
+    month = body.get("month")
+    if not teacher_id or not year or not month:
+        raise HTTPException(400, "Faltan campos: teacher_id, year, month")
+
+    # ¿Ya existe pago para este período?
+    existing = (await db.execute(
+        select(TeacherPayment).where(
+            TeacherPayment.teacher_id == teacher_id,
+            TeacherPayment.period_year == year,
+            TeacherPayment.period_month == month,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(400, "Este período ya está marcado como pagado")
+
+    period = await _calculate_teacher_period(db, teacher_id, year, month)
+    if not period:
+        raise HTTPException(404, "Profesor no encontrado")
+
+    if period["total_amount"] <= 0:
+        raise HTTPException(400, "No hay clases pagables en este período")
+
+    payment = TeacherPayment(
+        teacher_id=teacher_id,
+        period_year=year,
+        period_month=month,
+        classes_count=period["classes_count"],
+        group_count=period["group_count"],
+        private_count=period["private_count"],
+        event_count=period["event_count"],
+        total_amount=period["total_amount"],
+        currency=period["currency"],
+        payment_method=body.get("payment_method"),
+        reference=body.get("reference"),
+        notes=body.get("notes"),
+        paid_by_admin_id=admin.user_id,
+    )
+    db.add(payment)
+
+    # Notificar al profe
+    db.add(Notification(
+        user_id=teacher_id,
+        type=NotificationType.info,
+        title="💰 Pago recibido",
+        body=f"Se registró el pago de tu período {month:02d}/{year} por RD$ {period['total_amount']:,.2f}",
+        link="/dashboard/teacher/income",
+    ))
+
+    await log_action(db, admin.user_id, "mark_teacher_payment_paid", "payments",
+                     target_id=payment.id,
+                     details=f"teacher={teacher_id}, period={year}-{month:02d}, amount={period['total_amount']}")
+    await db.commit()
+    return {"ok": True, "payment_id": payment.id, "amount": period["total_amount"]}
+
+
+@router.delete("/teacher-payments/{payment_id}")
+async def delete_teacher_payment(
+    payment_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.9: Revertir un pago marcado por error."""
+    p = await db.get(TeacherPayment, payment_id)
+    if not p:
+        raise HTTPException(404, "Pago no encontrado")
+    await log_action(db, admin.user_id, "delete_teacher_payment", "payments",
+                     target_id=payment_id, details=f"amount={p.total_amount}")
+    await db.delete(p)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.patch("/teachers/{teacher_id}/rates")
+async def update_teacher_rates(
+    teacher_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.9: Actualiza tarifas de pago de un profesor."""
+    t = await db.get(Teacher, teacher_id)
+    if not t:
+        raise HTTPException(404, "Profesor no encontrado")
+    for f in ("rate_group", "rate_private", "rate_event"):
+        if f in body:
+            val = float(body[f])
+            if val < 0:
+                raise HTTPException(400, f"{f} no puede ser negativo")
+            setattr(t, f, val)
+    await log_action(db, admin.user_id, "update_teacher_rates", "users",
+                     target_id=teacher_id,
+                     details=f"group={t.rate_group}, private={t.rate_private}, event={t.rate_event}")
+    await db.commit()
+    return {
+        "ok": True,
+        "rate_group": t.rate_group,
+        "rate_private": t.rate_private,
+        "rate_event": t.rate_event,
+    }
+
+
+@router.get("/teacher-payments-history/{teacher_id}")
+async def teacher_payment_history(
+    teacher_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V1.9: Historial de pagos a un profe."""
+    payments = (await db.execute(
+        select(TeacherPayment).where(TeacherPayment.teacher_id == teacher_id)
+        .order_by(TeacherPayment.period_year.desc(), TeacherPayment.period_month.desc())
+    )).scalars().all()
+    return [{
+        "id": p.id,
+        "period_year": p.period_year,
+        "period_month": p.period_month,
+        "classes_count": p.classes_count,
+        "group_count": p.group_count,
+        "private_count": p.private_count,
+        "event_count": p.event_count,
+        "total_amount": p.total_amount,
+        "currency": p.currency,
+        "payment_method": p.payment_method,
+        "reference": p.reference,
+        "notes": p.notes,
+        "paid_at": p.paid_at.isoformat() if p.paid_at else None,
+    } for p in payments]

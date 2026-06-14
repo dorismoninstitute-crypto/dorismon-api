@@ -7,7 +7,7 @@ from __future__ import annotations
 from datetime import datetime, date
 from uuid import uuid4
 from sqlalchemy import (
-    String, ForeignKey, Numeric, Boolean, DateTime, Integer, Date, Text,
+    String, ForeignKey, Numeric, Boolean, DateTime, Integer, Date, Text, Float,
     func, Index, UniqueConstraint, JSON,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -122,8 +122,36 @@ class Teacher(Base):
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
     specialties: Mapped[str] = mapped_column(String, default="")
     modalities: Mapped[str] = mapped_column(String, default="online")
-    levels_taught: Mapped[str | None] = mapped_column(String, nullable=True)  # V1.5.1: "A1,A2,B1" — niveles que enseña
+    levels_taught: Mapped[str | None] = mapped_column(String, nullable=True)  # V1.5.1
     hire_date: Mapped[date] = mapped_column(Date, default=date.today)
+    # V1.9: Tarifas de pago por tipo de clase (en moneda local, ej: RD$)
+    rate_group: Mapped[float] = mapped_column(Float, default=500.0)  # clase grupal regular
+    rate_private: Mapped[float] = mapped_column(Float, default=1000.0)  # clase privada 1-a-1
+    rate_event: Mapped[float] = mapped_column(Float, default=750.0)  # evento/workshop
+
+
+class TeacherPayment(Base):
+    """V1.9: Registro de pagos a profesores por período mensual.
+
+    Se crea cuando el admin marca como pagado un período.
+    El cálculo de "lo que falta cobrar" se hace on-the-fly basado en clases con asistencia.
+    """
+    __tablename__ = "teacher_payments"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    teacher_id: Mapped[str] = mapped_column(ForeignKey("teachers.user_id"))
+    period_year: Mapped[int] = mapped_column(Integer)  # 2026
+    period_month: Mapped[int] = mapped_column(Integer)  # 1-12
+    classes_count: Mapped[int] = mapped_column(Integer)  # snapshot al momento de pagar
+    group_count: Mapped[int] = mapped_column(Integer, default=0)
+    private_count: Mapped[int] = mapped_column(Integer, default=0)
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_amount: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String, default="DOP")  # peso dominicano
+    payment_method: Mapped[str | None] = mapped_column(String, nullable=True)  # transferencia/efectivo/etc
+    reference: Mapped[str | None] = mapped_column(String, nullable=True)  # # de transferencia
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    paid_by_admin_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
 
 
 class Course(Base):
@@ -570,3 +598,54 @@ class PlanFeature(Base):
     feature: Mapped[str] = mapped_column(String)
     is_included: Mapped[bool] = mapped_column(Boolean, default=True)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MessageCategory(str, enum.Enum):
+    """V2.0: Categoría del mensaje/ticket."""
+    general = "general"           # Mensaje normal
+    urgent = "urgent"             # Problema urgente (link no funciona, no entra)
+    consultation = "consultation" # Consulta general
+    bug = "bug"                   # Bug/error técnico
+    request = "request"           # Pedido (cambio horario, etc.)
+
+
+class MessagePriority(str, enum.Enum):
+    """V2.0: Prioridad."""
+    low = "low"
+    normal = "normal"
+    high = "high"
+
+
+class MessageStatus(str, enum.Enum):
+    """V2.0: Estado del ticket (solo aplica si is_ticket=True)."""
+    open = "open"           # Recién creado
+    in_progress = "in_progress"  # Admin lo está atendiendo
+    resolved = "resolved"   # Resuelto
+    closed = "closed"       # Cerrado
+
+
+class Message(Base):
+    """V2.0: Mensaje asíncrono entre usuarios o ticket de soporte."""
+    __tablename__ = "messages"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    from_user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    to_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+    # NULL = mensaje genérico al admin (ej: ticket de soporte que va a cualquier admin)
+
+    subject: Mapped[str] = mapped_column(String)
+    body: Mapped[str] = mapped_column(Text)
+
+    # Para tickets
+    is_ticket: Mapped[bool] = mapped_column(Boolean, default=False)
+    category: Mapped[MessageCategory] = mapped_column(default=MessageCategory.general)
+    priority: Mapped[MessagePriority] = mapped_column(default=MessagePriority.normal)
+    status: Mapped[MessageStatus] = mapped_column(default=MessageStatus.open)
+
+    # Thread (replies)
+    reply_to_id: Mapped[str | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+
+    # Read tracking
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
