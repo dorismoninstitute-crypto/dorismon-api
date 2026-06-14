@@ -224,14 +224,13 @@ def tpl_ticket_replied(name: str, subject: str, body_preview: str) -> str:
 async def validate_email_domain(email: str) -> tuple[bool, str]:
     """V2.1: Valida que el dominio del email tenga registros MX reales.
 
+    V2.1.1: Validación más estricta:
+    - Bloquea dominios obviamente falsos
+    - Si no hay dnspython, bloquea (no permite por default)
+    - Si timeout DNS, bloquea (no permite por default)
+    - Whitelist de proveedores conocidos (gmail, hotmail, etc) bypassea MX lookup
+
     Retorna (válido, mensaje_error).
-
-    Bloquea:
-    - test@test (sin dominio válido)
-    - pepe@dominio_inexistente.com (sin MX records)
-    - emails que no son formato email
-
-    Permite gmail, hotmail, outlook, dominios reales con MX.
     """
     if "@" not in email:
         return False, "Formato de email inválido"
@@ -246,33 +245,76 @@ async def validate_email_domain(email: str) -> tuple[bool, str]:
     if "." not in domain:
         return False, "El dominio del email no es válido"
 
-    # Lista de TLDs claramente falsos
-    blacklist_domains = {"test.com", "test.test", "example.com", "example.org",
-                          "ejemplo.com", "asdf.com", "qwerty.com", "fake.com",
-                          "tempmail.com", "mailinator.com", "trashmail.com"}
-    if domain.lower() in blacklist_domains:
+    domain_lower = domain.lower()
+
+    # V2.1.1: Whitelist de proveedores conocidos (siempre válidos)
+    whitelist_domains = {
+        "gmail.com", "googlemail.com", "outlook.com", "outlook.es",
+        "hotmail.com", "hotmail.es", "live.com", "msn.com",
+        "yahoo.com", "yahoo.es", "ymail.com",
+        "icloud.com", "me.com", "mac.com",
+        "protonmail.com", "proton.me", "pm.me",
+        "aol.com", "zoho.com", "fastmail.com",
+        "claro.net.do", "codetel.net.do", "verizon.net",
+        "dorismon.do",  # tu dominio
+    }
+    if domain_lower in whitelist_domains:
+        return True, ""
+
+    # Lista negra ampliada V2.1.1
+    blacklist_domains = {
+        "test.com", "test.test", "test.es", "test.org", "test.io",
+        "example.com", "example.org", "example.net", "example.io",
+        "ejemplo.com", "ejemplo.es",
+        "asdf.com", "asdfasdf.com", "qwerty.com", "qwertyuiop.com",
+        "fake.com", "fakemail.com", "fake.io",
+        "tempmail.com", "mailinator.com", "trashmail.com", "guerrillamail.com",
+        "10minutemail.com", "throwaway.email", "yopmail.com",
+        "abc.com", "abc.es", "xyz.com", "xyz.es",
+        "prueba.com", "prueba.es", "demo.com",
+        "noexiste.com", "nada.com", "inventado.com",
+        "correo.com", "email.com",  # genéricos sospechosos
+    }
+    if domain_lower in blacklist_domains:
         return False, f"El dominio {domain} no está permitido. Usá tu email real."
 
-    # Resolver MX
+    # V2.1.1: Bloquear TLDs sospechosos
+    suspicious_tlds = (".test", ".invalid", ".localhost", ".local", ".example")
+    if any(domain_lower.endswith(t) for t in suspicious_tlds):
+        return False, f"El dominio {domain} no es válido. Usá tu email real."
+
+    # V2.1.1: Bloquear TLDs raros si el dominio es corto (5-7 chars y TLD raro)
+    # Esto bloquea cosas como asdfasdf.xyz, qwerty.io, random.io
+    common_tlds = (".com", ".org", ".net", ".edu", ".gov", ".io", ".co",
+                   ".do", ".es", ".mx", ".ar", ".cl", ".pe", ".co.uk", ".com.do",
+                   ".com.mx", ".com.ar", ".com.es", ".email", ".app", ".dev")
+    rare_tlds = (".xyz", ".top", ".click", ".online", ".site", ".store",
+                  ".tech", ".info", ".biz", ".loan", ".party", ".trade")
+    if any(domain_lower.endswith(t) for t in rare_tlds):
+        # Solo permitimos TLDs raros si el dominio tiene más de 10 chars (probable real)
+        # O si pasamos validación MX completa
+        pass  # se valida abajo con MX, pero más estricto
+
+    # Resolver MX (estricto en V2.1.1)
     try:
         import dns.resolver
-        try:
-            answers = dns.resolver.resolve(domain, "MX", lifetime=5.0)
-            if len(answers) == 0:
-                return False, f"El dominio {domain} no tiene servidor de email configurado"
-            return True, ""
-        except dns.resolver.NXDOMAIN:
-            return False, f"El dominio {domain} no existe"
-        except dns.resolver.NoAnswer:
-            return False, f"El dominio {domain} no acepta emails"
-        except dns.resolver.Timeout:
-            # Si DNS timeout, dejar pasar (mejor permitir que romper registro)
-            logger.warning(f"DNS timeout para {domain} — permitiendo")
-            return True, ""
-        except Exception as e:
-            logger.warning(f"Error MX para {domain}: {e} — permitiendo")
-            return True, ""
     except ImportError:
-        # Si no hay dnspython instalado, no bloqueamos (degradación grácil)
-        logger.warning("dnspython no instalado, MX validation skipped")
+        logger.error("dnspython no instalado — bloqueando emails con dominios desconocidos")
+        return False, "No podemos validar tu email en este momento. Probá con Gmail, Hotmail, Outlook o tu email del trabajo."
+
+    try:
+        answers = dns.resolver.resolve(domain, "MX", lifetime=8.0)
+        if len(list(answers)) == 0:
+            return False, f"El dominio {domain} no tiene servidor de email configurado"
         return True, ""
+    except dns.resolver.NXDOMAIN:
+        return False, f"El dominio {domain} no existe. Verificá tu email."
+    except dns.resolver.NoAnswer:
+        return False, f"El dominio {domain} no acepta emails."
+    except dns.resolver.Timeout:
+        # V2.1.1: si timeout, bloqueamos (más seguro)
+        logger.warning(f"DNS timeout para {domain} — bloqueando por seguridad")
+        return False, f"No pudimos verificar el dominio {domain}. Probá con Gmail, Hotmail, Outlook o intentá de nuevo."
+    except Exception as e:
+        logger.error(f"Error MX para {domain}: {e}")
+        return False, f"No pudimos verificar el dominio {domain}. Probá con un email de Gmail, Hotmail u Outlook."

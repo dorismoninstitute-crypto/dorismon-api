@@ -115,6 +115,21 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
     )
 
 
+@router.get("/email-service-status")
+async def email_service_status():
+    """V2.1.1: Endpoint público para verificar si el servicio de email está configurado.
+
+    Útil para diagnóstico desde el frontend.
+    """
+    from app.services.email_service import is_email_configured, RESEND_API_KEY, EMAIL_FROM, APP_URL
+    return {
+        "configured": is_email_configured(),
+        "from_address_set": bool(EMAIL_FROM),
+        "app_url_set": bool(APP_URL),
+        "key_length": len(RESEND_API_KEY) if RESEND_API_KEY else 0,
+    }
+
+
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     user = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()

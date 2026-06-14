@@ -1270,6 +1270,16 @@ async def list_placement_results(
         )).scalar() > 0
         if status == "pending" and has_enrollment: continue
         if status == "enrolled" and not has_enrollment: continue
+        # V2.1.1: Si el estudiante ya está inscripto, mostrar también su nivel ACTUAL
+        # (puede ser distinto al sugerido si el admin lo cambió al inscribirlo)
+        current_level = None
+        current_level_code = None
+        if s.current_level_id:
+            cl = await db.get(Level, s.current_level_id)
+            if cl:
+                current_level = cl.id
+                current_level_code = cl.code
+
         out.append({
             "test_id": test.id,
             "student_id": u.id,
@@ -1280,6 +1290,9 @@ async def list_placement_results(
             "suggested_level_id": test.suggested_level_id,
             "suggested_level_code": lvl.code if lvl else None,
             "suggested_level_name": lvl.name if lvl else None,
+            # V2.1.1: nivel actual real (puede diferir si admin lo cambió)
+            "current_level_id": current_level,
+            "current_level_code": current_level_code,
             "grammar_score": float(test.grammar_score) if test.grammar_score is not None else None,
             "reading_score": float(test.reading_score) if test.reading_score is not None else None,
             "is_enrolled": has_enrollment,

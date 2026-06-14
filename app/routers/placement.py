@@ -41,6 +41,8 @@ async def get_placement_questions(
     """V1.4: Devuelve 15 preguntas aleatorias balanceadas por destreza,
     con orden de opciones mezclado para evitar trampas.
 
+    V2.1.1: Bloquea si el email no está verificado (cuando Resend está configurado).
+
     Distribución:
     - 8 Grammar
     - 5 Reading Comprehension
@@ -52,6 +54,13 @@ async def get_placement_questions(
     import random
     if user.role != "student":
         raise HTTPException(403, "Solo estudiantes")
+
+    # V2.1.1: Verificar email obligatorio (si Resend configurado)
+    from app.services.email_service import is_email_configured
+    if is_email_configured():
+        u = await db.get(User, user.user_id)
+        if u and not u.email_verified:
+            raise HTTPException(403, "Debes verificar tu email antes de hacer el test. Revisá tu correo o pedí un nuevo código.")
 
     # Obtener TODAS las preguntas activas agrupadas
     all_questions = (await db.execute(
@@ -90,8 +99,9 @@ async def get_placement_questions(
         fill_needed = min(15 - len(selected), len(remaining))
         selected.extend(random.sample(remaining, fill_needed))
 
-    # Mezclar el orden de las 15
-    random.shuffle(selected)
+    # V2.1.1: Ordenar de fácil a difícil (A1 → A2 → B1 → B2 → C1 → C2)
+    LEVEL_ORDER = {"A1": 0, "A2": 1, "B1": 2, "B2": 3, "C1": 4, "C2": 5}
+    selected.sort(key=lambda q: (LEVEL_ORDER.get(q.difficulty_level, 99), q.id))
 
     # Para cada pregunta, mezclar el orden de las opciones a/b/c/d
     out = []
