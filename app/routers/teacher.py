@@ -294,6 +294,13 @@ async def save_attendance(
         att.recorded_at = now
         updated += 1
     await log_action(db, teacher.user_id, "save_attendance", "teacher", target_id=session_id)
+
+    # V2.1: auto-marcar sesión como completed si ya pasó
+    if session.ends_at_utc:
+        ends_aware = session.ends_at_utc if session.ends_at_utc.tzinfo else session.ends_at_utc.replace(tzinfo=tz.utc)
+        if ends_aware < now and session.status == SessionStatus.scheduled:
+            session.status = SessionStatus.completed
+
     await db.commit()
 
     # V1.3: recomputar progreso de módulo para todos los estudiantes presentes

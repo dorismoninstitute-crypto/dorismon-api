@@ -1,5 +1,5 @@
 """Auth — login, register, refresh, me."""
-from datetime import datetime, timezone as tz
+from datetime import datetime, timedelta, timezone as tz
 from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy import select
@@ -49,6 +49,7 @@ class UserOut(BaseModel):
     role: str
     avatar_url: Optional[str] = None
     gender: Optional[str] = None  # V1.6.4
+    email_verified: Optional[bool] = True  # V2.1
     current_level_id: Optional[int] = None
     placement_done: Optional[bool] = None
 
@@ -58,20 +59,54 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
     existing = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, "Ya existe una cuenta con este email")
+
+    # V2.1: Validar que el email tenga dominio real (MX records)
+    from app.services.email_service import validate_email_domain, send_email, tpl_welcome, gen_verification_code, is_email_configured
+    from app.models import EmailVerification
+    valid, err = await validate_email_domain(body.email)
+    if not valid:
+        raise HTTPException(400, err)
+
     # V1.6.4: Validar gender
     gender = None
     if body.gender:
         if body.gender not in ("male", "female", "other"):
             raise HTTPException(400, "gender debe ser 'male', 'female' u 'other'")
         gender = body.gender
+
+    # V2.1: usuario empieza con email_verified=False (se verifica con código)
+    # Si no hay servicio email configurado, lo dejamos verificado automáticamente
+    email_verified = not is_email_configured()
+
     user = User(
         email=body.email, password_hash=hash_password(body.password),
         full_name=body.full_name, phone=body.phone, role=UserRole.student,
         gender=gender,
+        email_verified=email_verified,
     )
     db.add(user)
     await db.flush()
     db.add(Student(user_id=user.id))
+
+    # V2.1: si hay servicio email, crear código de verificación
+    if is_email_configured():
+        code = gen_verification_code()
+        ev = EmailVerification(
+            user_id=user.id,
+            code=code,
+            expires_at=datetime.now(tz.utc) + timedelta(minutes=30),
+        )
+        db.add(ev)
+        # Enviar email asíncronamente (no bloqueamos el registro si falla el envío)
+        try:
+            await send_email(
+                to=body.email,
+                subject="Verificá tu email — Dorismon Language Institute",
+                html=tpl_welcome(body.full_name, code),
+            )
+        except Exception:
+            pass  # No rompemos el registro si el email falla
+
     await log_action(db, user.id, "register", "auth", target_id=user.id)
     await db.commit()
     return TokenResponse(
@@ -116,7 +151,8 @@ async def me(user: Annotated[CurrentUser, Depends(get_current_user)], db: AsyncS
     if not u:
         raise HTTPException(404, "Usuario no encontrado")
     out = UserOut(id=u.id, email=u.email, full_name=u.full_name, phone=u.phone,
-                  role=u.role.value, avatar_url=u.avatar_url, gender=u.gender)
+                  role=u.role.value, avatar_url=u.avatar_url, gender=u.gender,
+                  email_verified=u.email_verified)
     if u.role == UserRole.student:
         st = await db.get(Student, u.id)
         if st:
@@ -194,3 +230,178 @@ async def update_my_profile(
             "role": u.role.value,
         },
     }
+
+
+# ============= V2.1 — VERIFICACIÓN DE EMAIL =============
+
+class VerifyEmailRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+@router.post("/verify-email")
+async def verify_email(
+    body: VerifyEmailRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.1: Verifica el código de email que recibió el usuario por correo."""
+    from app.models import EmailVerification
+
+    u = await db.get(User, user.user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+    if u.email_verified:
+        return {"ok": True, "already_verified": True}
+
+    # Buscar verificación válida más reciente
+    ev = (await db.execute(
+        select(EmailVerification).where(
+            EmailVerification.user_id == u.id,
+            EmailVerification.code == body.code,
+            EmailVerification.used_at.is_(None),
+        ).order_by(EmailVerification.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+
+    if not ev:
+        raise HTTPException(400, "Código incorrecto")
+
+    # Validar expiración (timezone-safe)
+    expires_aware = ev.expires_at if ev.expires_at.tzinfo else ev.expires_at.replace(tzinfo=tz.utc)
+    if expires_aware < datetime.now(tz.utc):
+        raise HTTPException(400, "El código expiró. Pedí un nuevo código.")
+
+    ev.used_at = datetime.now(tz.utc)
+    u.email_verified = True
+    await log_action(db, u.id, "verify_email", "auth", target_id=u.id)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/resend-verification")
+async def resend_verification(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.1: Reenvía el código de verificación al email del usuario."""
+    from app.models import EmailVerification
+    from app.services.email_service import send_email, tpl_welcome, gen_verification_code, is_email_configured
+
+    u = await db.get(User, user.user_id)
+    if not u:
+        raise HTTPException(404)
+    if u.email_verified:
+        return {"ok": True, "already_verified": True}
+    if not is_email_configured():
+        raise HTTPException(503, "Servicio de email no configurado. Contactá al administrador.")
+
+    # Invalidar códigos anteriores
+    old_codes = (await db.execute(
+        select(EmailVerification).where(
+            EmailVerification.user_id == u.id,
+            EmailVerification.used_at.is_(None),
+        )
+    )).scalars().all()
+    for old in old_codes:
+        old.used_at = datetime.now(tz.utc)
+
+    # Nuevo código
+    code = gen_verification_code()
+    ev = EmailVerification(
+        user_id=u.id,
+        code=code,
+        expires_at=datetime.now(tz.utc) + timedelta(minutes=30),
+    )
+    db.add(ev)
+    await send_email(
+        to=u.email,
+        subject="Tu código de verificación — Dorismon",
+        html=tpl_welcome(u.full_name, code),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+# ============= V2.1 — RECUPERAR CONTRASEÑA =============
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+@router.post("/forgot-password")
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.1: Envía email con link para resetear contraseña.
+
+    Por seguridad SIEMPRE retorna ok=True (no revela si el email existe).
+    """
+    from app.models import PasswordReset
+    from app.services.email_service import send_email, tpl_password_reset, gen_reset_token, is_email_configured
+
+    user = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
+    if user and user.is_active and is_email_configured():
+        # Invalidar tokens anteriores no usados
+        old_tokens = (await db.execute(
+            select(PasswordReset).where(
+                PasswordReset.user_id == user.id,
+                PasswordReset.used_at.is_(None),
+            )
+        )).scalars().all()
+        for old in old_tokens:
+            old.used_at = datetime.now(tz.utc)
+
+        token = gen_reset_token()
+        pr = PasswordReset(
+            user_id=user.id,
+            token=token,
+            expires_at=datetime.now(tz.utc) + timedelta(hours=2),
+        )
+        db.add(pr)
+        await send_email(
+            to=user.email,
+            subject="Recuperá tu contraseña — Dorismon",
+            html=tpl_password_reset(user.full_name, token),
+        )
+        await log_action(db, user.id, "forgot_password_request", "auth", target_id=user.id)
+        await db.commit()
+
+    # Respuesta uniforme aunque no exista el usuario
+    return {"ok": True, "message": "Si el email existe, recibirás un link de recuperación."}
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=10, max_length=200)
+    new_password: str = Field(min_length=8, max_length=72)
+
+
+@router.post("/reset-password")
+async def reset_password(
+    body: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.1: Resetear contraseña con el token recibido por email."""
+    from app.models import PasswordReset
+
+    pr = (await db.execute(
+        select(PasswordReset).where(
+            PasswordReset.token == body.token,
+            PasswordReset.used_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    if not pr:
+        raise HTTPException(400, "Token inválido o ya usado")
+
+    expires_aware = pr.expires_at if pr.expires_at.tzinfo else pr.expires_at.replace(tzinfo=tz.utc)
+    if expires_aware < datetime.now(tz.utc):
+        raise HTTPException(400, "El link expiró. Pedí un nuevo link.")
+
+    u = await db.get(User, pr.user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+
+    u.password_hash = hash_password(body.new_password)
+    pr.used_at = datetime.now(tz.utc)
+    await log_action(db, u.id, "reset_password", "auth", target_id=u.id)
+    await db.commit()
+    return {"ok": True, "message": "Contraseña actualizada. Ya podés iniciar sesión."}

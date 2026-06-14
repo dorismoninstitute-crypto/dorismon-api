@@ -1,4 +1,5 @@
 """Dorismon API V1.0 — academia de inglés (online/presencial/hibrida)."""
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +23,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # V2.1: restringir orígenes. Configurar CORS_ORIGINS en Render como CSV.
+    # Default permisivo para desarrollo, pero el env de Render debe sobreescribir.
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

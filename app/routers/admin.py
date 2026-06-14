@@ -279,42 +279,8 @@ async def create_level(
     return {"id": l.id}
 
 
-@router.post("/modules", status_code=201)
-async def create_module(
-    body: dict,
-    admin: Annotated[CurrentUser, Depends(require_admin)],
-    db: AsyncSession = Depends(get_db),
-):
-    for f in ("level_id", "name"):
-        if not body.get(f):
-            raise HTTPException(400)
-    m = Module(level_id=body["level_id"], name=body["name"], description=body.get("description"))
-    db.add(m)
-    await db.commit()
-    await db.refresh(m)
-    return {"id": m.id}
-
-
-@router.post("/lessons", status_code=201)
-async def create_lesson(
-    body: dict,
-    admin: Annotated[CurrentUser, Depends(require_admin)],
-    db: AsyncSession = Depends(get_db),
-):
-    if not body.get("module_id") or not body.get("title"):
-        raise HTTPException(400)
-    lesson = Lesson(
-        module_id=body["module_id"], title=body["title"],
-        description=body.get("description"), objectives=body.get("objectives"),
-        can_do=body.get("can_do"),
-        video_url=body.get("video_url"), pdf_url=body.get("pdf_url"),
-        audio_url=body.get("audio_url"),
-        duration_min=body.get("duration_min", 15),
-    )
-    db.add(lesson)
-    await db.commit()
-    await db.refresh(lesson)
-    return {"id": lesson.id}
+# V2.1: Endpoints POST /modules y POST /lessons obsoletos eliminados.
+# Las versiones actualizadas están más abajo (con order_index).
 
 
 @router.patch("/lessons/{lesson_id}")
@@ -454,12 +420,20 @@ async def create_session(
     for f in ("teacher_id", "course_id", "level_id", "title", "modality", "starts_at_utc", "ends_at_utc"):
         if not body.get(f):
             raise HTTPException(400, f"{f} requerido")
+    # V2.1: validar fechas
+    try:
+        starts_at = datetime.fromisoformat(body["starts_at_utc"].replace("Z", "+00:00"))
+        ends_at = datetime.fromisoformat(body["ends_at_utc"].replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(400, "Formato de fecha inválido")
+    if ends_at <= starts_at:
+        raise HTTPException(400, "La hora de fin debe ser posterior a la hora de inicio")
     s = ClassSession(
         teacher_id=body["teacher_id"], course_id=body["course_id"], level_id=body["level_id"],
         title=body["title"], description=body.get("description"),
         modality=Modality(body["modality"]),
-        starts_at_utc=datetime.fromisoformat(body["starts_at_utc"].replace("Z", "+00:00")),
-        ends_at_utc=datetime.fromisoformat(body["ends_at_utc"].replace("Z", "+00:00")),
+        starts_at_utc=starts_at,
+        ends_at_utc=ends_at,
         meeting_url=body.get("meeting_url"),
         branch_id=body.get("branch_id"), classroom_id=body.get("classroom_id"),
         capacity=body.get("capacity", 15),
@@ -1936,6 +1910,19 @@ async def issue_certification_quick(
         link="/dashboard/student/certificates",
     ))
 
+    # V2.1: email al estudiante con su certificado
+    student_user = await db.get(User, e.student_id)
+    if student_user and student_user.email:
+        from app.services.email_service import send_email, tpl_certificate_issued
+        try:
+            await send_email(
+                to=student_user.email,
+                subject=f"🎓 ¡Tu certificado de {level.code if level else ''} está listo!",
+                html=tpl_certificate_issued(student_user.full_name, level.code if level else "—", code),
+            )
+        except Exception:
+            pass
+
     await log_action(db, admin.user_id, "issue_certificate", "certificates", target_id=cert.id)
     await db.commit()
 
@@ -2386,8 +2373,13 @@ async def create_private_class(
         raise HTTPException(400, "Modalidad inválida")
 
     # Parse fecha
-    starts_at = datetime.fromisoformat(body["starts_at_utc"].replace("Z", "+00:00"))
+    try:
+        starts_at = datetime.fromisoformat(body["starts_at_utc"].replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(400, "Formato de fecha inválido")
     duration = body.get("duration_min", 60)
+    if duration <= 0 or duration > 480:  # max 8h
+        raise HTTPException(400, "Duración inválida (debe ser entre 1 y 480 minutos)")
     ends_at = starts_at + timedelta(minutes=duration)
 
     session = ClassSession(
@@ -2681,7 +2673,7 @@ async def mark_teacher_payment_paid(
     )
     db.add(payment)
 
-    # Notificar al profe
+    # Notificar al profe (interna + email V2.1)
     db.add(Notification(
         user_id=teacher_id,
         type=NotificationType.info,
@@ -2689,6 +2681,22 @@ async def mark_teacher_payment_paid(
         body=f"Se registró el pago de tu período {month:02d}/{year} por RD$ {period['total_amount']:,.2f}",
         link="/dashboard/teacher/income",
     ))
+
+    # V2.1: enviar email al profe
+    teacher_user = await db.get(User, teacher_id)
+    if teacher_user and teacher_user.email:
+        from app.services.email_service import send_email, tpl_teacher_payment
+        try:
+            month_names = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+                          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+            await send_email(
+                to=teacher_user.email,
+                subject=f"💰 Pago de {month_names[month]} {year} — Dorismon",
+                html=tpl_teacher_payment(teacher_user.full_name, f"{month_names[month]} {year}",
+                                         period["total_amount"], period["classes_count"]),
+            )
+        except Exception:
+            pass  # No rompe el pago si email falla
 
     await log_action(db, admin.user_id, "mark_teacher_payment_paid", "payments",
                      target_id=payment.id,
