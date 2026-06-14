@@ -791,7 +791,7 @@ async def update_student_profile(
             tutor_fields_sent = any(f in body for f in ["tutor_name", "tutor_phone", "tutor_document"])
             if tutor_fields_sent and not all([s.tutor_name, s.tutor_phone, s.tutor_document]):
                 raise HTTPException(400,
-                    "Como sos menor de edad, los datos del tutor son obligatorios: nombre, teléfono y documento")
+                    "Como eres menor de edad, los datos del tutor son obligatorios: nombre, teléfono y documento")
 
     await log_action(db, user.user_id, "update_profile", "students", target_id=user.user_id)
     await db.commit()

@@ -31,7 +31,7 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 class _InMemoryRedis:
     """Mock minimalista de Redis para que el sistema arranque sin Redis instalado.
     Soporta get/set/delete/expire — suficiente para holds y cache simple.
-    Para producción, cambiá REDIS_URL en .env a redis://localhost:6379/0."""
+    Para producción, cambia REDIS_URL en .env a redis://localhost:6379/0."""
     def __init__(self):
         self._data = {}
 
@@ -121,6 +121,8 @@ async def init_db():
             "ALTER TABLE students ADD COLUMN IF NOT EXISTS how_found_us VARCHAR",
             "ALTER TABLE students ADD COLUMN IF NOT EXISTS referred_by VARCHAR",
             "ALTER TABLE students ADD COLUMN IF NOT EXISTS special_notes TEXT",
+            # V2.3: Modalidad por inscripción (online/presencial/hibrida)
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS modality VARCHAR DEFAULT 'online'",
         ]
         for m in migrations:
             try:

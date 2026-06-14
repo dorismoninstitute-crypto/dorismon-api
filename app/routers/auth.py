@@ -283,7 +283,7 @@ async def verify_email(
     # Validar expiración (timezone-safe)
     expires_aware = ev.expires_at if ev.expires_at.tzinfo else ev.expires_at.replace(tzinfo=tz.utc)
     if expires_aware < datetime.now(tz.utc):
-        raise HTTPException(400, "El código expiró. Pedí un nuevo código.")
+        raise HTTPException(400, "El código expiró. Pide un nuevo código.")
 
     ev.used_at = datetime.now(tz.utc)
     u.email_verified = True
@@ -448,7 +448,7 @@ async def test_email_endpoint(body: dict):
         return {
             "ok": result,
             "to": to,
-            "message": "Email enviado a Resend. Revisá tu inbox + spam en 1-2 min. También revisá Resend Logs."
+            "message": "Email enviado a Resend. Revisa tu inbox + spam en 1-2 min. También revisá Resend Logs."
         }
     except Exception as e:
         log.error(f"[TEST-EMAIL] Excepción: {e}")
@@ -479,7 +479,7 @@ async def reset_password(
 
     expires_aware = pr.expires_at if pr.expires_at.tzinfo else pr.expires_at.replace(tzinfo=tz.utc)
     if expires_aware < datetime.now(tz.utc):
-        raise HTTPException(400, "El link expiró. Pedí un nuevo link.")
+        raise HTTPException(400, "El link expiró. Pide un nuevo link.")
 
     u = await db.get(User, pr.user_id)
     if not u:
@@ -489,4 +489,4 @@ async def reset_password(
     pr.used_at = datetime.now(tz.utc)
     await log_action(db, u.id, "reset_password", "auth", target_id=u.id)
     await db.commit()
-    return {"ok": True, "message": "Contraseña actualizada. Ya podés iniciar sesión."}
+    return {"ok": True, "message": "Contraseña actualizada. Ya puedes iniciar sesión."}

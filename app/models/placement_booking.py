@@ -249,6 +249,8 @@ class Enrollment(Base):
     level_id: Mapped[int] = mapped_column(ForeignKey("levels.id"))
     teacher_id: Mapped[str | None] = mapped_column(ForeignKey("teachers.user_id"), nullable=True)
     plan_id: Mapped[int | None] = mapped_column(ForeignKey("plans.id"), nullable=True)
+    # V2.3: Modalidad de inscripción (online/presencial/hibrida)
+    modality: Mapped[Modality] = mapped_column(default=Modality.online)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)

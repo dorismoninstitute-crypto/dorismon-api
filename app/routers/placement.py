@@ -60,7 +60,7 @@ async def get_placement_questions(
     if is_email_configured():
         u = await db.get(User, user.user_id)
         if u and not u.email_verified:
-            raise HTTPException(403, "Debes verificar tu email antes de hacer el test. Revisá tu correo o pedí un nuevo código.")
+            raise HTTPException(403, "Debes verificar tu email antes de hacer el test. Revisa tu correo o pide un nuevo código.")
 
     # Obtener TODAS las preguntas activas agrupadas
     all_questions = (await db.execute(
@@ -344,7 +344,7 @@ async def my_placement_result(
             "listening_score": None,
             "writing_score": None,
             "speaking_score": None,
-            "score_pct": None,  # no se guarda en el modelo, lo calculamos si querés
+            "score_pct": None,  # no se guarda en el modelo, lo calculamos si quieres
             "correct_count": None, "total_questions": None,
             "suggested_level_code": level.code if level else None,
             "suggested_level_name": level.name if level else None,

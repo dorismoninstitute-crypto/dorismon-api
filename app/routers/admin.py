@@ -76,14 +76,32 @@ async def admin_dashboard(
             Enrollment.is_active.is_(True),
         )
     )).scalar() or 0
-    # V1.5.1: Profesores sin estudiantes asignados
+    # V1.5.1 + V2.3: Profesores sin estudiantes asignados (con LISTA detallada)
     teachers_with_students_q = (await db.execute(
         select(Enrollment.teacher_id).where(
             Enrollment.teacher_id.is_not(None), Enrollment.is_active.is_(True),
         ).distinct()
     )).scalars().all()
     teachers_with_students = set(teachers_with_students_q)
-    teachers_without_students = max(0, total_teachers - len(teachers_with_students))
+
+    # V2.3: Lista de profes SIN estudiantes (con nombre y datos)
+    all_teachers = (await db.execute(
+        select(Teacher, User).join(User, Teacher.user_id == User.id)
+        .where(User.is_active.is_(True), User.role == UserRole.teacher)
+    )).all()
+    teachers_without_students_list = []
+    for t, u in all_teachers:
+        if t.user_id not in teachers_with_students:
+            teachers_without_students_list.append({
+                "user_id": u.id,
+                "full_name": u.full_name,
+                "email": u.email,
+                "gender": u.gender,
+                "specialties": t.specialties or "",
+                "modalities": t.modalities or "",
+                "levels_taught": t.levels_taught or "",
+            })
+    teachers_without_students = len(teachers_without_students_list)
 
     # V1.6.4: Total módulos cargados (para detectar sistema vacío)
     total_modules = (await db.execute(
@@ -104,6 +122,7 @@ async def admin_dashboard(
             "certificates_issued": certs_issued,
             "unassigned_students": unassigned_students,  # V1.5.1
             "teachers_without_students": teachers_without_students,  # V1.5.1
+            "teachers_without_students_list": teachers_without_students_list,  # V2.3: lista detallada
             "total_modules": total_modules,  # V1.6.4
         },
     }
@@ -170,18 +189,43 @@ async def create_user(
         role = UserRole(body["role"])
     except ValueError:
         raise HTTPException(400, "Rol inválido")
+
+    # V2.3: Validar email real (dominio MX) — para profes/admins/estudiantes
+    from app.services.email_service import validate_email_domain
+    valid, err = await validate_email_domain(body["email"])
+    if not valid:
+        raise HTTPException(400, err)
+
+    # V2.3: Validar gender si se envía
+    gender = body.get("gender")
+    if gender and gender not in ("male", "female", "other"):
+        raise HTTPException(400, "gender debe ser 'male', 'female' u 'other'")
+
     user = User(
         email=body["email"], password_hash=hash_password(body["password"]),
         full_name=body["full_name"], phone=body.get("phone"), role=role,
+        gender=gender,
+        # V2.3: Si lo crea el admin, asumir email_verified=True (admin ya validó)
+        email_verified=True,
     )
     db.add(user)
     await db.flush()
     if role == UserRole.student:
         db.add(Student(user_id=user.id))
     elif role == UserRole.teacher:
-        db.add(Teacher(user_id=user.id, specialties=body.get("specialties", ""),
-                       modalities=body.get("modalities", "online"), bio=body.get("bio")))
-    await log_action(db, admin.user_id, "create_user", "admin", target_id=user.id)
+        # V2.3: Permitir más campos al crear profe
+        db.add(Teacher(
+            user_id=user.id,
+            specialties=body.get("specialties", ""),
+            modalities=body.get("modalities", "online"),
+            bio=body.get("bio"),
+            levels_taught=body.get("levels_taught"),
+            rate_group=body.get("rate_group", 500.0),
+            rate_private=body.get("rate_private", 1000.0),
+            rate_event=body.get("rate_event", 750.0),
+        ))
+    await log_action(db, admin.user_id, "create_user", "admin", target_id=user.id,
+                     details=f"role={role.value}, email={body['email']}")
     await db.commit()
     return {"id": user.id}
 
@@ -195,9 +239,30 @@ async def update_user(
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(404)
-    for f in ("full_name", "phone", "avatar_url", "is_active"):
+    # V2.3: Permitir editar email también (con validación)
+    if "email" in body and body["email"] != user.email:
+        # Verificar que no exista otro con ese email
+        existing = (await db.execute(select(User).where(User.email == body["email"]))).scalar_one_or_none()
+        if existing and existing.id != user.id:
+            raise HTTPException(409, "Ya existe otro usuario con ese email")
+        # Validar dominio
+        from app.services.email_service import validate_email_domain
+        valid, err = await validate_email_domain(body["email"])
+        if not valid:
+            raise HTTPException(400, err)
+        user.email = body["email"]
+
+    for f in ("full_name", "phone", "avatar_url", "is_active", "email_verified"):
         if f in body:
             setattr(user, f, body[f])
+
+    # V2.3: Permitir cambiar gender
+    if "gender" in body:
+        gender = body["gender"]
+        if gender and gender not in ("male", "female", "other"):
+            raise HTTPException(400, "gender debe ser 'male', 'female' u 'other'")
+        user.gender = gender if gender else None
+
     await log_action(db, admin.user_id, "update_user", "admin", target_id=user_id)
     await db.commit()
     return {"ok": True}
@@ -510,6 +575,7 @@ async def list_enrollments(
             "level_id": l.id, "level_code": l.code, "level_name": l.name,
             "teacher_id": e.teacher_id, "teacher_name": teacher_name,  # V1.5
             "plan_id": e.plan_id, "plan_name": plan_name,  # V1.5
+            "modality": e.modality.value if e.modality else "online",  # V2.3
             "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
             "is_active": e.is_active,
             "final_grade": float(e.final_grade) if e.final_grade else None,
@@ -573,10 +639,19 @@ async def create_enrollment(
                 teacher_id = candidates[0][0]
                 auto_assigned = True
 
+    # V2.3: Validar modality si se envía
+    modality_val = Modality.online  # default
+    if body.get("modality"):
+        try:
+            modality_val = Modality(body["modality"])
+        except ValueError:
+            raise HTTPException(400, "Modalidad inválida (online/presencial/hibrida)")
+
     e = Enrollment(
         student_id=body["student_id"], course_id=body["course_id"],
         level_id=body["level_id"], teacher_id=teacher_id,
         plan_id=body.get("plan_id"),
+        modality=modality_val,  # V2.3
     )
     db.add(e)
     # V1.4.1: Actualizar nivel del estudiante + marcar placement_done
@@ -590,22 +665,65 @@ async def create_enrollment(
         user_id=body["student_id"],
         type=NotificationType.info,
         title="🎓 Inscripción confirmada",
-        body="Has sido inscrito en un curso. Revisá tu dashboard.",
+        body="Has sido inscrito en un curso. Revisa tu dashboard.",
         link="/dashboard/student",
     ))
-    # V1.5.1: Notificar al profe si fue auto-asignado
-    if auto_assigned and teacher_id:
+
+    # V2.3: Email + notif al profe asignado (sea manual o auto)
+    if teacher_id:
         st_user = await db.get(User, body["student_id"])
         level_obj = await db.get(Level, body["level_id"])
+        teacher_user = await db.get(User, teacher_id)
+        modality_label = {"online": "Online", "presencial": "Presencial", "hibrida": "Híbrida"}.get(modality_val.value, "")
+
+        notif_body = f"{st_user.full_name if st_user else 'Estudiante'} fue asignado a tu grupo de {level_obj.code if level_obj else ''} ({modality_label})."
+        if auto_assigned:
+            notif_body = "Auto-asignación: " + notif_body
+
         db.add(Notification(
             user_id=teacher_id,
             type=NotificationType.info,
             title="👥 Nuevo estudiante asignado",
-            body=f"{st_user.full_name if st_user else 'Estudiante'} fue asignado a tu grupo de {level_obj.code if level_obj else ''}.",
+            body=notif_body,
             link="/dashboard/teacher/students",
         ))
+
+        # Email al profe
+        if teacher_user and teacher_user.email:
+            from app.services.email_service import send_email, tpl_teacher_assigned, is_email_configured
+            if is_email_configured() and st_user:
+                try:
+                    await send_email(
+                        to=teacher_user.email,
+                        subject=f"Nuevo estudiante asignado: {st_user.full_name}",
+                        html=tpl_teacher_assigned(
+                            teacher_user.full_name,
+                            st_user.full_name,
+                            level_obj.code if level_obj else "",
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        # Email al estudiante: "Tu profesor es X"
+        if st_user and st_user.email and teacher_user:
+            from app.services.email_service import send_email, tpl_teacher_assigned, is_email_configured
+            if is_email_configured():
+                try:
+                    await send_email(
+                        to=st_user.email,
+                        subject=f"Tu profesor asignado: {teacher_user.full_name}",
+                        html=tpl_teacher_assigned(
+                            st_user.full_name,
+                            teacher_user.full_name,
+                            level_obj.code if level_obj else "",
+                        ),
+                    )
+                except Exception:
+                    pass
+
     await log_action(db, admin.user_id, "enroll", "admin", target_id=e.id,
-                     details=f"auto_assigned={auto_assigned}")
+                     details=f"auto_assigned={auto_assigned}, modality={modality_val.value}")
     await db.commit()
     return {"id": e.id, "auto_assigned_teacher_id": teacher_id if auto_assigned else None}
 
@@ -993,21 +1111,29 @@ async def update_enrollment(
     old_teacher = enr.teacher_id
     old_plan = enr.plan_id
     old_level = enr.level_id
+    old_modality = enr.modality
     if "teacher_id" in body: enr.teacher_id = body["teacher_id"]
     if "plan_id" in body: enr.plan_id = body["plan_id"]
     if "level_id" in body: enr.level_id = body["level_id"]
     if "is_active" in body: enr.is_active = body["is_active"]
+    # V2.3: cambiar modalidad
+    if "modality" in body:
+        try:
+            enr.modality = Modality(body["modality"])
+        except ValueError:
+            raise HTTPException(400, "Modalidad inválida")
     # Notificar al estudiante del cambio
     changes = []
     if old_teacher != enr.teacher_id: changes.append("profesor")
     if old_plan != enr.plan_id: changes.append("plan")
     if old_level != enr.level_id: changes.append("nivel")
+    if old_modality != enr.modality: changes.append("modalidad")
     if changes:
         db.add(Notification(
             user_id=enr.student_id,
             type=NotificationType.info,
             title="📝 Cambios en tu inscripción",
-            body=f"Se actualizó tu {', '.join(changes)}. Consultá los detalles con un coordinador.",
+            body=f"Se actualizó tu {', '.join(changes)}. Consulta los detalles con un coordinador.",
         ))
     await log_action(db, admin.user_id, "update_enrollment", "enrollments", enroll_id)
     await db.commit()

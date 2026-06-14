@@ -5,7 +5,7 @@ Si está seteada, se envían vía API de Resend.
 
 Configurar en Render:
   RESEND_API_KEY=re_xxxxxxxxxxxx
-  EMAIL_FROM=Dorismon <onboarding@resend.dev>   (o noreply@dorismon.do si tenés dominio verificado)
+  EMAIL_FROM=Dorismon <onboarding@resend.dev>   (o noreply@dorismon.do si tienes dominio verificado)
   APP_URL=https://dorismon-web.vercel.app
 """
 import os
@@ -131,7 +131,7 @@ def tpl_welcome(name: str, code: str) -> str:
       <p>Gracias por registrarte. Para empezar a usar la plataforma necesitamos verificar tu email.</p>
       <p>Tu código de verificación es:</p>
       <div class="code-box">{code}</div>
-      <p>Ingresá este código en la pantalla de verificación. <strong>El código vence en 30 minutos.</strong></p>
+      <p>Ingresa este código en la pantalla de verificación. <strong>El código vence en 30 minutos.</strong></p>
       <p>Si no te registraste vos, ignorá este email y la cuenta no se activará.</p>
     """)
 
@@ -141,7 +141,7 @@ def tpl_password_reset(name: str, token: str) -> str:
     return _base_html(f"""
       <h2>Recuperar contraseña</h2>
       <p>Hola {name},</p>
-      <p>Recibimos una solicitud para resetear tu contraseña. Hacé clic en el botón para crear una nueva:</p>
+      <p>Recibimos una solicitud para resetear tu contraseña. Haz clic en el botón para crear una nueva:</p>
       <p style="text-align: center;">
         <a href="{link}" class="button">Crear nueva contraseña</a>
       </p>
@@ -189,7 +189,7 @@ def tpl_teacher_payment(teacher_name: str, month: str, amount: float, classes: i
         RD$ {amount:,.2f}
       </p>
       <p style="text-align: center; color: #64748b;">por <strong>{classes}</strong> clases dictadas</p>
-      <p>Si tenés dudas sobre el desglose, ingresá a "Mis ingresos" en la plataforma.</p>
+      <p>Si tienes dudas sobre el desglose, ingresá a "Mis ingresos" en la plataforma.</p>
     """)
 
 
@@ -303,7 +303,7 @@ async def validate_email_domain(email: str) -> tuple[bool, str]:
         import dns.resolver
     except ImportError:
         logger.error("dnspython no instalado — bloqueando emails con dominios desconocidos")
-        return False, "No podemos validar tu email en este momento. Probá con Gmail, Hotmail, Outlook o tu email del trabajo."
+        return False, "No podemos validar tu email en este momento. Prueba con Gmail, Hotmail, Outlook o tu email del trabajo."
 
     try:
         answers = dns.resolver.resolve(domain, "MX", lifetime=8.0)
@@ -317,7 +317,7 @@ async def validate_email_domain(email: str) -> tuple[bool, str]:
     except dns.resolver.Timeout:
         # V2.1.1: si timeout, bloqueamos (más seguro)
         logger.warning(f"DNS timeout para {domain} — bloqueando por seguridad")
-        return False, f"No pudimos verificar el dominio {domain}. Probá con Gmail, Hotmail, Outlook o intentá de nuevo."
+        return False, f"No pudimos verificar el dominio {domain}. Prueba con Gmail, Hotmail, Outlook o intentá de nuevo."
     except Exception as e:
         logger.error(f"Error MX para {domain}: {e}")
-        return False, f"No pudimos verificar el dominio {domain}. Probá con un email de Gmail, Hotmail u Outlook."
+        return False, f"No pudimos verificar el dominio {domain}. Prueba con un email de Gmail, Hotmail u Outlook."

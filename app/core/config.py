@@ -21,7 +21,7 @@ def _normalize_db_url(url: str) -> str:
 
 class Settings(BaseSettings):
     # Base de datos. En Render, esta variable la inyecta el servicio de Postgres.
-    # Localmente, podés usar SQLite: sqlite+aiosqlite:///./dorismon.db
+    # Localmente, puedes usar SQLite: sqlite+aiosqlite:///./dorismon.db
     DATABASE_URL: str = "sqlite+aiosqlite:///./dorismon.db"
     REDIS_URL: str = "memory://"
 

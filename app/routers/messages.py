@@ -67,7 +67,7 @@ async def send_message(
             # Sólo a un profe asignado a él
             target = await db.get(User, body.to_user_id)
             if target.role.value not in ("teacher", "super_admin"):
-                raise HTTPException(403, "Solo podés mensajear a tu profesor o al admin")
+                raise HTTPException(403, "Solo puedes mensajear a tu profesor o al admin")
             if target.role.value == "teacher":
                 # Verificar que esté inscripto con este profe
                 enr = (await db.execute(
@@ -78,14 +78,14 @@ async def send_message(
                     )
                 )).scalar_one_or_none()
                 if not enr:
-                    raise HTTPException(403, "Solo podés mensajear a profesores asignados")
+                    raise HTTPException(403, "Solo puedes mensajear a profesores asignados")
 
     elif user.role == "teacher":
         # Profe puede mensajear a sus estudiantes o al admin
         if body.to_user_id:
             target = await db.get(User, body.to_user_id)
             if target.role.value not in ("student", "super_admin"):
-                raise HTTPException(403, "Solo podés mensajear a tus estudiantes o al admin")
+                raise HTTPException(403, "Solo puedes mensajear a tus estudiantes o al admin")
             if target.role.value == "student":
                 enr = (await db.execute(
                     select(Enrollment).where(
@@ -95,7 +95,7 @@ async def send_message(
                     )
                 )).scalar_one_or_none()
                 if not enr:
-                    raise HTTPException(403, "Solo podés mensajear a tus estudiantes")
+                    raise HTTPException(403, "Solo puedes mensajear a tus estudiantes")
 
     # Admin puede mensajear a cualquiera
 
