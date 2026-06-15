@@ -124,6 +124,13 @@ async def init_db():
             # V2.3: Modalidad por inscripción (online/presencial/hibrida)
             "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS modality VARCHAR DEFAULT 'online'",
         ]
+        # V2.6: Crear tablas nuevas si no existen (las define el modelo via Base.metadata.create_all)
+        # Las migraciones específicas para campos nuevos van aquí:
+        v26_migrations = [
+            # No hay ALTER necesarios porque las tablas son nuevas (BankAccount, PaymentProof, TrialClass)
+            # SQLAlchemy las creará automáticamente con Base.metadata.create_all
+        ]
+        migrations.extend(v26_migrations)
         for m in migrations:
             try:
                 await conn.execute(sa_text(m))

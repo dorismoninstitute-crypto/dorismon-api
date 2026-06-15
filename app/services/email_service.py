@@ -290,22 +290,44 @@ async def validate_email_domain(email: str) -> tuple[bool, str]:
     if domain_lower in whitelist_domains:
         return True, ""
 
-    # Lista negra ampliada V2.1.1
+    # Lista negra ampliada V2.5
     blacklist_domains = {
         "test.com", "test.test", "test.es", "test.org", "test.io",
         "example.com", "example.org", "example.net", "example.io",
         "ejemplo.com", "ejemplo.es",
         "asdf.com", "asdfasdf.com", "qwerty.com", "qwertyuiop.com",
-        "fake.com", "fakemail.com", "fake.io",
-        "tempmail.com", "mailinator.com", "trashmail.com", "guerrillamail.com",
+        "fake.com", "fakemail.com", "fake.io", "fake.org", "fake.net",
+        "tempmail.com", "tempmail.org", "tempmail.net", "tempmail.io",
+        "mailinator.com", "trashmail.com", "guerrillamail.com",
         "10minutemail.com", "throwaway.email", "yopmail.com",
         "abc.com", "abc.es", "xyz.com", "xyz.es",
-        "prueba.com", "prueba.es", "demo.com",
+        "prueba.com", "prueba.es", "demo.com", "demo.org",
         "noexiste.com", "nada.com", "inventado.com",
-        "correo.com", "email.com",  # genéricos sospechosos
+        "correo.com", "email.com", "mail.com",  # genéricos sospechosos
+        # V2.5: más bloqueos
+        "123.com", "1234.com", "12345.com",
+        "aaa.com", "bbb.com", "ccc.com",
+        "user.com", "users.com", "name.com",
+        "spam.com", "spammer.com",
+        "guerrilla.com", "guerrillamail.org", "guerrillamail.net",
+        "mailtemp.com", "yopmail.org", "yopmail.fr", "yopmail.net",
+        "dispostable.com", "discard.email", "throwawaymail.com",
+        "getnada.com", "tempr.email", "mintemail.com",
     }
     if domain_lower in blacklist_domains:
         return False, f"El dominio {domain} no está permitido. Usa tu email real."
+
+    # V2.5: Bloquear dominios SOSPECHOSOS por patrón
+    local_lower = local.lower()
+    if len(local_lower) < 3:
+        return False, "El usuario del email es muy corto. Usa tu email real."
+
+    # V2.5: bloquear emails con local muy genérico
+    suspicious_locals = {"test", "tests", "testing", "fake", "fakeuser", "prueba",
+                          "demo", "abc", "xyz", "asdf", "qwerty", "user", "users",
+                          "noexiste", "nadie", "ninguno", "ejemplo", "example"}
+    if local_lower in suspicious_locals:
+        return False, "Ese email parece de prueba. Usa tu email real."
 
     # V2.1.1: Bloquear TLDs sospechosos
     suspicious_tlds = (".test", ".invalid", ".localhost", ".local", ".example")

@@ -104,3 +104,33 @@ async def get_lesson(
             "id": m.id, "title": m.title, "type": m.type.value, "url": m.url,
         } for m in materials],
     }
+
+
+# V2.5 — Endpoint público para obtener configuración del instituto (logo, nombre, etc.)
+@router.get("/institute-settings")
+async def get_institute_settings_public(db: AsyncSession = Depends(get_db)):
+    """V2.5: Settings públicos del instituto (logo, nombre, colores, contacto).
+    Accesible sin auth — usado en landing, login, register, footer, etc.
+    """
+    from app.models import InstituteSetting
+    s = await db.get(InstituteSetting, 1)
+    if not s:
+        # Defaults si no hay settings configurados
+        return {
+            "name": "Dorismon Language Institute",
+            "logo_url": None,
+            "primary_color": "#4361ee",
+            "accent_color": "#f4622a",
+            "contact_email": None,
+            "contact_phone": None,
+            "address": None,
+        }
+    return {
+        "name": s.name,
+        "logo_url": s.logo_url,
+        "primary_color": s.primary_color,
+        "accent_color": s.accent_color,
+        "contact_email": s.contact_email,
+        "contact_phone": s.contact_phone,
+        "address": s.address,
+    }

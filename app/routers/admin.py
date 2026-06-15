@@ -16,6 +16,8 @@ from app.models import (
     Certificate, InstituteSetting, AuditLog, Notification, TeacherPayment,
     UserRole, Modality, SessionStatus, MaterialType, PaymentStatus, NotificationType,
     PlanFeature, ModuleProgress, EventRegistration, AttendanceState,
+    # V2.6: Pagos por transferencia + clase de prueba
+    BankAccount, BankAccountType, PaymentProof, PaymentProofStatus, PaymentMethod, TrialClass,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -788,38 +790,129 @@ async def list_payments(
 @router.get("/finance/summary")
 async def finance_summary(
     admin: Annotated[CurrentUser, Depends(require_admin)],
+    year: int | None = None,
+    month: int | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    now = datetime.now(tz.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    """V2.5: Resumen financiero del instituto (mejorado).
 
-    income_month = float((await db.execute(
-        select(func.coalesce(func.sum(Payment.amount), 0)).where(
-            Payment.status == PaymentStatus.paid, Payment.paid_at >= month_start,
+    Por defecto: mes actual. Con parámetros: cualquier mes/año específico.
+
+    Devuelve estructura completa para dashboard financiero.
+    """
+    from calendar import monthrange
+    now = datetime.now(tz.utc)
+    target_year = year or now.year
+    target_month = month or now.month
+    last_day = monthrange(target_year, target_month)[1]
+    start = datetime(target_year, target_month, 1, tzinfo=tz.utc)
+    end = datetime(target_year, target_month, last_day, 23, 59, 59, tzinfo=tz.utc)
+
+    # Ingresos del mes (pagos completados)
+    paid_payments = (await db.execute(
+        select(Payment).where(
+            Payment.status == PaymentStatus.paid,
+            Payment.paid_at >= start, Payment.paid_at <= end,
         )
-    )).scalar() or 0)
+    )).scalars().all()
+    total_income = sum(float(p.amount or 0) for p in paid_payments)
+
+    # Ingresos del año (acumulado)
+    year_start = datetime(target_year, 1, 1, tzinfo=tz.utc)
     income_year = float((await db.execute(
         select(func.coalesce(func.sum(Payment.amount), 0)).where(
             Payment.status == PaymentStatus.paid, Payment.paid_at >= year_start,
         )
     )).scalar() or 0)
-    pending_amount = float((await db.execute(
-        select(func.coalesce(func.sum(Payment.amount), 0)).where(
+
+    # Pendientes a cobrar (estudiantes que aún no pagaron)
+    pending_payments = (await db.execute(
+        select(Payment).where(
             Payment.status == PaymentStatus.pending,
+            Payment.created_at >= start, Payment.created_at <= end,
         )
-    )).scalar() or 0)
+    )).scalars().all()
+    pending_income = sum(float(p.amount or 0) for p in pending_payments)
+
+    # Gastos del mes (pagos a profes — TeacherPayment solo existe cuando ya está pagado)
+    teacher_payments_paid = (await db.execute(
+        select(TeacherPayment).where(
+            TeacherPayment.period_year == target_year,
+            TeacherPayment.period_month == target_month,
+        )
+    )).scalars().all()
+    total_expenses = sum(float(p.total_amount or 0) for p in teacher_payments_paid)
+
+    # Pendientes a pagar a profes (calculado en vivo)
+    pending_expenses = 0.0
+    pending_expense_count = 0
+    teachers_q = (await db.execute(
+        select(Teacher, User).join(User, Teacher.user_id == User.id)
+        .where(User.is_active.is_(True), User.role == UserRole.teacher)
+    )).all()
+
+    for t, _u in teachers_q:
+        sessions_q = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.teacher_id == t.user_id,
+                ClassSession.starts_at_utc >= start,
+                ClassSession.starts_at_utc <= end,
+                ClassSession.status == SessionStatus.completed,
+            )
+        )).scalars().all()
+        expected = 0.0
+        for s in sessions_q:
+            if s.student_id:
+                expected += float(t.rate_private or 0)
+            else:
+                expected += float(t.rate_group or 0)
+        already_paid = sum(
+            float(p.total_amount or 0)
+            for p in teacher_payments_paid
+            if p.teacher_id == t.user_id
+        )
+        pending = expected - already_paid
+        if pending > 0:
+            pending_expenses += pending
+            pending_expense_count += 1
+
+    # Suscripciones activas (pagaron en los últimos 31 días)
     active_subscriptions = (await db.execute(
         select(func.count()).select_from(Payment).where(
             Payment.status == PaymentStatus.paid,
             Payment.paid_at > now - timedelta(days=31),
         )
     )).scalar() or 0
+
+    net_balance = total_income - total_expenses
+    projected_balance = (total_income + pending_income) - (total_expenses + pending_expenses)
+
     return {
-        "income_month": income_month,
-        "income_year": income_year,
-        "pending_amount": pending_amount,
+        # Compatibilidad con UI vieja
+        "income_month": round(total_income, 2),
+        "income_year": round(income_year, 2),
+        "pending_amount": round(pending_income, 2),
         "active_subscriptions": active_subscriptions,
+        # V2.5: estructura nueva más completa
+        "year": target_year,
+        "month": target_month,
+        "income": {
+            "total": round(total_income, 2),
+            "count": len(paid_payments),
+            "pending_total": round(pending_income, 2),
+            "pending_count": len(pending_payments),
+        },
+        "expenses": {
+            "total": round(total_expenses, 2),
+            "count": len(teacher_payments_paid),
+            "pending_total": round(pending_expenses, 2),
+            "pending_count": pending_expense_count,
+        },
+        "balance": {
+            "net": round(net_balance, 2),
+            "projected": round(projected_balance, 2),
+        },
+        "currency": "RD$",
     }
 
 
@@ -907,6 +1000,27 @@ async def update_settings(
     if not s:
         s = InstituteSetting(id=1)
         db.add(s)
+
+    # V2.5: Validar tamaño del logo si es base64
+    if "logo_url" in body and body["logo_url"]:
+        logo = body["logo_url"]
+        # Si es base64 data URL, validar tamaño
+        if logo.startswith("data:"):
+            # Estimación rápida: 1 byte de base64 = 0.75 bytes reales
+            estimated_bytes = len(logo) * 0.75
+            max_bytes = 800 * 1024  # 800 KB max
+            if estimated_bytes > max_bytes:
+                raise HTTPException(400,
+                    f"El logo es muy pesado ({estimated_bytes/1024:.0f}KB). Máximo permitido: 800KB. "
+                    "Comprime la imagen o usa una más pequeña.")
+            # Validar que sea imagen
+            if not (logo.startswith("data:image/png") or
+                    logo.startswith("data:image/jpeg") or
+                    logo.startswith("data:image/jpg") or
+                    logo.startswith("data:image/webp") or
+                    logo.startswith("data:image/svg")):
+                raise HTTPException(400, "El logo debe ser PNG, JPG, WebP o SVG.")
+
     for f in ("name", "logo_url", "primary_color", "accent_color",
               "contact_email", "contact_phone", "address", "timezone"):
         if f in body:
@@ -2043,7 +2157,7 @@ async def issue_certification_quick(
     course = await db.get(Course, e.course_id)
     db.add(Notification(
         user_id=e.student_id,
-        type=NotificationType.success,
+        type=NotificationType.info,
         title="🎓 ¡Tu certificado está listo!",
         body=f"¡Felicitaciones! Completaste {course.name if course else ''} nivel {level.code if level else ''}. Tu código de certificado es {code}.",
         link="/dashboard/student/certificates",
@@ -3001,5 +3115,519 @@ async def admin_update_student_profile(
             s.birth_date = None
 
     await log_action(db, admin.user_id, "admin_update_student_profile", "students", target_id=student_id)
+    await db.commit()
+    return {"ok": True}
+
+
+
+
+@router.get("/finance/transactions")
+async def admin_finance_transactions(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    year: int | None = None,
+    month: int | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.5: Lista de TODAS las transacciones del período (ingresos + gastos).
+
+    Mezcla pagos de estudiantes Y pagos a profesores, ordenados por fecha.
+    Útil para ver el flujo de caja del mes.
+    """
+    from datetime import datetime, timezone as tz
+    now = datetime.now(tz.utc)
+    target_year = year or now.year
+    target_month = month or now.month
+
+    from calendar import monthrange
+    last_day = monthrange(target_year, target_month)[1]
+    start = datetime(target_year, target_month, 1, tzinfo=tz.utc)
+    end = datetime(target_year, target_month, last_day, 23, 59, 59, tzinfo=tz.utc)
+
+    transactions = []
+
+    # Ingresos (pagos de estudiantes)
+    payments = (await db.execute(
+        select(Payment).where(
+            Payment.created_at >= start, Payment.created_at <= end,
+        ).order_by(Payment.created_at.desc())
+    )).scalars().all()
+
+    for p in payments:
+        student = await db.get(User, p.student_id) if p.student_id else None
+        plan = await db.get(Plan, p.plan_id) if p.plan_id else None
+        transactions.append({
+            "type": "income",
+            "id": p.id,
+            "date": (p.paid_at or p.created_at).isoformat() if (p.paid_at or p.created_at) else None,
+            "description": f"Pago: {student.full_name if student else '?'} ({plan.name if plan else 'sin plan'})",
+            "amount": float(p.amount or 0),
+            "status": p.status.value if p.status else "pending",
+            "method": p.method,
+            "reference": p.reference,
+        })
+
+    # Gastos (pagos a profes — solo los YA pagados existen en la tabla)
+    from app.models import TeacherPayment
+    teacher_pmts = (await db.execute(
+        select(TeacherPayment).where(
+            TeacherPayment.period_year == target_year,
+            TeacherPayment.period_month == target_month,
+        ).order_by(TeacherPayment.paid_at.desc())
+    )).scalars().all()
+
+    for tp in teacher_pmts:
+        teacher_user = await db.get(User, tp.teacher_id) if tp.teacher_id else None
+        transactions.append({
+            "type": "expense",
+            "id": tp.id,
+            "date": tp.paid_at.isoformat() if tp.paid_at else None,
+            "description": f"Pago a profe: {teacher_user.full_name if teacher_user else '?'} ({tp.period_year}-{tp.period_month:02d})",
+            "amount": float(tp.total_amount or 0),
+            "status": "paid",  # Si existe el registro, ya está pagado
+            "method": tp.payment_method,
+            "reference": tp.reference or tp.notes,
+        })
+
+    # Ordenar por fecha desc
+    transactions.sort(key=lambda x: x["date"] or "", reverse=True)
+
+    return {
+        "year": target_year,
+        "month": target_month,
+        "total": len(transactions),
+        "transactions": transactions,
+    }
+
+
+# ============= V2.6 — CUENTAS BANCARIAS =============
+
+@router.get("/bank-accounts")
+async def list_bank_accounts(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Lista todas las cuentas bancarias del instituto."""
+    accounts = (await db.execute(
+        select(BankAccount).order_by(BankAccount.is_active.desc(), BankAccount.bank_name)
+    )).scalars().all()
+    return [
+        {
+            "id": a.id,
+            "bank_name": a.bank_name,
+            "account_type": a.account_type.value if a.account_type else "savings",
+            "account_number": a.account_number,
+            "holder_name": a.holder_name,
+            "holder_document": a.holder_document,
+            "notes": a.notes,
+            "is_active": a.is_active,
+        }
+        for a in accounts
+    ]
+
+
+@router.post("/bank-accounts", status_code=201)
+async def create_bank_account(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Crear cuenta bancaria."""
+    for f in ("bank_name", "account_number", "holder_name", "holder_document"):
+        if not body.get(f):
+            raise HTTPException(400, f"{f} requerido")
+
+    acc_type = body.get("account_type", "savings")
+    if acc_type not in ("savings", "checking"):
+        acc_type = "savings"
+
+    acc = BankAccount(
+        bank_name=body["bank_name"].strip(),
+        account_type=BankAccountType(acc_type),
+        account_number=body["account_number"].strip(),
+        holder_name=body["holder_name"].strip(),
+        holder_document=body["holder_document"].strip(),
+        notes=body.get("notes"),
+        is_active=body.get("is_active", True),
+    )
+    db.add(acc)
+    await log_action(db, admin.user_id, "create_bank_account", "admin", details=acc.bank_name)
+    await db.commit()
+    await db.refresh(acc)
+    return {"id": acc.id, "ok": True}
+
+
+@router.patch("/bank-accounts/{account_id}")
+async def update_bank_account(
+    account_id: int, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Editar cuenta bancaria."""
+    acc = await db.get(BankAccount, account_id)
+    if not acc:
+        raise HTTPException(404)
+    for f in ("bank_name", "account_number", "holder_name", "holder_document", "notes", "is_active"):
+        if f in body:
+            setattr(acc, f, body[f])
+    if "account_type" in body and body["account_type"] in ("savings", "checking"):
+        acc.account_type = BankAccountType(body["account_type"])
+    await log_action(db, admin.user_id, "update_bank_account", "admin", target_id=str(account_id))
+    await db.commit()
+    return {"ok": True}
+
+
+@router.delete("/bank-accounts/{account_id}")
+async def delete_bank_account(
+    account_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Eliminar cuenta bancaria (solo si nunca tuvo pagos asociados)."""
+    acc = await db.get(BankAccount, account_id)
+    if not acc:
+        raise HTTPException(404)
+    # Mejor desactivar que borrar (para histórico)
+    acc.is_active = False
+    await log_action(db, admin.user_id, "deactivate_bank_account", "admin", target_id=str(account_id))
+    await db.commit()
+    return {"ok": True}
+
+
+# ============= V2.6 — VERIFICAR PRUEBAS DE PAGO =============
+
+@router.get("/payment-proofs")
+async def list_payment_proofs(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    status: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Lista pruebas de pago. Por defecto: solo las pendientes."""
+    stmt = select(PaymentProof, User, Plan).join(
+        User, PaymentProof.student_id == User.id
+    ).outerjoin(Plan, PaymentProof.plan_id == Plan.id)
+
+    if status:
+        try:
+            stmt = stmt.where(PaymentProof.status == PaymentProofStatus(status))
+        except ValueError:
+            raise HTTPException(400, "Estado inválido")
+    else:
+        # Default: solo pendientes
+        stmt = stmt.where(PaymentProof.status == PaymentProofStatus.pending)
+
+    stmt = stmt.order_by(PaymentProof.created_at.desc())
+    rows = (await db.execute(stmt)).all()
+
+    return [
+        {
+            "id": p.id,
+            "student_id": p.student_id,
+            "student_name": u.full_name,
+            "student_email": u.email,
+            "plan_id": p.plan_id,
+            "plan_name": plan.name if plan else "Sin plan",
+            "amount": float(p.amount),
+            "currency": p.currency,
+            "method": p.method.value if p.method else "bank_transfer",
+            "bank_origin": p.bank_origin,
+            "payment_date": p.payment_date.isoformat() if p.payment_date else None,
+            "reference_number": p.reference_number,
+            "voucher_url": p.voucher_url,
+            "status": p.status.value if p.status else "pending",
+            "student_notes": p.student_notes,
+            "admin_notes": p.admin_notes,
+            "modality": p.modality.value if p.modality else "online",
+            "level_id": p.level_id,
+            "course_id": p.course_id,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "reviewed_at": p.reviewed_at.isoformat() if p.reviewed_at else None,
+        }
+        for p, u, plan in rows
+    ]
+
+
+@router.post("/payment-proofs/{proof_id}/approve")
+async def approve_payment_proof(
+    proof_id: str,
+    body: dict | None = None,
+    admin: Annotated[CurrentUser, Depends(require_admin)] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Aprobar prueba de pago.
+
+    Acciones automáticas:
+    1. Marca el PaymentProof como approved
+    2. Crea la inscripción del estudiante en el plan
+    3. Asigna nivel + modalidad
+    4. Crea un Payment como "paid"
+    5. Envía email al estudiante de confirmación
+    """
+    proof = await db.get(PaymentProof, proof_id)
+    if not proof:
+        raise HTTPException(404, "Prueba de pago no encontrada")
+    if proof.status != PaymentProofStatus.pending:
+        raise HTTPException(400, f"Esta prueba ya está {proof.status.value}")
+
+    student = await db.get(Student, proof.student_id)
+    student_user = await db.get(User, proof.student_id)
+    if not student or not student_user:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    plan = await db.get(Plan, proof.plan_id)
+    if not plan:
+        raise HTTPException(404, "Plan no encontrado")
+
+    # Determinar level_id (si no viene, usar el current del estudiante o default)
+    level_id = proof.level_id or student.current_level_id
+    if not level_id:
+        # Default A1
+        lvl = (await db.execute(select(Level).where(Level.code == "A1"))).scalar_one_or_none()
+        if lvl:
+            level_id = lvl.id
+
+    # Determinar course_id (default curso principal si no viene)
+    course_id = proof.course_id
+    if not course_id:
+        course = (await db.execute(select(Course).limit(1))).scalar_one_or_none()
+        if course:
+            course_id = course.id
+
+    if not level_id or not course_id:
+        raise HTTPException(400, "No se pudo determinar curso/nivel. Configura nivel y curso por defecto.")
+
+    # 1. Crear inscripción
+    enrollment = Enrollment(
+        student_id=proof.student_id,
+        course_id=course_id,
+        level_id=level_id,
+        plan_id=proof.plan_id,
+        modality=proof.modality,
+        is_active=True,
+    )
+    db.add(enrollment)
+    await db.flush()
+
+    # 2. Actualizar nivel del estudiante
+    student.current_level_id = level_id
+    if not student.placement_done:
+        student.placement_done = True
+
+    # 3. Crear Payment correspondiente
+    payment = Payment(
+        student_id=proof.student_id,
+        plan_id=proof.plan_id,
+        amount=proof.amount,
+        currency=proof.currency,
+        status=PaymentStatus.paid,
+        method=proof.method.value if proof.method else "bank_transfer",
+        reference=proof.reference_number,
+        paid_at=datetime.now(tz.utc),
+    )
+    db.add(payment)
+
+    # 4. Actualizar proof
+    proof.status = PaymentProofStatus.approved
+    proof.enrollment_id = enrollment.id
+    proof.reviewed_by_admin_id = admin.user_id
+    proof.reviewed_at = datetime.now(tz.utc)
+    if body and body.get("admin_notes"):
+        proof.admin_notes = body["admin_notes"]
+
+    # 5. Notificación in-app
+    db.add(Notification(
+        user_id=proof.student_id,
+        type=NotificationType.info,
+        title="✅ ¡Pago aprobado! Estás inscrito",
+        body=f"Tu pago de RD${float(proof.amount):,.2f} fue confirmado. Ya tienes acceso a tu plan {plan.name}.",
+        link="/dashboard/student",
+    ))
+
+    # 6. Email de confirmación
+    try:
+        from app.services.email_service import send_email, is_email_configured, _base_html
+        if is_email_configured() and student_user.email:
+            html = _base_html(f"""
+                <h2>¡Hola, {student_user.full_name}! 🎉</h2>
+                <p>Tu pago ha sido <strong>confirmado</strong> y tu inscripción está activa.</p>
+                <p><strong>Detalles de tu inscripción:</strong></p>
+                <ul style="line-height: 1.8;">
+                    <li><strong>Plan:</strong> {plan.name}</li>
+                    <li><strong>Monto pagado:</strong> RD${float(proof.amount):,.2f}</li>
+                    <li><strong>Modalidad:</strong> {proof.modality.value if proof.modality else 'online'}</li>
+                </ul>
+                <p>Ya puedes acceder a todas las funciones de tu plan.</p>
+                <p style="text-align: center; margin-top: 24px;">
+                    <a href="https://dorismon.com/dashboard" class="button">Ir a mi dashboard</a>
+                </p>
+                <p style="font-size: 12px; color: #64748b;">
+                    Pronto te asignaremos un profesor y empezarán tus clases. Te avisamos por email cuando esté listo.
+                </p>
+            """)
+            await send_email(
+                to=student_user.email,
+                subject="✅ Pago confirmado — Inscripción activa | Dorismon",
+                html=html,
+            )
+    except Exception:
+        pass  # No bloquear si email falla
+
+    await log_action(db, admin.user_id, "approve_payment_proof", "admin", target_id=proof_id,
+                     details=f"enrollment={enrollment.id}")
+    await db.commit()
+    return {"ok": True, "enrollment_id": enrollment.id}
+
+
+@router.post("/payment-proofs/{proof_id}/reject")
+async def reject_payment_proof(
+    proof_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Rechazar prueba de pago. Requiere motivo."""
+    reason = body.get("reason", "").strip()
+    if not reason or len(reason) < 10:
+        raise HTTPException(400, "Debes proporcionar un motivo del rechazo (mínimo 10 caracteres)")
+
+    proof = await db.get(PaymentProof, proof_id)
+    if not proof:
+        raise HTTPException(404)
+    if proof.status != PaymentProofStatus.pending:
+        raise HTTPException(400, f"Esta prueba ya está {proof.status.value}")
+
+    proof.status = PaymentProofStatus.rejected
+    proof.admin_notes = reason
+    proof.reviewed_by_admin_id = admin.user_id
+    proof.reviewed_at = datetime.now(tz.utc)
+
+    # Notificar al estudiante
+    student_user = await db.get(User, proof.student_id)
+    db.add(Notification(
+        user_id=proof.student_id,
+        type=NotificationType.info,
+        title="❌ Pago rechazado",
+        body=f"Motivo: {reason}. Por favor verifica los datos y sube una nueva prueba.",
+        link="/dashboard/student/payments",
+    ))
+
+    # Email
+    try:
+        from app.services.email_service import send_email, is_email_configured, _base_html
+        if is_email_configured() and student_user and student_user.email:
+            html = _base_html(f"""
+                <h2>Hola, {student_user.full_name}</h2>
+                <p>Lamentablemente no pudimos verificar tu pago. Te explicamos abajo:</p>
+                <div style="background:#fef2f2;border-left:4px solid #ef4444;padding:12px;margin:16px 0;border-radius:6px;">
+                    <p style="margin:0;font-size:14px;"><strong>Motivo:</strong></p>
+                    <p style="margin:8px 0 0 0;">{reason}</p>
+                </div>
+                <p>Por favor verifica los datos y vuelve a subir tu prueba de pago.</p>
+                <p style="text-align: center; margin-top: 24px;">
+                    <a href="https://dorismon.com/checkout" class="button">Volver a enviar pago</a>
+                </p>
+                <p style="font-size: 12px; color: #64748b;">
+                    Si crees que hay un error, escríbenos por la sección Ayuda de la plataforma.
+                </p>
+            """)
+            await send_email(
+                to=student_user.email,
+                subject="No pudimos verificar tu pago | Dorismon",
+                html=html,
+            )
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "reject_payment_proof", "admin", target_id=proof_id,
+                     details=reason[:100])
+    await db.commit()
+    return {"ok": True}
+
+
+# ============= V2.6 — CLASES DE PRUEBA =============
+
+@router.get("/trial-classes")
+async def list_trial_classes(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    status: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Lista solicitudes de clases de prueba."""
+    stmt = select(TrialClass, User).join(User, TrialClass.student_id == User.id)
+    if status:
+        stmt = stmt.where(TrialClass.status == status)
+    else:
+        # Default: solo las que requieren acción del admin
+        stmt = stmt.where(TrialClass.status.in_(["requested", "scheduled"]))
+    stmt = stmt.order_by(TrialClass.created_at.desc())
+    rows = (await db.execute(stmt)).all()
+
+    return [
+        {
+            "id": tc.id,
+            "student_id": tc.student_id,
+            "student_name": u.full_name,
+            "student_email": u.email,
+            "modality": tc.modality.value if tc.modality else "online",
+            "preferred_level": tc.preferred_level,
+            "preferred_date": tc.preferred_date.isoformat() if tc.preferred_date else None,
+            "preferred_time": tc.preferred_time,
+            "notes": tc.notes,
+            "status": tc.status,
+            "teacher_id": tc.teacher_id,
+            "scheduled_at": tc.scheduled_at.isoformat() if tc.scheduled_at else None,
+            "created_at": tc.created_at.isoformat() if tc.created_at else None,
+        }
+        for tc, u in rows
+    ]
+
+
+@router.post("/trial-classes/{trial_id}/schedule")
+async def schedule_trial_class(
+    trial_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.6: Admin agenda la clase de prueba con un profesor.
+
+    Body: teacher_id, scheduled_at (ISO datetime), meeting_url (opcional)
+    """
+    teacher_id = body.get("teacher_id")
+    scheduled_at_str = body.get("scheduled_at")
+    if not teacher_id or not scheduled_at_str:
+        raise HTTPException(400, "teacher_id y scheduled_at son requeridos")
+
+    tc = await db.get(TrialClass, trial_id)
+    if not tc:
+        raise HTTPException(404)
+
+    try:
+        scheduled_at = datetime.fromisoformat(scheduled_at_str.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(400, "scheduled_at inválido (formato ISO)")
+
+    tc.teacher_id = teacher_id
+    tc.scheduled_at = scheduled_at
+    tc.status = "scheduled"
+
+    # Notificar
+    student_user = await db.get(User, tc.student_id)
+    teacher_user = await db.get(User, teacher_id)
+    db.add(Notification(
+        user_id=tc.student_id,
+        type=NotificationType.info,
+        title="🎁 Tu clase de prueba está agendada",
+        body=f"Profesor: {teacher_user.full_name if teacher_user else '?'}. Fecha: {scheduled_at.strftime('%d/%m/%Y %H:%M')}",
+        link="/dashboard/student/calendar",
+    ))
+    db.add(Notification(
+        user_id=teacher_id,
+        type=NotificationType.info,
+        title="🎁 Tienes una clase de prueba",
+        body=f"Estudiante: {student_user.full_name if student_user else '?'}. Fecha: {scheduled_at.strftime('%d/%m/%Y %H:%M')}",
+        link="/dashboard/teacher",
+    ))
+
+    await log_action(db, admin.user_id, "schedule_trial_class", "admin", target_id=trial_id)
     await db.commit()
     return {"ok": True}

@@ -478,6 +478,108 @@ class Plan(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+# ============= V2.6 — SISTEMA DE PAGOS POR TRANSFERENCIA =============
+
+class BankAccountType(str, enum.Enum):
+    savings = "savings"      # Ahorros
+    checking = "checking"    # Corriente
+
+
+class BankAccount(Base):
+    """V2.6: Cuentas bancarias del instituto donde los estudiantes hacen transferencias.
+
+    Configurable por admin. Solo las activas se muestran al estudiante.
+    """
+    __tablename__ = "bank_accounts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bank_name: Mapped[str] = mapped_column(String)  # BHD, Popular, Banreservas, etc.
+    account_type: Mapped[BankAccountType] = mapped_column(default=BankAccountType.savings)
+    account_number: Mapped[str] = mapped_column(String)
+    holder_name: Mapped[str] = mapped_column(String)  # Titular
+    holder_document: Mapped[str] = mapped_column(String)  # Cédula o RNC
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)  # Instrucciones extra
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PaymentProofStatus(str, enum.Enum):
+    pending = "pending"      # Esperando verificación
+    approved = "approved"    # Admin aprobó → estudiante inscrito
+    rejected = "rejected"    # Admin rechazó
+
+
+class PaymentMethod(str, enum.Enum):
+    bank_transfer = "bank_transfer"
+    yappy = "yappy"
+    tpago = "tpago"
+    pingdigital = "pingdigital"
+    cash = "cash"
+    other = "other"
+
+
+class PaymentProof(Base):
+    """V2.6: Prueba de pago subida por el estudiante.
+
+    Cuando es aprobada por admin, se crea la inscripción automáticamente.
+    """
+    __tablename__ = "payment_proofs"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id"))
+    plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"))
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("courses.id"), nullable=True)
+    level_id: Mapped[int | None] = mapped_column(ForeignKey("levels.id"), nullable=True)
+    modality: Mapped[Modality] = mapped_column(default=Modality.online)
+
+    # Datos del pago
+    amount: Mapped[float] = mapped_column(Numeric(10, 2))
+    currency: Mapped[str] = mapped_column(String, default="DOP")
+    method: Mapped[PaymentMethod] = mapped_column(default=PaymentMethod.bank_transfer)
+    bank_origin: Mapped[str | None] = mapped_column(String, nullable=True)  # Banco desde donde envió
+    payment_date: Mapped[date] = mapped_column(Date)
+    reference_number: Mapped[str] = mapped_column(String)  # Número de transacción
+    voucher_url: Mapped[str] = mapped_column(Text)  # Base64 o URL de screenshot
+
+    # Estado
+    status: Mapped[PaymentProofStatus] = mapped_column(default=PaymentProofStatus.pending)
+    student_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    admin_notes: Mapped[str | None] = mapped_column(Text, nullable=True)  # Motivo si rechaza
+    reviewed_by_admin_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Si fue aprobado, qué inscripción se creó
+    enrollment_id: Mapped[str | None] = mapped_column(ForeignKey("enrollments.id"), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TrialClass(Base):
+    """V2.6: Clase de prueba GRATIS para nuevos estudiantes.
+
+    Cada estudiante puede tener UNA sola clase de prueba.
+    """
+    __tablename__ = "trial_classes"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id"), unique=True)  # 1 por estudiante
+    modality: Mapped[Modality] = mapped_column(default=Modality.online)
+    preferred_level: Mapped[str | None] = mapped_column(String, nullable=True)  # A1, A2, B1, etc.
+    preferred_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    preferred_time: Mapped[str | None] = mapped_column(String, nullable=True)  # "morning", "afternoon", "evening"
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Cuando admin la agenda
+    session_id: Mapped[str | None] = mapped_column(ForeignKey("class_sessions.id"), nullable=True)
+    teacher_id: Mapped[str | None] = mapped_column(ForeignKey("teachers.user_id"), nullable=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Estado
+    status: Mapped[str] = mapped_column(String, default="requested")  # requested, scheduled, completed, no_show, cancelled
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    student_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    converted_to_paid: Mapped[bool] = mapped_column(Boolean, default=False)  # Si después se inscribió a un plan
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Payment(Base):
     __tablename__ = "payments"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)

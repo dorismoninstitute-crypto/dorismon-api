@@ -194,6 +194,7 @@ async def change_password(
 class UpdateProfileRequest(BaseModel):
     """V1.6.4: Actualizar perfil propio (cualquier rol)."""
     full_name: str | None = Field(default=None, min_length=2, max_length=100)
+    email: str | None = Field(default=None)  # V2.5: permitir cambiar email propio
     phone: str | None = Field(default=None, max_length=30)
     gender: str | None = Field(default=None)  # V1.6.4: 'male', 'female', 'other' o "" para limpiar
     bio: str | None = Field(default=None, max_length=500)  # solo profes
@@ -205,7 +206,9 @@ async def update_my_profile(
     user: Annotated[CurrentUser, Depends(get_current_user)],
     db: AsyncSession = Depends(get_db),
 ):
-    """V1.6.4: Actualizar perfil propio. Cualquier campo es opcional."""
+    """V1.6.4: Actualizar perfil propio. Cualquier campo es opcional.
+    V2.5: También permite cambiar email propio (con validación MX).
+    """
     u = await db.get(User, user.user_id)
     if not u:
         raise HTTPException(404, "Usuario no encontrado")
@@ -214,6 +217,21 @@ async def update_my_profile(
         u.full_name = body.full_name.strip()
     if body.phone is not None:
         u.phone = body.phone.strip() or None
+
+    # V2.5: Cambiar email propio con validación MX
+    if body.email is not None and body.email.strip() and body.email.strip().lower() != u.email.lower():
+        new_email = body.email.strip().lower()
+        # Verificar que no exista otro con ese email
+        existing = (await db.execute(select(User).where(User.email == new_email))).scalar_one_or_none()
+        if existing and existing.id != u.id:
+            raise HTTPException(409, "Ya existe otro usuario con ese email")
+        # Validar dominio
+        from app.services.email_service import validate_email_domain
+        valid, err = await validate_email_domain(new_email)
+        if not valid:
+            raise HTTPException(400, err)
+        u.email = new_email
+
     if body.gender is not None:
         # V1.6.4: Validar gender
         g = body.gender.strip().lower()
