@@ -134,3 +134,99 @@ async def get_institute_settings_public(db: AsyncSession = Depends(get_db)):
         "contact_phone": s.contact_phone,
         "address": s.address,
     }
+
+
+# V2.8 — Servir el logo del instituto como icono PWA dinámico
+@router.get("/institute-icon/{size}")
+async def get_institute_icon(size: int, db: AsyncSession = Depends(get_db)):
+    """V2.8: Devuelve el logo del instituto como PNG cuadrado del tamaño pedido.
+
+    Si admin subió logo en settings → lo usa como icono PWA.
+    Si no → devuelve un PNG con la "D" azul (fallback).
+    """
+    from fastapi import Response
+    from app.models import InstituteSetting
+
+    # Validar tamaño
+    if size not in (72, 96, 128, 144, 152, 180, 192, 384, 512):
+        raise HTTPException(400, "Tamaño no soportado")
+
+    s = await db.get(InstituteSetting, 1)
+    logo_url = s.logo_url if s and s.logo_url else None
+
+    if logo_url and logo_url.startswith("data:image"):
+        # Logo subido en base64 → procesar con Pillow para hacer icono cuadrado
+        try:
+            import base64
+            from io import BytesIO
+            from PIL import Image
+
+            # Extraer base64
+            _, b64 = logo_url.split(",", 1)
+            img_data = base64.b64decode(b64)
+            img = Image.open(BytesIO(img_data)).convert("RGBA")
+
+            # Hacer canvas blanco cuadrado del tamaño pedido
+            canvas = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+            inner_size = int(size * 0.86)
+
+            # Escalar logo manteniendo proporción
+            ratio = img.size[0] / img.size[1]
+            if ratio > 1:
+                new_w = inner_size
+                new_h = int(inner_size / ratio)
+            else:
+                new_h = inner_size
+                new_w = int(inner_size * ratio)
+
+            resized = img.resize((new_w, new_h), Image.LANCZOS)
+            x = (size - new_w) // 2
+            y = (size - new_h) // 2
+            canvas.paste(resized, (x, y), resized if resized.mode == "RGBA" else None)
+
+            output = BytesIO()
+            canvas.save(output, "PNG", optimize=True)
+            return Response(content=output.getvalue(), media_type="image/png",
+                           headers={"Cache-Control": "public, max-age=3600"})
+        except Exception as e:
+            pass
+
+    # Fallback: devolver icono genérico (D azul)
+    # Generar simple en runtime
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageDraw, ImageFont
+        import os
+
+        canvas = Image.new("RGBA", (size, size), (67, 97, 238, 255))  # #4361ee
+        draw = ImageDraw.Draw(canvas)
+
+        # Buscar fuente disponible
+        font = None
+        for fp in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]:
+            if os.path.exists(fp):
+                try:
+                    font = ImageFont.truetype(fp, int(size * 0.55))
+                    break
+                except Exception:
+                    pass
+        if not font:
+            font = ImageFont.load_default()
+
+        text = "D"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        x = (size - text_w) // 2 - bbox[0]
+        y = (size - text_h) // 2 - bbox[1]
+        draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
+
+        output = BytesIO()
+        canvas.save(output, "PNG", optimize=True)
+        return Response(content=output.getvalue(), media_type="image/png",
+                       headers={"Cache-Control": "public, max-age=3600"})
+    except Exception:
+        raise HTTPException(500, "No se pudo generar el icono")

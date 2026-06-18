@@ -456,26 +456,77 @@ async def list_admin_sessions(
     db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
+    filter_period: str = Query("upcoming", description="upcoming/this_week/this_month/past/all"),
+    teacher_id: str | None = None,
+    course_id: int | None = None,
+    level_id: int | None = None,
 ):
+    """V2.8: Lista sesiones con filtros y orden ascendente (próximas primero).
+
+    filter_period:
+    - upcoming: clases futuras (>= hoy), orden ASC (default)
+    - this_week: clases de esta semana
+    - this_month: clases de este mes
+    - past: clases pasadas, orden DESC (más reciente primero)
+    - all: todas, orden ASC
+    """
+    from datetime import timedelta as td
+    now = datetime.now(tz.utc)
+
+    stmt = select(ClassSession)
+
+    # Filtros de fecha
+    if filter_period == "upcoming":
+        stmt = stmt.where(ClassSession.starts_at_utc >= now - td(hours=2))  # incluye clases en curso
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+    elif filter_period == "this_week":
+        start = now - td(days=now.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + td(days=7)
+        stmt = stmt.where(ClassSession.starts_at_utc >= start, ClassSession.starts_at_utc < end)
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+    elif filter_period == "this_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        from calendar import monthrange
+        last_day = monthrange(start.year, start.month)[1]
+        end = start.replace(day=last_day, hour=23, minute=59, second=59)
+        stmt = stmt.where(ClassSession.starts_at_utc >= start, ClassSession.starts_at_utc <= end)
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+    elif filter_period == "past":
+        stmt = stmt.where(ClassSession.starts_at_utc < now)
+        stmt = stmt.order_by(ClassSession.starts_at_utc.desc())
+    else:  # all
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+
+    # Filtros adicionales
+    if teacher_id:
+        stmt = stmt.where(ClassSession.teacher_id == teacher_id)
+    if course_id:
+        stmt = stmt.where(ClassSession.course_id == course_id)
+    if level_id:
+        stmt = stmt.where(ClassSession.level_id == level_id)
+
     offset = (page - 1) * limit
-    stmt = select(ClassSession).order_by(ClassSession.starts_at_utc.desc()).offset(offset).limit(limit)
+    stmt = stmt.offset(offset).limit(limit)
+
     sessions = (await db.execute(stmt)).scalars().all()
     out = []
     for s in sessions:
-        teacher_user = await db.get(User, s.teacher_id)
-        course = await db.get(Course, s.course_id)
-        level = await db.get(Level, s.level_id)
+        teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
+        course = await db.get(Course, s.course_id) if s.course_id else None
+        level = await db.get(Level, s.level_id) if s.level_id else None
         out.append({
-            "id": s.id, "title": s.title, "modality": s.modality.value,
-            "starts_at_utc": s.starts_at_utc.isoformat(),
-            "ends_at_utc": s.ends_at_utc.isoformat(),
+            "id": s.id, "title": s.title, "modality": s.modality.value if s.modality else None,
+            "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+            "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
             "teacher_id": s.teacher_id, "teacher_name": teacher_user.full_name if teacher_user else None,
             "course_id": s.course_id, "course_name": course.name if course else None,
             "level_id": s.level_id, "level_code": level.code if level else None,
             "branch_id": s.branch_id, "classroom_id": s.classroom_id,
-            "meeting_url": s.meeting_url, "capacity": s.capacity, "status": s.status.value,
+            "meeting_url": s.meeting_url, "capacity": s.capacity,
+            "status": s.status.value if s.status else "scheduled",
         })
-    return {"items": out, "page": page, "limit": limit}
+    return {"items": out, "page": page, "limit": limit, "filter_period": filter_period}
 
 
 @router.post("/sessions", status_code=201)
@@ -1037,17 +1088,117 @@ async def audit_logs(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
 ):
+    """V2.8: Auditoría con nombres legibles + acciones en español."""
+    # V2.8: Diccionario de acciones → texto en español
+    ACTION_LABELS = {
+        "register": "Se registró en la plataforma",
+        "login": "Inició sesión",
+        "logout": "Cerró sesión",
+        "update_profile": "Actualizó su perfil",
+        "change_password": "Cambió su contraseña",
+        "request_password_reset": "Solicitó recuperar contraseña",
+        "reset_password": "Cambió contraseña con token",
+        "verify_email": "Verificó su email",
+        "create_user": "Creó un usuario",
+        "update_user": "Editó un usuario",
+        "delete_user": "Eliminó un usuario",
+        "pause_student": "Pausó a un estudiante",
+        "resume_student": "Reactivó a un estudiante",
+        "create_session": "Creó una clase",
+        "update_session": "Editó una clase",
+        "cancel_session": "Canceló una clase",
+        "delete_session": "Eliminó una clase",
+        "create_class_series": "Creó una serie semanal",
+        "update_class_series": "Editó una serie",
+        "delete_class_series": "Eliminó una serie",
+        "mark_attendance": "Registró asistencia",
+        "create_assignment": "Creó una tarea",
+        "grade_assignment": "Calificó una tarea",
+        "create_quiz": "Creó un quiz",
+        "create_material": "Subió material",
+        "create_event": "Creó un evento",
+        "create_certificate": "Generó un certificado",
+        "create_plan": "Creó un plan",
+        "update_plan": "Editó un plan",
+        "delete_plan": "Eliminó un plan",
+        "create_payment": "Registró un pago",
+        "update_payment": "Editó un pago",
+        "mark_teacher_paid": "Pagó a un profesor",
+        "delete_teacher_payment": "Eliminó pago a profesor",
+        "create_branch": "Creó una sucursal",
+        "create_classroom": "Creó un aula",
+        "update_settings": "Actualizó la configuración",
+        "create_bank_account": "Creó una cuenta bancaria",
+        "update_bank_account": "Editó una cuenta bancaria",
+        "deactivate_bank_account": "Desactivó una cuenta bancaria",
+        "approve_payment_proof": "Aprobó un pago por transferencia",
+        "reject_payment_proof": "Rechazó un pago por transferencia",
+        "submit_payment_proof": "Subió comprobante de pago",
+        "request_trial_class": "Solicitó clase de prueba",
+        "schedule_trial_class": "Agendó una clase de prueba",
+        "send_message": "Envió un mensaje",
+        "open_ticket": "Abrió un ticket",
+        "close_ticket": "Cerró un ticket",
+        "complete_placement": "Completó test de nivel",
+    }
+
+    MODULE_LABELS = {
+        "auth": "Cuenta",
+        "admin": "Administración",
+        "student": "Estudiante",
+        "teacher": "Profesor",
+        "payments": "Pagos",
+        "messages": "Mensajes",
+        "placement": "Test de nivel",
+        "events": "Eventos",
+    }
+
     offset = (page - 1) * limit
     stmt = select(AuditLog).order_by(AuditLog.created_at.desc()).offset(offset).limit(limit)
     logs = (await db.execute(stmt)).scalars().all()
-    return {
-        "items": [{
-            "id": l.id, "user_id": l.user_id, "action": l.action,
-            "module": l.module, "target_id": l.target_id, "ip": l.ip,
-            "created_at": l.created_at.isoformat(),
-        } for l in logs],
-        "page": page, "limit": limit,
-    }
+
+    items = []
+    for l in logs:
+        # Obtener nombre del usuario que hizo la acción
+        actor_name = "?"
+        actor_email = "?"
+        actor_role = "?"
+        if l.user_id:
+            actor = await db.get(User, l.user_id)
+            if actor:
+                actor_name = actor.full_name
+                actor_email = actor.email
+                actor_role = actor.role.value if actor.role else "?"
+
+        # Si la acción tiene target_id, obtener info del afectado
+        target_name = None
+        if l.target_id:
+            # Intentar como User
+            target = await db.get(User, l.target_id)
+            if target:
+                target_name = target.full_name
+
+        action_label = ACTION_LABELS.get(l.action, l.action.replace("_", " ").capitalize())
+        module_label = MODULE_LABELS.get(l.module, l.module.capitalize() if l.module else "?")
+
+        items.append({
+            "id": l.id,
+            "user_id": l.user_id,
+            "actor_name": actor_name,
+            "actor_email": actor_email,
+            "actor_role": actor_role,
+            "action": l.action,
+            "action_label": action_label,
+            "module": l.module,
+            "module_label": module_label,
+            "target_id": l.target_id,
+            "target_name": target_name,
+            "details": l.details if hasattr(l, "details") else None,
+            "ip": l.ip,
+            "created_at": l.created_at.isoformat() if l.created_at else None,
+        })
+
+    return {"items": items, "page": page, "limit": limit}
 
 
 @router.get("/levels-by-course/{course_id}")
@@ -3631,3 +3782,75 @@ async def schedule_trial_class(
     await log_action(db, admin.user_id, "schedule_trial_class", "admin", target_id=trial_id)
     await db.commit()
     return {"ok": True}
+
+
+# ============= V2.8 — SOFT DELETE DE USUARIOS =============
+
+@router.delete("/users/{user_id}")
+async def soft_delete_user(
+    user_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.8: Soft delete de usuario (profesor, estudiante o admin).
+
+    NO borra físicamente. Marca como inactivo + email rename para liberarlo.
+    El usuario desaparece de listas activas pero su historial (clases, pagos, asistencia)
+    se conserva para auditoría y contabilidad.
+
+    Restricciones de seguridad:
+    - No se puede borrar a SÍ mismo
+    - No se puede borrar al último admin activo
+    """
+    if user_id == admin.user_id:
+        raise HTTPException(400, "No puedes eliminar tu propia cuenta")
+
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+
+    if not u.is_active:
+        raise HTTPException(400, "Este usuario ya está inactivo")
+
+    # Si es admin, verificar que no sea el último activo
+    if u.role == UserRole.super_admin:
+        active_admins = (await db.execute(
+            select(func.count()).select_from(User).where(
+                User.role == UserRole.super_admin,
+                User.is_active.is_(True),
+            )
+        )).scalar() or 0
+        if active_admins <= 1:
+            raise HTTPException(400, "No puedes eliminar al último administrador activo")
+
+    # Soft delete: desactivar + liberar email
+    old_email = u.email
+    u.is_active = False
+    # Rename email para que se pueda crear otro usuario con ese email después
+    timestamp = int(datetime.now(tz.utc).timestamp())
+    u.email = f"deleted_{timestamp}_{old_email}"
+
+    # Si es profe: cancelar sesiones futuras sin asignar
+    if u.role == UserRole.teacher:
+        future_sessions = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.teacher_id == user_id,
+                ClassSession.starts_at_utc > datetime.now(tz.utc),
+                ClassSession.status == SessionStatus.scheduled,
+            )
+        )).scalars().all()
+        for s in future_sessions:
+            s.status = SessionStatus.cancelled
+
+    # Si es estudiante: pausar enrollments activos
+    if u.role == UserRole.student:
+        st = await db.get(Student, user_id)
+        if st:
+            st.is_paused = True
+            st.paused_at = datetime.now(tz.utc)
+            st.pause_reason = "Usuario eliminado por administrador"
+
+    await log_action(db, admin.user_id, "delete_user", "admin",
+                     target_id=user_id, details=f"role={u.role.value} email={old_email}")
+    await db.commit()
+    return {"ok": True, "deleted_email": old_email}

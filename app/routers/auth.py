@@ -12,7 +12,7 @@ from app.core.security import (
     get_current_user, CurrentUser,
 )
 from app.core.db import get_db
-from app.models import User, Student, UserRole
+from app.models import User, Student, UserRole, Level
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -51,6 +51,7 @@ class UserOut(BaseModel):
     gender: Optional[str] = None  # V1.6.4
     email_verified: Optional[bool] = True  # V2.1
     current_level_id: Optional[int] = None
+    current_level_code: Optional[str] = None  # V2.8: nivel del placement test (A1, B2, C1, etc.)
     placement_done: Optional[bool] = None
 
 
@@ -166,6 +167,11 @@ async def me(user: Annotated[CurrentUser, Depends(get_current_user)], db: AsyncS
         if st:
             out.current_level_id = st.current_level_id
             out.placement_done = st.placement_done
+            # V2.8: incluir el código del nivel (A1, B2, C1, etc.) para mostrar en dashboard
+            if st.current_level_id:
+                lvl = await db.get(Level, st.current_level_id)
+                if lvl:
+                    out.current_level_code = lvl.code
     return out
 
 
