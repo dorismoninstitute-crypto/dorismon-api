@@ -176,40 +176,59 @@ async def main():
         await db.flush()
         print(f"{len(plans)} planes")
 
-        # === 7b. Features estructuradas por plan (V1.3) ===
+        # === 7b. Features estructuradas por plan (V1.3 + V2.9 feature_keys) ===
+        # Cada tupla: (texto descriptivo, is_included, order_index, feature_key)
         plan_features_data = {
             "starter": [
-                ("8 clases grupales al mes (2 por semana)", True, 0),
-                ("Modalidad: solo online", True, 1),
-                ("Acceso a material básico", True, 2),
-                ("Eventos abiertos", False, 3),
-                ("Material descargable", False, 4),
-                ("Certificado al final del nivel", False, 5),
+                ("8 clases grupales al mes (2 por semana)", True, 0, "grupal_classes"),
+                ("Modalidad: solo online", True, 1, None),
+                ("Acceso a biblioteca básica", True, 2, "library_basic"),
+                ("Ver eventos del instituto", True, 3, "events_view"),
+                ("Test de nivel CEFR", True, 4, "placement_test"),
+                ("Tareas y quizzes evaluativos", False, 5, "assignments"),
+                ("Materiales descargables premium", False, 6, "materials_premium"),
+                ("Clases privadas 1-a-1", False, 7, "private_classes"),
+                ("Certificado al final del nivel", False, 8, "certificates"),
+                ("Soporte prioritario", False, 9, "priority_support"),
             ],
             "professional": [
-                ("16 clases grupales al mes (4 por semana)", True, 0),
-                ("Modalidad: online + híbrida", True, 1),
-                ("Hasta 2 eventos abiertos al mes", True, 2),
-                ("Material descargable completo", True, 3),
-                ("Certificado al final del nivel", True, 4),
-                ("Soporte por email del profesor", True, 5),
-                ("Acceso a TOEFL / Business", False, 6),
+                ("16 clases grupales al mes (4 por semana)", True, 0, "grupal_classes"),
+                ("Modalidad: online + híbrida", True, 1, None),
+                ("Biblioteca completa de lecciones", True, 2, "library_full"),
+                ("Tareas con feedback del profesor", True, 3, "assignments"),
+                ("Quizzes evaluativos", True, 4, "quizzes"),
+                ("Eventos del instituto (acceso libre)", True, 5, "events_free"),
+                ("Test de nivel CEFR", True, 6, "placement_test"),
+                ("Certificado al final del nivel", True, 7, "certificates"),
+                ("Materiales descargables premium", False, 8, "materials_premium"),
+                ("Clases privadas 1-a-1", False, 9, "private_classes"),
+                ("Soporte prioritario", False, 10, "priority_support"),
             ],
             "academy": [
-                ("24 clases grupales al mes (6 por semana)", True, 0),
-                ("Modalidad: online + presencial + híbrida", True, 1),
-                ("Eventos abiertos ilimitados", True, 2),
-                ("Material descargable + recursos premium", True, 3),
-                ("Certificado al final del nivel", True, 4),
-                ("Soporte directo del profesor", True, 5),
-                ("1 clase privada al mes", True, 6),
-                ("Acceso a TOEFL / Business / Conversación", True, 7),
+                ("24 clases grupales al mes (6 por semana)", True, 0, "grupal_classes"),
+                ("Modalidad: online + presencial + híbrida", True, 1, None),
+                ("Biblioteca completa de lecciones", True, 2, "library_full"),
+                ("Tareas con feedback del profesor", True, 3, "assignments"),
+                ("Quizzes evaluativos", True, 4, "quizzes"),
+                ("Materiales descargables premium", True, 5, "materials_premium"),
+                ("Eventos del instituto (acceso libre)", True, 6, "events_free"),
+                ("Test de nivel CEFR", True, 7, "placement_test"),
+                ("Certificado al final del nivel", True, 8, "certificates"),
+                ("1 clase privada al mes", True, 9, "private_classes"),
+                ("Ruta curricular personalizada", True, 10, "course_route"),
+                ("Soporte prioritario", True, 11, "priority_support"),
             ],
         }
         for plan in plans:
-            for feature_text, is_inc, idx in plan_features_data.get(plan.code, []):
-                db.add(PlanFeature(plan_id=plan.id, feature=feature_text, is_included=is_inc, order_index=idx))
-        print("Features de planes cargadas")
+            for feature_text, is_inc, idx, feature_key in plan_features_data.get(plan.code, []):
+                db.add(PlanFeature(
+                    plan_id=plan.id,
+                    feature=feature_text,
+                    is_included=is_inc,
+                    order_index=idx,
+                    feature_key=feature_key,
+                ))
+        print("Features de planes cargadas con feature_keys (V2.9)")
 
         # === 8. SEDES Y AULAS ===
         branches_data = [
@@ -251,10 +270,13 @@ async def main():
                 assigned_teacher = teacher_ids["ana@dorismon.do"]
             else:
                 assigned_teacher = teacher_ids["sara@dorismon.do"]
-            # Inscripción CON profe asignado
+            # Inscripción CON profe asignado y plan según nivel
+            # V2.9: Asignar plan profesional por default (excepto C1 que es Academy)
+            assigned_plan_id = plans[2].id if lvl_code in ("C1", "C2") else plans[1].id
             db.add(Enrollment(
                 student_id=u.id, course_id=course_ids[course_code],
                 level_id=level_id, teacher_id=assigned_teacher,
+                plan_id=assigned_plan_id,
             ))
             print(f"Estudiante: {em} / Estudiante2026!")
 

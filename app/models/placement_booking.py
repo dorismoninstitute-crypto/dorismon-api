@@ -77,6 +77,10 @@ class NotificationType(str, enum.Enum):
     class_scheduled = "class_scheduled"
     reminder = "reminder"
     info = "info"
+    # V2.9
+    class_cancelled = "class_cancelled"
+    class_reminder_24h = "class_reminder_24h"
+    general = "general"
 
 
 class User(Base):
@@ -299,6 +303,11 @@ class ClassSession(Base):
     series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id", ondelete="SET NULL"), nullable=True)  # V1.7: pertenece a una serie
     student_id: Mapped[str | None] = mapped_column(ForeignKey("students.user_id"), nullable=True)  # V1.7: si está seteado = clase privada 1-a-1
     counts_for_progress: Mapped[bool] = mapped_column(Boolean, default=True)  # V1.7: privadas pueden no contar para CEFR
+    # V2.9: Recordatorios automáticos + cancelaciones del profe
+    reminder_24h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancelled_by_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ClassSeries(Base):
@@ -720,11 +729,17 @@ class ModuleProgress(Base):
 
 
 class PlanFeature(Base):
-    """Features editables de un plan (mientras más features, más caro)."""
+    """Features editables de un plan (mientras más features, más caro).
+
+    V2.9: Ahora cada feature tiene un `feature_key` que mapea a una funcionalidad real
+    del sistema (ej: 'private_classes', 'certificates', 'priority_support').
+    El campo `feature` sigue siendo el texto descriptivo legible.
+    """
     __tablename__ = "plan_features"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id", ondelete="CASCADE"))
-    feature: Mapped[str] = mapped_column(String)
+    feature: Mapped[str] = mapped_column(String)  # Texto descriptivo
+    feature_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # V2.9: código interno
     is_included: Mapped[bool] = mapped_column(Boolean, default=True)
     order_index: Mapped[int] = mapped_column(Integer, default=0)
 

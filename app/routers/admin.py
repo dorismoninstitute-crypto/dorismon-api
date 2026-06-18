@@ -3854,3 +3854,114 @@ async def soft_delete_user(
                      target_id=user_id, details=f"role={u.role.value} email={old_email}")
     await db.commit()
     return {"ok": True, "deleted_email": old_email}
+
+
+# ============= V2.9 — RECORDATORIOS AUTOMÁTICOS DE CLASE =============
+
+from fastapi import Header
+
+
+@router.post("/send-class-reminders", include_in_schema=False)
+async def send_class_reminders(
+    db: AsyncSession = Depends(get_db),
+    x_cron_secret: str | None = Header(None),
+):
+    """V2.9: Dispara emails recordatorio 24h antes para clases que NO los recibieron aún.
+
+    Protegido con header `X-Cron-Secret` (env REMINDER_CRON_SECRET).
+    Diseñado para ser llamado cada 1 hora por un cron externo (cron-job.org / uptimerobot).
+
+    Lógica:
+    - Busca clases con starts_at_utc entre (ahora + 23h) y (ahora + 25h)
+    - Solo las que tienen reminder_24h_sent_at IS NULL y status=scheduled
+    - Envía email a estudiantes inscritos + notificación in-app
+    - Marca reminder_24h_sent_at = now() para no duplicar
+    """
+    import os
+    expected = os.getenv("REMINDER_CRON_SECRET", "")
+    if not expected or x_cron_secret != expected:
+        raise HTTPException(401, "Invalid cron secret")
+
+    from datetime import timedelta as td
+    from app.services.email_service import send_class_reminder_24h_email
+    now = datetime.now(tz.utc)
+    window_start = now + td(hours=23)
+    window_end = now + td(hours=25)
+
+    # Buscar clases que necesitan recordatorio
+    stmt = select(ClassSession).where(
+        ClassSession.starts_at_utc >= window_start,
+        ClassSession.starts_at_utc <= window_end,
+        ClassSession.reminder_24h_sent_at.is_(None),
+        ClassSession.status == SessionStatus.scheduled,
+    )
+    sessions = (await db.execute(stmt)).scalars().all()
+
+    total_emails_sent = 0
+    sessions_processed = 0
+
+    for s in sessions:
+        teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
+        teacher_name = teacher_user.full_name if teacher_user else "Tu profesor"
+        when_local = s.starts_at_utc.strftime("%d/%m/%Y a las %H:%M UTC")
+        classroom_info = None
+        if s.classroom_id:
+            cr = await db.get(Classroom, s.classroom_id)
+            br = await db.get(Branch, cr.branch_id) if cr and cr.branch_id else None
+            if cr and br:
+                classroom_info = f"{br.name} — {cr.name}"
+
+        # Buscar estudiantes inscritos
+        student_ids: set[str] = set()
+        if s.student_id:
+            student_ids.add(s.student_id)
+        else:
+            active_enrollments = (await db.execute(
+                select(Enrollment.student_id).where(
+                    Enrollment.course_id == s.course_id,
+                    Enrollment.level_id == s.level_id,
+                    Enrollment.is_active.is_(True),
+                )
+            )).scalars().all()
+            student_ids.update(active_enrollments)
+
+        for sid in student_ids:
+            stu = await db.get(User, sid)
+            if not stu or not stu.is_active:
+                continue
+            # Notificación in-app
+            db.add(Notification(
+                user_id=sid,
+                type=NotificationType.class_reminder_24h if hasattr(NotificationType, "class_reminder_24h") else NotificationType.reminder,
+                title="Recordatorio: tu clase es mañana",
+                body=f"'{s.title}' — {when_local} — con {teacher_name}",
+                link=f"/dashboard/student/sessions/{s.id}",
+            ))
+            # Email
+            if stu.email_verified:
+                try:
+                    sent = await send_class_reminder_24h_email(
+                        to_email=stu.email,
+                        student_name=stu.full_name,
+                        class_title=s.title,
+                        when_local=when_local,
+                        teacher_name=teacher_name,
+                        meeting_url=s.meeting_url,
+                        classroom_info=classroom_info,
+                    )
+                    if sent:
+                        total_emails_sent += 1
+                except Exception:
+                    pass
+
+        # Marcar como enviado (aunque algunos emails hayan fallado, evita reintentos infinitos)
+        s.reminder_24h_sent_at = now
+        sessions_processed += 1
+
+    await db.commit()
+    return {
+        "ok": True,
+        "sessions_processed": sessions_processed,
+        "emails_sent": total_emails_sent,
+        "now_utc": now.isoformat(),
+    }

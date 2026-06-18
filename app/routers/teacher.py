@@ -13,7 +13,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizQuestion, QuizAttempt,
     Material, Observation, Notification, Student,
     AttendanceState, QuestionType, MaterialType, NotificationType, SessionStatus,
-    Course, Level,
+    Course, Level, UserRole,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
@@ -252,6 +252,10 @@ async def get_attendance(
             "starts_at_utc": session.starts_at_utc.isoformat(),
             "modality": session.modality.value,
             "teacher_notes": session.teacher_notes,
+            # V2.9: status + datos de cancelación
+            "status": session.status.value if session.status else "scheduled",
+            "cancellation_reason": session.cancellation_reason,
+            "cancelled_at": session.cancelled_at.isoformat() if session.cancelled_at else None,
         },
         "students": out_students,
     }
@@ -775,3 +779,153 @@ async def teacher_income_history(
         "reference": p.reference,
         "paid_at": p.paid_at.isoformat() if p.paid_at else None,
     } for p in payments]
+
+
+# ============= V2.9 — PROFE CANCELA SU CLASE =============
+
+from pydantic import BaseModel, Field
+
+
+class CancelSessionRequest(BaseModel):
+    reason: str = Field(min_length=20, max_length=500,
+                        description="Motivo de la cancelación (mínimo 20 chars)")
+
+
+@router.post("/sessions/{session_id}/cancel")
+async def cancel_my_session(
+    session_id: str,
+    body: CancelSessionRequest,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.9: Profe cancela su propia clase.
+
+    Reglas:
+    - Solo el profe asignado a la clase puede cancelarla (admin también)
+    - Mínimo 2 horas de anticipación al starts_at_utc
+    - Solo sesiones con status=scheduled
+    - Marca la sesión como cancelled + guarda motivo + cancelled_by + cancelled_at
+    - Notifica a TODOS los estudiantes inscritos (in-app + email)
+    - Notifica al admin (in-app)
+    """
+    s = await db.get(ClassSession, session_id)
+    if not s:
+        raise HTTPException(404, "Clase no encontrada")
+
+    # Verificar permisos: el profe debe ser el asignado, o admin
+    requester = await db.get(User, teacher.user_id)
+    if not requester:
+        raise HTTPException(401, "No autenticado")
+    is_admin = requester.role.value == "super_admin"
+    if not is_admin and s.teacher_id != teacher.user_id:
+        raise HTTPException(403, "Solo el profe asignado puede cancelar esta clase")
+
+    # Verificar status
+    if s.status != SessionStatus.scheduled:
+        raise HTTPException(400, f"Esta clase ya está en estado '{s.status.value}', no se puede cancelar")
+
+    # Verificar anticipación mínima (admin puede saltar esta regla)
+    now = datetime.now(tz.utc)
+    if not is_admin:
+        # SQLite devuelve datetime naive — normalizar a UTC para comparar
+        starts = s.starts_at_utc
+        if starts.tzinfo is None:
+            starts = starts.replace(tzinfo=tz.utc)
+        diff = (starts - now).total_seconds() / 3600.0
+        if diff < 2:
+            raise HTTPException(
+                400,
+                f"Debes cancelar con al menos 2 horas de anticipación. "
+                f"Esta clase es en {diff:.1f} horas. Contacta al admin si es urgente.",
+            )
+
+    # Marcar como cancelada
+    s.status = SessionStatus.cancelled
+    s.cancellation_reason = body.reason.strip()
+    s.cancelled_by_user_id = teacher.user_id
+    s.cancelled_at = now
+
+    # === Notificar a estudiantes inscritos ===
+    starts_for_msg = s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)
+    when_local = starts_for_msg.strftime("%d/%m/%Y a las %H:%M UTC")
+    # Encontrar estudiantes con asistencia o inscripción en esa clase
+    # 1. Por asistencias ya registradas (estudiantes que ya marcaron presente)
+    attended = (await db.execute(
+        select(SessionAttendance.student_id).where(SessionAttendance.session_id == session_id)
+    )).scalars().all()
+    student_ids: set[str] = set(attended)
+
+    # 2. Si la clase tiene student_id (privada), agregarlo
+    if s.student_id:
+        student_ids.add(s.student_id)
+
+    # 3. Si la clase es grupal: estudiantes con enrollment activo en ese course+level
+    if not s.student_id:  # clase grupal
+        active_enrollments = (await db.execute(
+            select(Enrollment.student_id).where(
+                Enrollment.course_id == s.course_id,
+                Enrollment.level_id == s.level_id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalars().all()
+        for sid in active_enrollments:
+            student_ids.add(sid)
+
+    # Crear notificaciones in-app
+    when_local = s.starts_at_utc.strftime("%d/%m/%Y a las %H:%M UTC")
+    teacher_name = requester.full_name
+    title = "Clase cancelada"
+    msg_short = f"Tu clase '{s.title}' del {when_local} fue cancelada por {teacher_name}. Motivo: {body.reason[:120]}"
+
+    for sid in student_ids:
+        db.add(Notification(
+            user_id=sid,
+            type=NotificationType.class_cancelled if hasattr(NotificationType, "class_cancelled") else NotificationType.general,
+            title=title,
+            body=msg_short,
+            link=f"/dashboard/student/sessions/{session_id}",
+        ))
+
+    # Notificar a admins
+    admins = (await db.execute(
+        select(User.id).where(User.role == UserRole.super_admin, User.is_active.is_(True))
+    )).scalars().all()
+    for aid in admins:
+        db.add(Notification(
+            user_id=aid,
+            type=NotificationType.general,
+            title="Profesor canceló una clase",
+            body=f"{teacher_name} canceló la clase '{s.title}' del {when_local}. Motivo: {body.reason[:100]}",
+            link=f"/dashboard/admin/sessions/{session_id}",
+        ))
+
+    # Email a estudiantes (solo a los que tienen email verificado)
+    try:
+        from app.services.email_service import send_class_cancelled_email
+        for sid in student_ids:
+            stu = await db.get(User, sid)
+            if stu and stu.email_verified and stu.is_active:
+                await send_class_cancelled_email(
+                    to_email=stu.email,
+                    student_name=stu.full_name,
+                    class_title=s.title,
+                    when_local=when_local,
+                    teacher_name=teacher_name,
+                    reason=body.reason,
+                )
+    except Exception:
+        # No bloquear el endpoint si el email falla
+        pass
+
+    await log_action(
+        db, teacher.user_id, "cancel_session", "teacher",
+        target_id=session_id,
+        details=f"reason={body.reason[:80]} students_notified={len(student_ids)}",
+    )
+    await db.commit()
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "students_notified": len(student_ids),
+        "status": "cancelled",
+    }

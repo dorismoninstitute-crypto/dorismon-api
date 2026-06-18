@@ -369,3 +369,85 @@ async def validate_email_domain(email: str) -> tuple[bool, str]:
     except Exception as e:
         logger.error(f"Error MX para {domain}: {e}")
         return False, f"No pudimos verificar el dominio {domain}. Prueba con un email de Gmail, Hotmail u Outlook."
+
+
+# ============= V2.9 — EMAILS DE CLASES =============
+
+async def send_class_cancelled_email(
+    to_email: str,
+    student_name: str,
+    class_title: str,
+    when_local: str,
+    teacher_name: str,
+    reason: str,
+) -> bool:
+    """V2.9: Email al estudiante avisando que su clase fue cancelada."""
+    subject = f"Clase cancelada: {class_title}"
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#dc2626;margin:0 0 16px">Tu clase fue cancelada</h2>
+      <p>Hola {student_name},</p>
+      <p>Lamentamos informarte que la siguiente clase fue cancelada:</p>
+      <div style="background:#fef2f2;border-left:4px solid #dc2626;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0;font-weight:600">{class_title}</p>
+        <p style="margin:8px 0 0;color:#64748b;font-size:14px">📅 {when_local}</p>
+        <p style="margin:4px 0 0;color:#64748b;font-size:14px">👤 Profesor: {teacher_name}</p>
+      </div>
+      <p><strong>Motivo:</strong></p>
+      <p style="color:#475569">{reason}</p>
+      <p style="margin-top:24px">El profesor te avisará cuando se reagende, o puedes contactar al coordinador para más información.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute</p>
+    </div>
+    """
+    text = (
+        f"Hola {student_name},\n\n"
+        f"Tu clase '{class_title}' del {when_local} fue cancelada por {teacher_name}.\n\n"
+        f"Motivo: {reason}\n\n"
+        f"El profesor te avisará cuando se reagende.\n\n"
+        f"— Dorismon Language Institute"
+    )
+    return await send_email(to_email, subject, html, text)
+
+
+async def send_class_reminder_24h_email(
+    to_email: str,
+    student_name: str,
+    class_title: str,
+    when_local: str,
+    teacher_name: str,
+    meeting_url: str | None = None,
+    classroom_info: str | None = None,
+) -> bool:
+    """V2.9: Email recordatorio 24h antes de la clase."""
+    subject = f"Recordatorio: tu clase '{class_title}' es mañana"
+    join_section = ""
+    if meeting_url:
+        join_section = f'<p style="margin-top:16px"><a href="{meeting_url}" style="background:#4361ee;color:white;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600">Entrar a la clase</a></p>'
+    if classroom_info:
+        join_section += f'<p style="margin:12px 0 0;color:#64748b">📍 {classroom_info}</p>'
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#4361ee;margin:0 0 16px">¡Tu clase es mañana! 📚</h2>
+      <p>Hola {student_name},</p>
+      <p>Te recordamos que mañana tienes la siguiente clase:</p>
+      <div style="background:#eff6ff;border-left:4px solid #4361ee;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0;font-weight:600;font-size:18px">{class_title}</p>
+        <p style="margin:8px 0 0;color:#64748b;font-size:14px">📅 {when_local}</p>
+        <p style="margin:4px 0 0;color:#64748b;font-size:14px">👤 Profesor: {teacher_name}</p>
+        {join_section}
+      </div>
+      <p style="margin-top:24px;color:#475569">Recuerda llegar a tiempo y tener tu material listo.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute</p>
+    </div>
+    """
+    text = (
+        f"Hola {student_name},\n\n"
+        f"Te recordamos que mañana tienes clase:\n\n"
+        f"  • {class_title}\n"
+        f"  • {when_local}\n"
+        f"  • Profesor: {teacher_name}\n"
+        + (f"  • Link: {meeting_url}\n" if meeting_url else "")
+        + (f"  • Aula: {classroom_info}\n" if classroom_info else "")
+        + "\n— Dorismon Language Institute"
+    )
+    return await send_email(to_email, subject, html, text)

@@ -507,3 +507,37 @@ async def reset_password(
     await log_action(db, u.id, "reset_password", "auth", target_id=u.id)
     await db.commit()
     return {"ok": True, "message": "Contraseña actualizada. Ya puedes iniciar sesión."}
+
+
+# ============= V2.9 — FEATURE GATES =============
+
+@router.get("/me/features")
+async def my_features(
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.9: Lista las features que tiene el usuario logueado en base a sus planes activos.
+
+    Admin y profes: SIEMPRE devuelven todas las features (acceso total).
+    Estudiantes: solo las features incluidas en sus enrollments activos.
+    """
+    from app.services.feature_gates import get_student_feature_keys, FEATURE_KEYS
+
+    u = await db.get(User, current.user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+
+    if u.role in (UserRole.super_admin, UserRole.teacher):
+        return {
+            "role": u.role.value,
+            "has_all": True,
+            "features": sorted(list(FEATURE_KEYS)),
+        }
+
+    # Estudiante
+    keys = await get_student_feature_keys(db, current.user_id)
+    return {
+        "role": u.role.value,
+        "has_all": False,
+        "features": sorted(list(keys)),
+    }

@@ -247,13 +247,18 @@ async def my_assignments(
 ):
     if user.role != "student":
         raise HTTPException(403)
+    # V2.9: Feature gate — si el plan no incluye assignments, devolver vacío + flag
+    from app.services.feature_gates import student_has_feature
+    has_access = await student_has_feature(db, user.user_id, "assignments")
+    if not has_access:
+        return {"items": [], "blocked_by_plan": True, "feature_key": "assignments"}
     enrollments = (await db.execute(
         select(Enrollment.level_id).where(
             Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
         )
     )).scalars().all()
     if not enrollments:
-        return []
+        return {"items": [], "blocked_by_plan": False}
     items = (await db.execute(
         select(Assignment).where(Assignment.level_id.in_(enrollments))
         .order_by(Assignment.due_at.asc().nullsfirst()).limit(40)
@@ -278,7 +283,7 @@ async def my_assignments(
             "submission_id": sub.id if sub else None,
             "submitted_at": sub.submitted_at.isoformat() if sub and sub.submitted_at else None,
         })
-    return out
+    return {"items": out, "blocked_by_plan": False}
 
 
 @router.post("/assignments/{assignment_id}/submit")
@@ -317,13 +322,18 @@ async def my_quizzes(
 ):
     if user.role != "student":
         raise HTTPException(403)
+    # V2.9: Feature gate quizzes
+    from app.services.feature_gates import student_has_feature
+    has_access = await student_has_feature(db, user.user_id, "quizzes")
+    if not has_access:
+        return {"items": [], "blocked_by_plan": True, "feature_key": "quizzes"}
     enrollments = (await db.execute(
         select(Enrollment.level_id).where(
             Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
         )
     )).scalars().all()
     if not enrollments:
-        return []
+        return {"items": [], "blocked_by_plan": False}
     items = (await db.execute(
         select(Quiz).where(Quiz.level_id.in_(enrollments), Quiz.is_published.is_(True))
         .order_by(Quiz.created_at.desc()).limit(40)
@@ -348,7 +358,7 @@ async def my_quizzes(
             "last_score": float(last_attempt.score) if last_attempt and last_attempt.score else None,
             "passed": last_attempt.passed if last_attempt else None,
         })
-    return out
+    return {"items": out, "blocked_by_plan": False}
 
 
 @router.get("/quizzes/{quiz_id}")
