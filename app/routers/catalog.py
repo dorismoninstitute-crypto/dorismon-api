@@ -230,3 +230,36 @@ async def get_institute_icon(size: int, db: AsyncSession = Depends(get_db)):
                        headers={"Cache-Control": "public, max-age=3600"})
     except Exception:
         raise HTTPException(500, "No se pudo generar el icono")
+
+
+# V2.9.1 — Endpoint PÚBLICO de planes (para checkout del estudiante)
+@router.get("/plans")
+async def list_public_plans(db: AsyncSession = Depends(get_db)):
+    """Lista los planes ACTIVOS con sus features incluidas.
+
+    Público (no requiere admin) para que los estudiantes vean los planes
+    en la pantalla de checkout/inscripción.
+    """
+    from app.models import Plan, PlanFeature
+    plans = (await db.execute(
+        select(Plan).where(Plan.is_active.is_(True)).order_by(Plan.price)
+    )).scalars().all()
+    out = []
+    for p in plans:
+        # Features incluidas (para mostrar en la card del plan)
+        feats = (await db.execute(
+            select(PlanFeature).where(PlanFeature.plan_id == p.id)
+            .order_by(PlanFeature.order_index)
+        )).scalars().all()
+        out.append({
+            "id": p.id, "code": p.code, "name": p.name,
+            "description": p.description,
+            "price": float(p.price), "currency": p.currency,
+            "duration_months": p.duration_months,
+            "is_active": p.is_active,
+            "features": [
+                {"feature": f.feature, "is_included": f.is_included}
+                for f in feats
+            ],
+        })
+    return out

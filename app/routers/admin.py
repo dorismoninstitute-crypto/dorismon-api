@@ -4,6 +4,7 @@ from datetime import datetime, date, timedelta, timezone as tz
 from secrets import token_urlsafe
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import require_admin, CurrentUser, hash_password
@@ -3057,8 +3058,9 @@ async def mark_teacher_payment_paid(
     if not period:
         raise HTTPException(404, "Profesor no encontrado")
 
+    # V2.9.1: NO permitir pagar montos cero o negativos (evita pagos fantasma)
     if period["total_amount"] <= 0:
-        raise HTTPException(400, "No hay clases pagables en este período")
+        raise HTTPException(400, "No hay clases pagables en este período. El monto a pagar es 0.")
 
     payment = TeacherPayment(
         teacher_id=teacher_id,
@@ -3076,6 +3078,14 @@ async def mark_teacher_payment_paid(
         paid_by_admin_id=admin.user_id,
     )
     db.add(payment)
+
+    # V2.9.1: commit temprano para capturar violación del constraint único
+    # (protege contra doble-click / doble request simultáneo)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "Este período acaba de ser marcado como pagado. Recarga la página.")
 
     # Notificar al profe (interna + email V2.1)
     db.add(Notification(

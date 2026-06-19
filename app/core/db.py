@@ -144,6 +144,27 @@ async def init_db():
             "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP WITH TIME ZONE",
         ]
         migrations.extend(v29_migrations)
+
+        # V2.9.1 — constraint único en teacher_payments (evita doble pago)
+        # Primero elimina duplicados existentes (deja el más reciente por período),
+        # luego crea el índice único. Idempotente.
+        v291_migrations = [
+            # Borrar duplicados: mantener el de paid_at más reciente por (teacher, año, mes)
+            """
+            DELETE FROM teacher_payments tp
+            USING teacher_payments tp2
+            WHERE tp.teacher_id = tp2.teacher_id
+              AND tp.period_year = tp2.period_year
+              AND tp.period_month = tp2.period_month
+              AND tp.paid_at < tp2.paid_at
+            """,
+            # Crear índice único (idempotente con IF NOT EXISTS)
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_teacher_payment_period
+            ON teacher_payments(teacher_id, period_year, period_month)
+            """,
+        ]
+        migrations.extend(v291_migrations)
         for m in migrations:
             try:
                 await conn.execute(sa_text(m))

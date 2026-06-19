@@ -164,8 +164,14 @@ class TeacherPayment(Base):
 
     Se crea cuando el admin marca como pagado un período.
     El cálculo de "lo que falta cobrar" se hace on-the-fly basado en clases con asistencia.
+
+    V2.9.1: constraint único (teacher, año, mes) para evitar doble pago por doble click.
     """
     __tablename__ = "teacher_payments"
+    __table_args__ = (
+        UniqueConstraint("teacher_id", "period_year", "period_month",
+                         name="uq_teacher_payment_period"),
+    )
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     teacher_id: Mapped[str] = mapped_column(ForeignKey("teachers.user_id"))
     period_year: Mapped[int] = mapped_column(Integer)  # 2026

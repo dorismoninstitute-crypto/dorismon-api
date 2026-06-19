@@ -45,15 +45,19 @@ async def student_dashboard(
     enrollments = []
     for e, c, l in enrollments_rows:
         teacher_name = None
+        teacher_id = None
         if e.teacher_id:
             t_user = await db.get(User, e.teacher_id)
-            teacher_name = t_user.full_name if t_user else None
+            # V2.9.1: solo mostrar el profe si sigue ACTIVO
+            if t_user and t_user.is_active:
+                teacher_name = t_user.full_name
+                teacher_id = e.teacher_id
         enrollments.append({
             "id": e.id, "course_id": c.id, "course_name": c.name,
             "level_id": l.id, "level_code": l.code, "level_name": l.name,
             "color": c.color, "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
             "final_grade": float(e.final_grade) if e.final_grade else None,
-            "teacher_id": e.teacher_id, "teacher_name": teacher_name,  # V1.5
+            "teacher_id": teacher_id, "teacher_name": teacher_name,  # V1.5, V2.9.1 solo si activo
         })
 
     # Próximas clases
@@ -88,13 +92,15 @@ async def student_dashboard(
     sessions = (await db.execute(next_sessions_stmt)).scalars().all()
     next_classes = []
     for s in sessions:
-        teacher_user = await db.get(User, s.teacher_id)
+        teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
+        # V2.9.1: mostrar profe solo si está activo
+        t_name = teacher_user.full_name if (teacher_user and teacher_user.is_active) else "—"
         next_classes.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
             "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
             "meeting_url": s.meeting_url,
-            "teacher_name": teacher_user.full_name if teacher_user else "—",
+            "teacher_name": t_name,
             "is_private": s.student_id is not None,  # V1.7
         })
 
@@ -232,7 +238,7 @@ async def my_courses(
             "enrollment_id": e.id, "course_id": c.id, "course_name": c.name,
             "course_color": c.color, "course_description": c.description,
             "level_id": l.id, "level_code": l.code, "level_name": l.name,
-            "teacher_name": t.full_name if t else None,
+            "teacher_name": (t.full_name if (t and t.is_active) else None),  # V2.9.1 solo activo
             "total_lessons": total_lessons,
             "completed_lessons": min(completed, total_lessons),
             "progress_pct": int(min(completed, total_lessons) * 100 / total_lessons) if total_lessons else 0,

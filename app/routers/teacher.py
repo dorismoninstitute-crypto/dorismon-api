@@ -186,16 +186,51 @@ async def teacher_dashboard(
 async def my_sessions(
     teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
     db: AsyncSession = Depends(get_db),
+    filter_period: str = "upcoming",  # upcoming/this_week/this_month/past/all
 ):
+    """V2.9.1: Clases del profe con filtro de período.
+
+    - upcoming (default): clases de hoy en adelante, orden ASC (próximas primero)
+    - this_week: clases de la semana actual
+    - this_month: clases del mes actual
+    - past: clases pasadas, orden DESC
+    - all: todas
+    """
+    from datetime import timedelta as td
+    from calendar import monthrange
+    now = datetime.now(tz.utc)
+
     stmt = select(ClassSession)
     if teacher.role == "teacher":
         stmt = stmt.where(ClassSession.teacher_id == teacher.user_id)
-    stmt = stmt.order_by(ClassSession.starts_at_utc.desc()).limit(50)
+
+    if filter_period == "upcoming":
+        stmt = stmt.where(ClassSession.starts_at_utc >= now - td(hours=3))
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+    elif filter_period == "this_week":
+        start = (now - td(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + td(days=7)
+        stmt = stmt.where(ClassSession.starts_at_utc >= start, ClassSession.starts_at_utc < end)
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+    elif filter_period == "this_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_day = monthrange(start.year, start.month)[1]
+        end = start.replace(day=last_day, hour=23, minute=59, second=59)
+        stmt = stmt.where(ClassSession.starts_at_utc >= start, ClassSession.starts_at_utc <= end)
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+    elif filter_period == "past":
+        stmt = stmt.where(ClassSession.starts_at_utc < now)
+        stmt = stmt.order_by(ClassSession.starts_at_utc.desc())
+    else:  # all
+        stmt = stmt.order_by(ClassSession.starts_at_utc.asc())
+
+    stmt = stmt.limit(100)
     sessions = (await db.execute(stmt)).scalars().all()
     out = []
     for s in sessions:
         course = await db.get(Course, s.course_id)
         level = await db.get(Level, s.level_id)
+        starts = s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)
         out.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
@@ -205,7 +240,7 @@ async def my_sessions(
             "status": s.status.value,
             "capacity": s.capacity,
         })
-    return out
+    return {"items": out, "filter_period": filter_period}
 
 
 @router.get("/sessions/{session_id}/attendance")

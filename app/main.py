@@ -31,11 +31,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# V2.9.1: CORS robusto.
+# Problema previo: allow_origins=["*"] + allow_credentials=True está PROHIBIDO por los navegadores.
+# Solución: lista explícita de orígenes permitidos + regex para subdominios de Vercel.
+_cors_env = os.getenv("CORS_ORIGINS", "").strip()
+if _cors_env and _cors_env != "*":
+    _allowed_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    # Default seguro: dominios de producción de Dorismon
+    _allowed_origins = [
+        "https://dorismon.com",
+        "https://www.dorismon.com",
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    # V2.1: restringir orígenes. Configurar CORS_ORIGINS en Render como CSV.
-    # Default permisivo para desarrollo, pero el env de Render debe sobreescribir.
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_origins=_allowed_origins,
+    # Permitir cualquier preview deploy de Vercel (dorismon-web-*.vercel.app)
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
