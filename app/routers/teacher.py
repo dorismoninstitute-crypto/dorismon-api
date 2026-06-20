@@ -228,6 +228,10 @@ async def my_sessions(
     sessions = (await db.execute(stmt)).scalars().all()
     out = []
     for s in sessions:
+        # V2.9.2: NO mostrar clases canceladas en "Mis clases"
+        # (evita que el profe vea/pase asistencia en clases que ya no existen)
+        if s.status == SessionStatus.cancelled:
+            continue
         course = await db.get(Course, s.course_id)
         level = await db.get(Level, s.level_id)
         starts = s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)
@@ -266,6 +270,13 @@ async def get_attendance(
         )
     )
     rows = (await db.execute(students_q)).all()
+    # V3.0: avisos de ausencia para esta clase
+    from app.models import AbsenceNotice
+    absence_map = {}
+    for an in (await db.execute(
+        select(AbsenceNotice).where(AbsenceNotice.session_id == session_id)
+    )).scalars().all():
+        absence_map[an.student_id] = an
     out_students = []
     for e, u in rows:
         att = (await db.execute(
@@ -274,11 +285,17 @@ async def get_attendance(
                 SessionAttendance.student_id == u.id,
             )
         )).scalar_one_or_none()
+        notice = absence_map.get(u.id)
         out_students.append({
             "student_id": u.id, "full_name": u.full_name, "email": u.email,
             "attendance_id": att.id if att else None,
             "state": att.state.value if att and att.state else None,
             "notes": att.notes if att else None,
+            # V3.0: aviso de ausencia del estudiante
+            "absence_notice": ({
+                "reason": notice.reason,
+                "in_advance": notice.notified_in_advance,
+            } if notice else None),
         })
 
     return {
@@ -307,6 +324,9 @@ async def save_attendance(
         raise HTTPException(404)
     if teacher.role == "teacher" and session.teacher_id != teacher.user_id:
         raise HTTPException(403)
+    # V2.9.2: no permitir pasar asistencia en clase cancelada
+    if session.status == SessionStatus.cancelled:
+        raise HTTPException(400, "Esta clase fue cancelada. No se puede registrar asistencia.")
     records = body.get("records", [])
     updated = 0
     now = datetime.now(tz.utc)

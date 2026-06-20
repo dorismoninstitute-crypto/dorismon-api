@@ -3975,3 +3975,173 @@ async def send_class_reminders(
         "emails_sent": total_emails_sent,
         "now_utc": now.isoformat(),
     }
+
+
+# ============= V2.9.2 — LIMPIEZA OPERATIVA (empezar limpio en producción) =============
+
+@router.post("/maintenance/clean-operational-data")
+async def clean_operational_data(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.9.2: Limpia datos OPERATIVOS de prueba para empezar producción en limpio.
+
+    BORRA (residuo de prueba):
+    - Asistencias (session_attendance)
+    - Registros a eventos (event_registrations)
+    - Notas/observaciones de clase (observations)
+    - Clases programadas (class_sessions)
+    - Series semanales (class_series)
+    - Pagos a profesores (teacher_payments)
+    - Comprobantes de pago (payment_proofs)
+    - Clases de prueba (trial_classes)
+    - Inscripciones (enrollments)
+
+    CONSERVA (datos reales):
+    - Usuarios, perfiles, placement, niveles asignados
+    - Cursos, módulos, lecciones, planes, sedes, aulas
+    - Cuentas bancarias
+
+    SEGURIDAD:
+    - Solo admin
+    - dry_run=true (default): solo CUENTA, no borra
+    - Para borrar de verdad: dry_run=false Y confirm="BORRAR DATOS DE PRUEBA"
+    """
+    dry_run = body.get("dry_run", True)
+    confirm = body.get("confirm", "")
+
+    from sqlalchemy import text as sa_text
+
+    # Tablas a limpiar EN ORDEN (respetando foreign keys: hijos primero)
+    # (nombre_tabla, etiqueta legible)
+    tables_in_order = [
+        ("session_attendance", "Asistencias registradas"),
+        ("event_registrations", "Registros a eventos"),
+        ("observations", "Notas de clase"),
+        ("trial_classes", "Clases de prueba"),
+        ("teacher_payments", "Pagos a profesores"),
+        ("payment_proofs", "Comprobantes de pago"),
+        ("class_sessions", "Clases programadas"),
+        ("class_series", "Series semanales"),
+        ("enrollments", "Inscripciones"),
+    ]
+
+    # Contar registros actuales de cada tabla
+    counts = {}
+    for table, label in tables_in_order:
+        try:
+            n = (await db.execute(sa_text(f"SELECT COUNT(*) FROM {table}"))).scalar() or 0
+            counts[table] = {"label": label, "count": n}
+        except Exception:
+            counts[table] = {"label": label, "count": 0}
+
+    total = sum(c["count"] for c in counts.values())
+
+    # DRY RUN: solo mostrar qué se borraría
+    if dry_run:
+        return {
+            "dry_run": True,
+            "message": "Esto es una simulación. NADA fue borrado.",
+            "total_records_to_delete": total,
+            "detail": [
+                {"tabla": v["label"], "registros": v["count"]}
+                for v in counts.values()
+            ],
+            "instrucciones": "Para borrar de verdad, envía dry_run=false y confirm='BORRAR DATOS DE PRUEBA'",
+        }
+
+    # EJECUCIÓN REAL: requiere confirmación exacta
+    if confirm != "BORRAR DATOS DE PRUEBA":
+        raise HTTPException(
+            400,
+            "Confirmación incorrecta. Para borrar, envía confirm='BORRAR DATOS DE PRUEBA'",
+        )
+
+    # Borrar en orden
+    deleted = {}
+    for table, label in tables_in_order:
+        try:
+            result = await db.execute(sa_text(f"DELETE FROM {table}"))
+            deleted[table] = {"label": label, "deleted": counts[table]["count"]}
+        except Exception as e:
+            # Si una tabla falla, hacer rollback total y reportar
+            await db.rollback()
+            raise HTTPException(
+                500,
+                f"Error borrando '{label}': {str(e)[:100]}. NO se borró nada (rollback).",
+            )
+
+    await log_action(
+        db, admin.user_id, "clean_operational_data", "admin",
+        details=f"total_deleted={total}",
+    )
+    await db.commit()
+
+    return {
+        "dry_run": False,
+        "ok": True,
+        "message": "Datos operativos de prueba eliminados. Usuarios, placement y niveles conservados.",
+        "total_deleted": total,
+        "detail": [
+            {"tabla": v["label"], "borrados": v["deleted"]}
+            for v in deleted.values()
+        ],
+    }
+
+
+# ============= V2.9.2 — REACTIVAR USUARIO (cualquier rol) =============
+
+@router.post("/users/{user_id}/reactivate")
+async def reactivate_user(
+    user_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V2.9.2: Reactiva un usuario desactivado (profesor, estudiante o admin).
+
+    - Pone is_active = True
+    - Restaura el email original (quita el prefijo deleted_TIMESTAMP_)
+    - Si es estudiante: lo des-pausa
+    - NOTA: las clases que se cancelaron al desactivarlo NO se reactivan
+      automáticamente (el admin las reprograma si las necesita), para evitar
+      reactivar clases con fechas ya pasadas.
+    """
+    u = await db.get(User, user_id)
+    if not u:
+        raise HTTPException(404, "Usuario no encontrado")
+
+    if u.is_active:
+        raise HTTPException(400, "Este usuario ya está activo")
+
+    # Restaurar email original si tiene el prefijo deleted_
+    if u.email.startswith("deleted_"):
+        # formato: deleted_{timestamp}_{email_original}
+        parts = u.email.split("_", 2)
+        if len(parts) == 3:
+            original_email = parts[2]
+            # Verificar que no exista otro usuario activo con ese email
+            existing = (await db.execute(
+                select(User).where(User.email == original_email, User.id != user_id)
+            )).scalar_one_or_none()
+            if existing:
+                raise HTTPException(
+                    400,
+                    f"No se puede restaurar el email '{original_email}' porque ya está en uso por otro usuario.",
+                )
+            u.email = original_email
+
+    u.is_active = True
+
+    # Si es estudiante, des-pausar
+    if u.role == UserRole.student:
+        st = await db.get(Student, user_id)
+        if st and st.is_paused:
+            st.is_paused = False
+            st.paused_at = None
+            st.pause_reason = None
+
+    await log_action(db, admin.user_id, "reactivate_user", "admin",
+                     target_id=user_id, details=f"role={u.role.value}")
+    await db.commit()
+    return {"ok": True, "email": u.email, "role": u.role.value}

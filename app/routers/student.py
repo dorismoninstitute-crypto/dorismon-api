@@ -12,8 +12,9 @@ from app.models import (
     Student, User, Enrollment, Course, Level, Module, Lesson, LessonProgress,
     Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
     ClassSession, SessionAttendance, Certificate, Notification, Material,
-    AttendanceState, QuestionType,
+    AttendanceState, QuestionType, AbsenceNotice, NotificationType, SessionStatus,
 )
+from datetime import timezone as _tz, datetime as _dt, timedelta as _td
 
 router = APIRouter(prefix="/student", tags=["student"])
 
@@ -182,6 +183,50 @@ async def student_dashboard(
             "max_score": float(a.max_score) if a else 100.0,
         }
 
+    # V3.0: Clases canceladas recientemente que afectan al estudiante (últimos 7 días)
+    # Para mostrar un aviso visible en el dashboard
+    recent_cancelled = []
+    cancelled_since = now - _td(days=7)
+    level_ids_for_cancel = [l.id for e, c, l in enrollments_rows] if enrollments_rows else []
+    cancel_stmt = (
+        select(ClassSession)
+        .where(
+            ClassSession.status == SessionStatus.cancelled,
+            ClassSession.cancelled_at >= cancelled_since,
+        )
+        .order_by(ClassSession.cancelled_at.desc())
+        .limit(5)
+    )
+    if level_ids_for_cancel:
+        cancel_stmt = cancel_stmt.where(
+            or_(
+                (ClassSession.level_id.in_(level_ids_for_cancel)) & (ClassSession.student_id.is_(None)),
+                ClassSession.student_id == user.user_id,
+            )
+        )
+    else:
+        cancel_stmt = cancel_stmt.where(ClassSession.student_id == user.user_id)
+    for cs in (await db.execute(cancel_stmt)).scalars().all():
+        cs_starts = cs.starts_at_utc if cs.starts_at_utc.tzinfo else cs.starts_at_utc.replace(tzinfo=_tz.utc)
+        recent_cancelled.append({
+            "id": cs.id, "title": cs.title,
+            "starts_at_utc": cs.starts_at_utc.isoformat(),
+            "reason": cs.cancellation_reason,
+            "cancelled_at": cs.cancelled_at.isoformat() if cs.cancelled_at else None,
+        })
+
+    # V3.0: IDs de clases donde el estudiante ya avisó que faltará
+    my_absence_ids = []
+    next_ids = [c["id"] for c in next_classes]
+    if next_ids:
+        notices = (await db.execute(
+            select(AbsenceNotice.session_id).where(
+                AbsenceNotice.student_id == user.user_id,
+                AbsenceNotice.session_id.in_(next_ids),
+            )
+        )).scalars().all()
+        my_absence_ids = list(notices)
+
     return {
         "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
                  "avatar_url": u.avatar_url, "role": "student"},
@@ -197,6 +242,8 @@ async def student_dashboard(
         "next_classes": next_classes,
         "next_assignment": next_assignment,
         "last_grade": last_grade_data,
+        "recent_cancelled": recent_cancelled,  # V3.0
+        "my_absence_session_ids": my_absence_ids,  # V3.0
     }
 
 
@@ -812,3 +859,121 @@ async def update_student_profile(
     await log_action(db, user.user_id, "update_profile", "students", target_id=user.user_id)
     await db.commit()
     return {"ok": True, "profile_complete": _is_profile_complete(s)}
+
+
+# ============= V3.0 — AVISAR AUSENCIA =============
+
+from pydantic import BaseModel as _BaseModel, Field as _Field
+
+
+class AbsenceNoticeRequest(_BaseModel):
+    reason: str = _Field(min_length=5, max_length=500,
+                         description="Motivo de la ausencia (mínimo 5 caracteres)")
+
+
+@router.post("/sessions/{session_id}/notify-absence")
+async def notify_absence(
+    session_id: str,
+    body: AbsenceNoticeRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.0: El estudiante avisa que faltará a una clase.
+
+    - Solo para clases futuras y programadas
+    - Registra si avisó con tiempo (>=2h antes) o a último momento
+    - Notifica al profesor de la clase
+    - No se puede avisar dos veces la misma clase (puede actualizar el motivo)
+    """
+    if user.role != "student":
+        raise HTTPException(403, "Solo estudiantes pueden avisar ausencias")
+
+    session = await db.get(ClassSession, session_id)
+    if not session:
+        raise HTTPException(404, "Clase no encontrada")
+    if session.status == SessionStatus.cancelled:
+        raise HTTPException(400, "Esta clase fue cancelada")
+
+    now = _dt.now(_tz.utc)
+    starts = session.starts_at_utc if session.starts_at_utc.tzinfo else session.starts_at_utc.replace(tzinfo=_tz.utc)
+    if starts < now:
+        raise HTTPException(400, "Esta clase ya pasó, no puedes avisar ausencia")
+
+    # Verificar que el estudiante pertenece a esta clase
+    # (grupal de su nivel o privada para él)
+    belongs = False
+    if session.student_id == user.user_id:
+        belongs = True
+    else:
+        enr = (await db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == user.user_id,
+                Enrollment.level_id == session.level_id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalar_one_or_none()
+        if enr:
+            belongs = True
+    if not belongs:
+        raise HTTPException(403, "Esta clase no está en tu plan")
+
+    # ¿Avisó con tiempo? (>= 2h antes)
+    in_advance = (starts - now).total_seconds() >= 7200
+
+    # ¿Ya existe un aviso? → actualizar
+    existing = (await db.execute(
+        select(AbsenceNotice).where(
+            AbsenceNotice.session_id == session_id,
+            AbsenceNotice.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        existing.reason = body.reason.strip()
+        existing.notified_in_advance = in_advance
+    else:
+        db.add(AbsenceNotice(
+            session_id=session_id,
+            student_id=user.user_id,
+            reason=body.reason.strip(),
+            notified_in_advance=in_advance,
+        ))
+
+    # Notificar al profe
+    if session.teacher_id:
+        student_user = await db.get(User, user.user_id)
+        student_name = student_user.full_name if student_user else "Un estudiante"
+        when = starts.strftime("%d/%m a las %H:%M")
+        db.add(Notification(
+            user_id=session.teacher_id,
+            type=NotificationType.info,
+            title="Un estudiante avisó que faltará",
+            body=f"{student_name} no asistirá a '{session.title}' ({when}). Motivo: {body.reason[:120]}",
+            link=f"/dashboard/teacher/sessions/{session_id}",
+        ))
+
+    await log_action(db, user.user_id, "notify_absence", "student", target_id=session_id)
+    await db.commit()
+    return {"ok": True, "notified_in_advance": in_advance}
+
+
+@router.delete("/sessions/{session_id}/notify-absence")
+async def cancel_absence_notice(
+    session_id: str,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.0: El estudiante retira su aviso de ausencia (al final sí puede ir)."""
+    if user.role != "student":
+        raise HTTPException(403)
+    notice = (await db.execute(
+        select(AbsenceNotice).where(
+            AbsenceNotice.session_id == session_id,
+            AbsenceNotice.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+    if not notice:
+        raise HTTPException(404, "No tienes aviso de ausencia para esta clase")
+    await db.delete(notice)
+    await db.commit()
+    return {"ok": True}

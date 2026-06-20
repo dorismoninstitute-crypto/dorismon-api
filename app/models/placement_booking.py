@@ -352,6 +352,23 @@ class SessionAttendance(Base):
     __table_args__ = (UniqueConstraint("session_id", "student_id"),)
 
 
+class AbsenceNotice(Base):
+    """V3.0: Aviso anticipado del estudiante de que faltará a una clase.
+
+    Lo crea el estudiante ANTES de la clase. El profe lo ve al pasar asistencia.
+    Distinto de SessionAttendance (que la marca el profe DESPUÉS).
+    """
+    __tablename__ = "absence_notices"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id", ondelete="CASCADE"))
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
+    reason: Mapped[str] = mapped_column(Text)
+    # Si avisó con tiempo (>= 2h antes) o a último momento
+    notified_in_advance: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (UniqueConstraint("session_id", "student_id", name="uq_absence_session_student"),)
+
+
 class Quiz(Base):
     __tablename__ = "quizzes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
