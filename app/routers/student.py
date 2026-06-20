@@ -183,6 +183,24 @@ async def student_dashboard(
             "max_score": float(a.max_score) if a else 100.0,
         }
 
+    # V3.0.1: Estado de la clase de prueba (para mostrar en el dashboard)
+    trial_info = None
+    from app.models import TrialClass
+    tc = (await db.execute(
+        select(TrialClass).where(TrialClass.student_id == user.user_id)
+    )).scalar_one_or_none()
+    if tc:
+        t_teacher_name = None
+        if tc.teacher_id:
+            t_user = await db.get(User, tc.teacher_id)
+            t_teacher_name = t_user.full_name if t_user else None
+        trial_info = {
+            "status": tc.status,  # requested / scheduled / completed / etc
+            "teacher_name": t_teacher_name,
+            "scheduled_at": tc.scheduled_at.isoformat() if tc.scheduled_at else None,
+            "modality": tc.modality.value if tc.modality else None,
+        }
+
     # V3.0: Clases canceladas recientemente que afectan al estudiante (últimos 7 días)
     # Para mostrar un aviso visible en el dashboard
     recent_cancelled = []
@@ -244,6 +262,7 @@ async def student_dashboard(
         "last_grade": last_grade_data,
         "recent_cancelled": recent_cancelled,  # V3.0
         "my_absence_session_ids": my_absence_ids,  # V3.0
+        "trial_info": trial_info,  # V3.0.1
     }
 
 

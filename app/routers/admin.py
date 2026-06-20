@@ -3771,6 +3771,49 @@ async def schedule_trial_class(
     tc.scheduled_at = scheduled_at
     tc.status = "scheduled"
 
+    # V3.0.1: Crear una ClassSession REAL para que aparezca en el calendario del estudiante
+    # Necesitamos course_id y level_id (no nulos). Usamos el nivel preferido del trial
+    # o el primero disponible como fallback.
+    from datetime import timedelta as _td
+    meeting_url = body.get("meeting_url")
+    # Resolver nivel
+    level_obj = None
+    if tc.preferred_level:
+        level_obj = (await db.execute(
+            select(Level).where(Level.code == tc.preferred_level).limit(1)
+        )).scalar_one_or_none()
+    if not level_obj:
+        level_obj = (await db.execute(select(Level).order_by(Level.id).limit(1))).scalar_one_or_none()
+    course_obj = None
+    if level_obj:
+        course_obj = await db.get(Course, level_obj.course_id) if hasattr(level_obj, "course_id") else None
+    if not course_obj:
+        course_obj = (await db.execute(select(Course).order_by(Course.id).limit(1))).scalar_one_or_none()
+
+    trial_session = None
+    if level_obj and course_obj:
+        ends_at = scheduled_at + _td(hours=1)
+        trial_session = ClassSession(
+            course_id=course_obj.id,
+            level_id=level_obj.id,
+            teacher_id=teacher_id,
+            title="🎁 Clase de prueba",
+            description="Clase de prueba gratis para conocer la metodología.",
+            modality=tc.modality,
+            starts_at_utc=scheduled_at,
+            ends_at_utc=ends_at,
+            meeting_url=meeting_url,
+            capacity=1,
+            student_id=tc.student_id,  # privada para este estudiante
+            counts_for_progress=False,  # no cuenta para CEFR
+            status=SessionStatus.scheduled,
+        )
+        db.add(trial_session)
+        await db.flush()
+        # Guardar referencia en el trial si tiene el campo
+        if hasattr(tc, "session_id"):
+            tc.session_id = trial_session.id
+
     # Notificar
     student_user = await db.get(User, tc.student_id)
     teacher_user = await db.get(User, teacher_id)
@@ -3789,9 +3832,24 @@ async def schedule_trial_class(
         link="/dashboard/teacher",
     ))
 
+    # V3.0.1: Enviar email al estudiante
+    if student_user and student_user.email:
+        try:
+            from app.services.email_service import send_trial_class_scheduled_email
+            await send_trial_class_scheduled_email(
+                to_email=student_user.email,
+                student_name=student_user.full_name,
+                teacher_name=teacher_user.full_name if teacher_user else "Tu profesor",
+                when_local=scheduled_at.strftime("%d/%m/%Y a las %H:%M UTC"),
+                modality=tc.modality.value if tc.modality else "online",
+                meeting_url=meeting_url,
+            )
+        except Exception:
+            pass  # no bloquear si el email falla
+
     await log_action(db, admin.user_id, "schedule_trial_class", "admin", target_id=trial_id)
     await db.commit()
-    return {"ok": True}
+    return {"ok": True, "session_created": trial_session is not None}
 
 
 # ============= V2.8 — SOFT DELETE DE USUARIOS =============
@@ -4145,3 +4203,107 @@ async def reactivate_user(
                      target_id=user_id, details=f"role={u.role.value}")
     await db.commit()
     return {"ok": True, "email": u.email, "role": u.role.value}
+
+
+# ============= V3.0.1 — AGENDA POR PROFESOR (admin) =============
+
+@router.get("/teachers-schedule")
+async def teachers_schedule(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.0.1: Resumen de la agenda de cada profesor.
+
+    Para que el admin sepa de un vistazo qué tiene cada maestro:
+    - Clase en curso ahora (si hay)
+    - Próxima clase
+    - Cuántas clases tiene hoy / esta semana
+    """
+    from datetime import timedelta as td
+    now = datetime.now(tz.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + td(days=1)
+    week_start = (now - td(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + td(days=7)
+
+    # Todos los profes activos
+    teachers = (await db.execute(
+        select(User).where(User.role == UserRole.teacher, User.is_active.is_(True))
+        .order_by(User.full_name)
+    )).scalars().all()
+
+    out = []
+    for t in teachers:
+        # Clases del profe (no canceladas)
+        base = select(ClassSession).where(
+            ClassSession.teacher_id == t.id,
+            ClassSession.status != SessionStatus.cancelled,
+        )
+        # En curso ahora
+        in_progress = (await db.execute(
+            base.where(
+                ClassSession.starts_at_utc <= now,
+                ClassSession.ends_at_utc > now,
+            ).limit(1)
+        )).scalar_one_or_none()
+        # Próxima clase futura
+        next_class = (await db.execute(
+            base.where(ClassSession.starts_at_utc > now)
+            .order_by(ClassSession.starts_at_utc.asc()).limit(1)
+        )).scalar_one_or_none()
+        # Conteo hoy
+        today_count = (await db.execute(
+            select(func.count()).select_from(ClassSession).where(
+                ClassSession.teacher_id == t.id,
+                ClassSession.status != SessionStatus.cancelled,
+                ClassSession.starts_at_utc >= today_start,
+                ClassSession.starts_at_utc < today_end,
+            )
+        )).scalar() or 0
+        # Conteo semana
+        week_count = (await db.execute(
+            select(func.count()).select_from(ClassSession).where(
+                ClassSession.teacher_id == t.id,
+                ClassSession.status != SessionStatus.cancelled,
+                ClassSession.starts_at_utc >= week_start,
+                ClassSession.starts_at_utc < week_end,
+            )
+        )).scalar() or 0
+
+        def _fmt(cs):
+            if not cs:
+                return None
+            course = None
+            level = None
+            return {
+                "id": cs.id, "title": cs.title,
+                "starts_at_utc": cs.starts_at_utc.isoformat() if cs.starts_at_utc else None,
+                "ends_at_utc": cs.ends_at_utc.isoformat() if cs.ends_at_utc else None,
+                "modality": cs.modality.value if cs.modality else None,
+                "meeting_url": cs.meeting_url,
+                "classroom_id": cs.classroom_id,
+            }
+
+        # Resolver aula/sede de la clase en curso o próxima para saber "dónde está"
+        location = None
+        ref = in_progress or next_class
+        if ref and ref.classroom_id:
+            cr = await db.get(Classroom, ref.classroom_id)
+            br = await db.get(Branch, cr.branch_id) if cr and cr.branch_id else None
+            if cr:
+                location = f"{br.name} — {cr.name}" if br else cr.name
+        elif ref and ref.modality and ref.modality.value == "online":
+            location = "Online"
+
+        out.append({
+            "teacher_id": t.id,
+            "teacher_name": t.full_name,
+            "email": t.email,
+            "in_progress": _fmt(in_progress),
+            "next_class": _fmt(next_class),
+            "today_count": today_count,
+            "week_count": week_count,
+            "current_location": location,
+        })
+
+    return {"teachers": out, "now_utc": now.isoformat()}

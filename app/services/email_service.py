@@ -451,3 +451,44 @@ async def send_class_reminder_24h_email(
         + "\n— Dorismon Language Institute"
     )
     return await send_email(to_email, subject, html, text)
+
+
+async def send_trial_class_scheduled_email(
+    to_email: str,
+    student_name: str,
+    teacher_name: str,
+    when_local: str,
+    modality: str,
+    meeting_url: str | None = None,
+) -> bool:
+    """V3.0.1: Email al estudiante cuando se le agenda su clase de prueba gratis."""
+    subject = "🎁 Tu clase de prueba está confirmada"
+    join_section = ""
+    if meeting_url:
+        join_section = f'<p style="margin-top:16px"><a href="{meeting_url}" style="background:#4361ee;color:white;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:600;display:inline-block">Entrar a la clase</a></p>'
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#16a34a;margin:0 0 16px">🎁 ¡Tu clase de prueba está confirmada!</h2>
+      <p>Hola {student_name},</p>
+      <p>Ya agendamos tu <strong>clase de prueba gratis</strong>. Estos son los detalles:</p>
+      <div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0;color:#15803d"><strong>👨‍🏫 Profesor:</strong> {teacher_name}</p>
+        <p style="margin:8px 0 0;color:#15803d"><strong>📅 Fecha:</strong> {when_local}</p>
+        <p style="margin:8px 0 0;color:#15803d"><strong>📍 Modalidad:</strong> {modality}</p>
+        {join_section}
+      </div>
+      <p style="color:#475569">Te recomendamos llegar puntual. Si no puedes asistir, avísanos con anticipación.</p>
+      <p style="color:#475569">¡Nos vemos pronto! Esta clase es tu oportunidad de conocer nuestra metodología.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute</p>
+    </div>
+    """
+    text = (
+        f"Hola {student_name},\n\n"
+        f"Tu clase de prueba gratis está confirmada:\n\n"
+        f"  • Profesor: {teacher_name}\n"
+        f"  • Fecha: {when_local}\n"
+        f"  • Modalidad: {modality}\n"
+        + (f"  • Link: {meeting_url}\n" if meeting_url else "")
+        + "\n¡Nos vemos pronto!\n\n— Dorismon Language Institute"
+    )
+    return await send_email(to_email, subject, html, text)
