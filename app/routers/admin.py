@@ -3977,7 +3977,9 @@ async def send_class_reminders(
             cr = await db.get(Classroom, s.classroom_id)
             br = await db.get(Branch, cr.branch_id) if cr and cr.branch_id else None
             if cr and br:
-                classroom_info = f"{br.name} — {cr.name}"
+                classroom_info = f"{br.name} — Aula {cr.name}"
+                if br.address:
+                    classroom_info += f" ({br.address})"
 
         # Buscar estudiantes inscritos
         student_ids: set[str] = set()

@@ -10,7 +10,7 @@ from app.core.db import get_db
 from app.models import (
     User, Student, Module, Lesson, Level, Course, Enrollment,
     SessionAttendance, ClassSession, ModuleProgress, Quiz, QuizAttempt,
-    AttendanceState,
+    AttendanceState, Branch, Classroom,
 )
 
 router = APIRouter(prefix="/progress", tags=["progress"])
@@ -90,6 +90,25 @@ async def my_course_progress(
     next_session_data = None
     if next_session:
         teacher = await db.get(User, next_session.teacher_id) if next_session.teacher_id else None
+        # V3.0.3: ubicación para presencial/híbrida
+        location = None
+        if next_session.branch_id or next_session.classroom_id:
+            branch = await db.get(Branch, next_session.branch_id) if next_session.branch_id else None
+            classroom = await db.get(Classroom, next_session.classroom_id) if next_session.classroom_id else None
+            if classroom and not branch and classroom.branch_id:
+                branch = await db.get(Branch, classroom.branch_id)
+            if branch or classroom:
+                maps_url = None
+                if branch and branch.address:
+                    from urllib.parse import quote
+                    maps_url = f"https://www.google.com/maps/search/?api=1&query={quote(branch.name + ' ' + branch.address)}"
+                location = {
+                    "branch_name": branch.name if branch else None,
+                    "address": branch.address if branch else None,
+                    "phone": branch.phone if branch else None,
+                    "classroom_name": classroom.name if classroom else None,
+                    "maps_url": maps_url,
+                }
         next_session_data = {
             "id": next_session.id, "title": next_session.title,
             "starts_at_utc": next_session.starts_at_utc.isoformat() if next_session.starts_at_utc else None,
@@ -100,6 +119,7 @@ async def my_course_progress(
             "teacher_notes": next_session.teacher_notes,
             "module_id": next_session.module_id,
             "is_private": next_session.student_id is not None,  # V1.7
+            "location": location,  # V3.0.3
         }
 
     # Última clase asistida con notas del profe

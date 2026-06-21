@@ -13,7 +13,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizQuestion, QuizAttempt,
     Material, Observation, Notification, Student,
     AttendanceState, QuestionType, MaterialType, NotificationType, SessionStatus,
-    Course, Level, UserRole,
+    Course, Level, UserRole, Branch, Classroom,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
@@ -298,6 +298,19 @@ async def get_attendance(
             } if notice else None),
         })
 
+    # V3.0.3: ubicación (aula/sede) para clases presenciales
+    teacher_location = None
+    if session.branch_id or session.classroom_id:
+        br = await db.get(Branch, session.branch_id) if session.branch_id else None
+        cr = await db.get(Classroom, session.classroom_id) if session.classroom_id else None
+        if cr and not br and cr.branch_id:
+            br = await db.get(Branch, cr.branch_id)
+        teacher_location = {
+            "branch_name": br.name if br else None,
+            "address": br.address if br else None,
+            "classroom_name": cr.name if cr else None,
+        }
+
     return {
         "session": {
             "id": session.id, "title": session.title,
@@ -308,6 +321,8 @@ async def get_attendance(
             "status": session.status.value if session.status else "scheduled",
             "cancellation_reason": session.cancellation_reason,
             "cancelled_at": session.cancelled_at.isoformat() if session.cancelled_at else None,
+            "meeting_url": session.meeting_url,
+            "location": teacher_location,  # V3.0.3
         },
         "students": out_students,
     }

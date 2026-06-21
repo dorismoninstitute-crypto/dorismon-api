@@ -13,10 +13,40 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
     ClassSession, SessionAttendance, Certificate, Notification, Material,
     AttendanceState, QuestionType, AbsenceNotice, NotificationType, SessionStatus, UserRole,
+    Branch, Classroom,
 )
 from datetime import timezone as _tz, datetime as _dt, timedelta as _td
 
 router = APIRouter(prefix="/student", tags=["student"])
+
+
+# V3.0.3: Helper — datos de ubicación de una clase presencial/híbrida
+async def _build_location(db: AsyncSession, session) -> dict | None:
+    """Devuelve sede, aula, dirección y teléfono para clases presenciales/híbridas.
+
+    Para online devuelve None (se usa meeting_url).
+    """
+    if not session.branch_id and not session.classroom_id:
+        return None
+    branch = await db.get(Branch, session.branch_id) if session.branch_id else None
+    classroom = await db.get(Classroom, session.classroom_id) if session.classroom_id else None
+    if not branch and not classroom:
+        return None
+    # Si el aula tiene sede y no vino branch, resolverla
+    if classroom and not branch and classroom.branch_id:
+        branch = await db.get(Branch, classroom.branch_id)
+    # V3.0.3: link de Google Maps para el botón "Cómo llegar"
+    maps_url = None
+    if branch and branch.address:
+        from urllib.parse import quote
+        maps_url = f"https://www.google.com/maps/search/?api=1&query={quote(branch.name + ' ' + branch.address)}"
+    return {
+        "branch_name": branch.name if branch else None,
+        "address": branch.address if branch else None,
+        "phone": branch.phone if branch else None,
+        "classroom_name": classroom.name if classroom else None,
+        "maps_url": maps_url,
+    }
 
 
 @router.get("/dashboard")
@@ -96,6 +126,8 @@ async def student_dashboard(
         teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
         # V2.9.1: mostrar profe solo si está activo
         t_name = teacher_user.full_name if (teacher_user and teacher_user.is_active) else "—"
+        # V3.0.3: ubicación para clases presenciales/híbridas
+        location = await _build_location(db, s)
         next_classes.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
@@ -103,6 +135,7 @@ async def student_dashboard(
             "meeting_url": s.meeting_url,
             "teacher_name": t_name,
             "is_private": s.student_id is not None,  # V1.7
+            "location": location,  # V3.0.3
         })
 
     # Tareas pendientes
@@ -588,6 +621,7 @@ async def my_calendar(
             "starts_at": s.starts_at_utc.isoformat(),
             "modality": s.modality.value,
             "meeting_url": s.meeting_url,
+            "location": await _build_location(db, s),  # V3.0.3
         })
     if enrollments:
         assignments = (await db.execute(
