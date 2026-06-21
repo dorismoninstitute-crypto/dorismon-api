@@ -165,6 +165,13 @@ async def init_db():
             """,
         ]
         migrations.extend(v291_migrations)
+
+        # V3.0.2 — campos de reagenda en trial_classes
+        v302_migrations = [
+            "ALTER TABLE trial_classes ADD COLUMN IF NOT EXISTS reschedule_count INTEGER DEFAULT 0",
+            "ALTER TABLE trial_classes ADD COLUMN IF NOT EXISTS reschedule_requested BOOLEAN DEFAULT FALSE",
+        ]
+        migrations.extend(v302_migrations)
         for m in migrations:
             try:
                 await conn.execute(sa_text(m))

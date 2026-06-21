@@ -608,6 +608,9 @@ class TrialClass(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     student_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
     converted_to_paid: Mapped[bool] = mapped_column(Boolean, default=False)  # Si después se inscribió a un plan
+    # V3.0.2: control de reagenda (el estudiante puede reagendar 1 vez si no asistió)
+    reschedule_count: Mapped[int] = mapped_column(Integer, default=0)
+    reschedule_requested: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

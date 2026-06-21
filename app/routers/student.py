@@ -12,7 +12,7 @@ from app.models import (
     Student, User, Enrollment, Course, Level, Module, Lesson, LessonProgress,
     Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
     ClassSession, SessionAttendance, Certificate, Notification, Material,
-    AttendanceState, QuestionType, AbsenceNotice, NotificationType, SessionStatus,
+    AttendanceState, QuestionType, AbsenceNotice, NotificationType, SessionStatus, UserRole,
 )
 from datetime import timezone as _tz, datetime as _dt, timedelta as _td
 
@@ -190,15 +190,44 @@ async def student_dashboard(
         select(TrialClass).where(TrialClass.student_id == user.user_id)
     )).scalar_one_or_none()
     if tc:
+        # V3.0.2: Detectar si la clase de prueba ya pasó y actualizar estado
+        # Si estaba "scheduled" y la sesión ya terminó → ver si asistió o no
+        trial_passed = False
+        attended = None
+        if tc.status == "scheduled" and tc.scheduled_at:
+            sched = tc.scheduled_at if tc.scheduled_at.tzinfo else tc.scheduled_at.replace(tzinfo=tz.utc)
+            # La clase dura ~1h; consideramos "pasó" 1h después del inicio
+            if now > sched + timedelta(hours=1):
+                trial_passed = True
+                # ¿Asistió? Revisar asistencia en la sesión vinculada
+                if tc.session_id:
+                    att = (await db.execute(
+                        select(SessionAttendance).where(
+                            SessionAttendance.session_id == tc.session_id,
+                            SessionAttendance.student_id == user.user_id,
+                        )
+                    )).scalar_one_or_none()
+                    if att and att.state and att.state.value in ("present", "late"):
+                        attended = True
+                    else:
+                        attended = False
+                # Actualizar estado del trial
+                tc.status = "completed" if attended else "no_show"
+                tc.completed_at = now
+                await db.commit()
+
         t_teacher_name = None
         if tc.teacher_id:
             t_user = await db.get(User, tc.teacher_id)
             t_teacher_name = t_user.full_name if t_user else None
         trial_info = {
-            "status": tc.status,  # requested / scheduled / completed / etc
+            "status": tc.status,  # requested / scheduled / completed / no_show / cancelled
             "teacher_name": t_teacher_name,
             "scheduled_at": tc.scheduled_at.isoformat() if tc.scheduled_at else None,
             "modality": tc.modality.value if tc.modality else None,
+            # V3.0.2: control de reagenda
+            "can_reschedule": (tc.status == "no_show" and tc.reschedule_count < 1 and not tc.reschedule_requested),
+            "reschedule_requested": tc.reschedule_requested,
         }
 
     # V3.0: Clases canceladas recientemente que afectan al estudiante (últimos 7 días)
@@ -534,22 +563,33 @@ async def my_calendar(
     )).scalars().all()
 
     events = []
+    # V3.0.2: clases del estudiante = grupales de su nivel + privadas suyas (incluye clase de prueba)
+    # Antes solo mostraba grupales si había inscripción; ahora también las privadas con student_id.
+    session_filter = ClassSession.student_id == user.user_id  # privadas (incluye trial)
     if enrollments:
-        sessions = (await db.execute(
-            select(ClassSession).where(
+        session_filter = or_(
+            ClassSession.student_id == user.user_id,
+            and_(
                 ClassSession.level_id.in_(enrollments),
-                ClassSession.ends_at_utc >= now,  # V1.6.4
-                ClassSession.starts_at_utc < horizon,
-                ClassSession.status == "scheduled",
-            ).order_by(ClassSession.starts_at_utc)
-        )).scalars().all()
-        for s in sessions:
-            events.append({
-                "type": "class", "id": s.id, "title": s.title,
-                "starts_at": s.starts_at_utc.isoformat(),
-                "modality": s.modality.value,
-                "meeting_url": s.meeting_url,
-            })
+                ClassSession.student_id.is_(None),
+            ),
+        )
+    sessions = (await db.execute(
+        select(ClassSession).where(
+            session_filter,
+            ClassSession.ends_at_utc >= now,
+            ClassSession.starts_at_utc < horizon,
+            ClassSession.status == "scheduled",
+        ).order_by(ClassSession.starts_at_utc)
+    )).scalars().all()
+    for s in sessions:
+        events.append({
+            "type": "class", "id": s.id, "title": s.title,
+            "starts_at": s.starts_at_utc.isoformat(),
+            "modality": s.modality.value,
+            "meeting_url": s.meeting_url,
+        })
+    if enrollments:
         assignments = (await db.execute(
             select(Assignment).where(
                 Assignment.level_id.in_(enrollments),
@@ -996,3 +1036,51 @@ async def cancel_absence_notice(
     await db.delete(notice)
     await db.commit()
     return {"ok": True}
+
+
+# ============= V3.0.2 — REAGENDAR CLASE DE PRUEBA =============
+
+@router.post("/trial-class/reschedule")
+async def request_trial_reschedule(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.0.2: El estudiante pide reagendar su clase de prueba (solo si no asistió, 1 vez).
+
+    Marca la solicitud para que el admin la vuelva a agendar. Notifica a los admins.
+    """
+    if user.role != "student":
+        raise HTTPException(403, "Solo estudiantes")
+
+    from app.models import TrialClass
+    tc = (await db.execute(
+        select(TrialClass).where(TrialClass.student_id == user.user_id)
+    )).scalar_one_or_none()
+    if not tc:
+        raise HTTPException(404, "No tienes clase de prueba")
+    if tc.status != "no_show":
+        raise HTTPException(400, "Solo puedes reagendar si no asististe a tu clase de prueba")
+    if tc.reschedule_count >= 1:
+        raise HTTPException(400, "Ya reagendaste una vez. Contacta al instituto para más opciones.")
+    if tc.reschedule_requested:
+        raise HTTPException(400, "Ya pediste reagendar. Te contactaremos pronto.")
+
+    tc.reschedule_requested = True
+
+    # Notificar admins
+    student_user = await db.get(User, user.user_id)
+    admins = (await db.execute(
+        select(User).where(User.role == UserRole.super_admin, User.is_active.is_(True))
+    )).scalars().all()
+    for adm in admins:
+        db.add(Notification(
+            user_id=adm.id,
+            type=NotificationType.info,
+            title="🔄 Solicitud de reagenda de clase de prueba",
+            body=f"{student_user.full_name if student_user else 'Un estudiante'} pidió reagendar su clase de prueba (no asistió a la anterior).",
+            link="/dashboard/admin/trial-classes",
+        ))
+
+    await log_action(db, user.user_id, "request_trial_reschedule", "student")
+    await db.commit()
+    return {"ok": True, "message": "Solicitud enviada. Te contactaremos para coordinar la nueva fecha."}
