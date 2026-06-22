@@ -14,7 +14,7 @@ logging.basicConfig(
     force=True,
 )
 
-from app.routers import auth, catalog, student, teacher, admin, certificates, placement, events, progress, calendar, messages, payments
+from app.routers import auth, catalog, student, teacher, admin, certificates, placement, events, progress, calendar, messages, payments, notifications
 from app.core.db import init_db
 
 
@@ -68,6 +68,7 @@ app.include_router(progress.router)
 app.include_router(calendar.router)
 app.include_router(messages.router)  # V2.0
 app.include_router(payments.router)  # V2.6
+app.include_router(notifications.router)  # V3.1 — centro de avisos universal
 
 
 @app.get("/health", tags=["system"])
