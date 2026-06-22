@@ -181,6 +181,55 @@ async def init_db():
     # V2.9: Llenar feature_keys en PlanFeature de planes ya existentes
     # Esto se ejecuta en cada arranque pero es idempotente (no duplica)
     await _backfill_plan_feature_keys()
+    # V3.0.5: limpiar clases de prueba duplicadas (por doble click previo)
+    await _cleanup_duplicate_trial_sessions()
+
+
+async def _cleanup_duplicate_trial_sessions():
+    """V3.0.5: Elimina ClassSessions de prueba duplicadas creadas por doble click.
+
+    Una clase de prueba es duplicada si hay 2+ sesiones para el mismo estudiante,
+    misma hora, con counts_for_progress=False. Deja solo una (la vinculada al
+    TrialClass si existe, o la más antigua).
+    """
+    from sqlalchemy import select, func as _func
+    from app.models.placement_booking import ClassSession, TrialClass
+    try:
+        async with engine.begin() as conn:
+            # Buscar grupos de sesiones de prueba duplicadas
+            rows = (await conn.execute(
+                select(
+                    ClassSession.student_id,
+                    ClassSession.starts_at_utc,
+                    _func.count(ClassSession.id).label("cnt"),
+                ).where(
+                    ClassSession.counts_for_progress.is_(False),
+                    ClassSession.student_id.isnot(None),
+                ).group_by(ClassSession.student_id, ClassSession.starts_at_utc)
+                .having(_func.count(ClassSession.id) > 1)
+            )).all()
+
+            for student_id, starts_at, cnt in rows:
+                # Sesiones de este grupo
+                sessions = (await conn.execute(
+                    select(ClassSession.id).where(
+                        ClassSession.student_id == student_id,
+                        ClassSession.starts_at_utc == starts_at,
+                        ClassSession.counts_for_progress.is_(False),
+                    ).order_by(ClassSession.id)
+                )).scalars().all()
+                # ¿Cuál está vinculada a un TrialClass? esa se conserva
+                linked = (await conn.execute(
+                    select(TrialClass.session_id).where(TrialClass.session_id.in_(sessions))
+                )).scalars().all()
+                keep = linked[0] if linked else sessions[0]
+                to_delete = [s for s in sessions if s != keep]
+                for sid in to_delete:
+                    await conn.execute(
+                        ClassSession.__table__.delete().where(ClassSession.id == sid)
+                    )
+    except Exception:
+        pass  # no bloquear el arranque si algo falla
 
 
 async def _backfill_plan_feature_keys():

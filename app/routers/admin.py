@@ -3812,25 +3812,56 @@ async def schedule_trial_class(
         course_obj = (await db.execute(select(Course).order_by(Course.id).limit(1))).scalar_one_or_none()
 
     trial_session = None
-    if level_obj and course_obj:
-        ends_at = scheduled_at + _td(hours=1)
-        trial_session = ClassSession(
-            course_id=course_obj.id,
-            level_id=level_obj.id,
-            teacher_id=teacher_id,
-            title="🎁 Clase de prueba",
-            description="Clase de prueba gratis para conocer la metodología.",
-            modality=tc.modality,
-            starts_at_utc=scheduled_at,
-            ends_at_utc=ends_at,
-            meeting_url=meeting_url,
-            capacity=1,
-            student_id=tc.student_id,  # privada para este estudiante
-            counts_for_progress=False,  # no cuenta para CEFR
-            status=SessionStatus.scheduled,
-        )
-        db.add(trial_session)
+    # V3.0.5: si ya existe una sesión vinculada (doble click / reagenda), reutilizarla
+    # en vez de crear otra. Esto evita clases de prueba duplicadas en el calendario.
+    existing_session = None
+    if tc.session_id:
+        existing_session = await db.get(ClassSession, tc.session_id)
+
+    if existing_session:
+        # Actualizar la sesión existente con los nuevos datos
+        existing_session.teacher_id = teacher_id
+        existing_session.starts_at_utc = scheduled_at
+        existing_session.ends_at_utc = scheduled_at + _td(hours=1)
+        existing_session.meeting_url = meeting_url
+        existing_session.modality = tc.modality
+        existing_session.status = SessionStatus.scheduled
+        trial_session = existing_session
         await db.flush()
+    elif level_obj and course_obj:
+        # Antes de crear, una verificación extra: ¿hay ya una sesión de prueba
+        # para este estudiante a esta misma hora? (protege contra doble click sin session_id)
+        dup = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.student_id == tc.student_id,
+                ClassSession.starts_at_utc == scheduled_at,
+                ClassSession.counts_for_progress.is_(False),
+                ClassSession.status == SessionStatus.scheduled,
+            )
+        )).scalar_one_or_none()
+        if dup:
+            trial_session = dup
+            dup.teacher_id = teacher_id
+            dup.meeting_url = meeting_url
+        else:
+            ends_at = scheduled_at + _td(hours=1)
+            trial_session = ClassSession(
+                course_id=course_obj.id,
+                level_id=level_obj.id,
+                teacher_id=teacher_id,
+                title="🎁 Clase de prueba",
+                description="Clase de prueba gratis para conocer la metodología.",
+                modality=tc.modality,
+                starts_at_utc=scheduled_at,
+                ends_at_utc=ends_at,
+                meeting_url=meeting_url,
+                capacity=1,
+                student_id=tc.student_id,  # privada para este estudiante
+                counts_for_progress=False,  # no cuenta para CEFR
+                status=SessionStatus.scheduled,
+            )
+            db.add(trial_session)
+            await db.flush()
         # Guardar referencia en el trial si tiene el campo
         if hasattr(tc, "session_id"):
             tc.session_id = trial_session.id
