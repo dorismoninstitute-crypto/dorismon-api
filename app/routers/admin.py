@@ -3712,13 +3712,26 @@ async def list_trial_classes(
     status: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """V2.6: Lista solicitudes de clases de prueba."""
+    """V2.6: Lista solicitudes de clases de prueba.
+    V3.0.4: incluye las que pidieron reagenda (no_show + reschedule_requested).
+    """
+    from sqlalchemy import or_ as _or
     stmt = select(TrialClass, User).join(User, TrialClass.student_id == User.id)
-    if status:
+    if status and status != "all":
         stmt = stmt.where(TrialClass.status == status)
+    elif status == "all":
+        pass  # V3.0.4: traer todas (historial completo)
     else:
-        # Default: solo las que requieren acción del admin
-        stmt = stmt.where(TrialClass.status.in_(["requested", "scheduled"]))
+        # Default: las que requieren acción del admin:
+        # - requested (nueva solicitud)
+        # - scheduled (ya agendada, futura)
+        # - no_show con reagenda pedida (el estudiante quiere otra fecha)
+        stmt = stmt.where(
+            _or(
+                TrialClass.status.in_(["requested", "scheduled"]),
+                (TrialClass.status == "no_show") & (TrialClass.reschedule_requested.is_(True)),
+            )
+        )
     stmt = stmt.order_by(TrialClass.created_at.desc())
     rows = (await db.execute(stmt)).all()
 
@@ -3737,6 +3750,9 @@ async def list_trial_classes(
             "teacher_id": tc.teacher_id,
             "scheduled_at": tc.scheduled_at.isoformat() if tc.scheduled_at else None,
             "created_at": tc.created_at.isoformat() if tc.created_at else None,
+            # V3.0.4: marcar si es una solicitud de reagenda
+            "reschedule_requested": tc.reschedule_requested,
+            "reschedule_count": tc.reschedule_count,
         }
         for tc, u in rows
     ]
@@ -3769,6 +3785,11 @@ async def schedule_trial_class(
 
     tc.teacher_id = teacher_id
     tc.scheduled_at = scheduled_at
+    # V3.0.4: si venía de una reagenda (no_show), contar la reagenda y limpiar el flag
+    if tc.status == "no_show" and tc.reschedule_requested:
+        tc.reschedule_count = (tc.reschedule_count or 0) + 1
+    tc.reschedule_requested = False
+    tc.completed_at = None  # limpiar por si estaba marcada
     tc.status = "scheduled"
 
     # V3.0.1: Crear una ClassSession REAL para que aparezca en el calendario del estudiante

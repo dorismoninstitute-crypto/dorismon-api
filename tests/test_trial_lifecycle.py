@@ -75,3 +75,36 @@ async def run():
 if __name__ == "__main__":
     ok = asyncio.run(run())
     sys.exit(0 if ok else 1)
+
+
+async def test_reschedule_visible_to_admin(base=None):
+    """V3.0.4: la solicitud de reagenda DEBE aparecerle al admin."""
+    import httpx
+    from datetime import datetime, timezone, timedelta
+    b = base or BASE
+    async with httpx.AsyncClient(base_url=b, timeout=30) as c:
+        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"DorismonAdmin2026!"})).json()["access_token"]
+        AH = {"Authorization": f"Bearer {admin}"}
+        stu = (await c.post("/auth/login", json={"email":"carlos.estudiante@dorismon.do","password":"Estudiante2026!"})).json()
+        SH = {"Authorization": f"Bearer {stu['access_token']}"}
+        ana = (await c.post("/auth/login", json={"email":"ana@dorismon.do","password":"Profe2026!"})).json()["access_token"]
+        ana_id = (await c.get("/auth/me", headers={"Authorization":f"Bearer {ana}"})).json()["id"]
+
+        await c.post("/payments/trial-class/request", headers=SH, json={"modality":"online","preferred_level":"A2"})
+        trials = (await c.get("/admin/trial-classes", headers=AH)).json()
+        tlist = trials if isinstance(trials, list) else trials.get("items", [])
+        trial_id = tlist[0]["id"]
+        past = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        await c.post(f"/admin/trial-classes/{trial_id}/schedule", headers=AH,
+                     json={"teacher_id": ana_id, "scheduled_at": past})
+        await c.get("/student/dashboard", headers=SH)  # dispara deteccion no_show
+        await c.post("/student/trial-class/reschedule", headers=SH)
+        trials2 = (await c.get("/admin/trial-classes", headers=AH)).json()
+        tlist2 = trials2 if isinstance(trials2, list) else trials2.get("items", [])
+        reagenda = [t for t in tlist2 if t.get("reschedule_requested")]
+        ok = len(reagenda) > 0
+        print(f"  {'✓' if ok else '✗'} admin ve la solicitud de reagenda")
+        return ok
+
+if __name__ == "__main__" and "--reschedule" in sys.argv:
+    asyncio.run(test_reschedule_visible_to_admin())
