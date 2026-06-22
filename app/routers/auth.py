@@ -126,11 +126,36 @@ async def email_service_status():
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    # V2.9.3: Rate limiting — proteger contra ataques de adivinar contraseñas
+    from app.services.rate_limiter import check_rate_limit, register_failure, register_success
+    # Clave: IP + email (así un atacante no bloquea a otros usuarios fácilmente)
+    client_ip = request.client.host if request.client else "unknown"
+    rl_key = f"{client_ip}:{body.email.lower()}"
+
+    allowed, retry_after = check_rate_limit(rl_key)
+    if not allowed:
+        mins = max(1, retry_after // 60)
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            f"Demasiados intentos fallidos. Por seguridad, espera {mins} minuto(s) antes de volver a intentar.",
+        )
+
     user = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
     if not user or not verify_password(body.password, user.password_hash):
+        # Registrar el intento fallido
+        locked, lock_secs = register_failure(rl_key)
+        if locked:
+            mins = max(1, lock_secs // 60)
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                f"Demasiados intentos fallidos. Por seguridad, tu acceso quedó bloqueado por {mins} minuto(s).",
+            )
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Email o contraseña incorrectos")
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cuenta desactivada")
+
+    # Login exitoso: limpiar el contador de intentos
+    register_success(rl_key)
     user.last_login_at = datetime.now(tz.utc)
     await log_action(db, user.id, "login", "auth")
     await db.commit()
