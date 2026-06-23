@@ -264,6 +264,9 @@ async def my_trial_status(
         "scheduled_at": tc.scheduled_at.isoformat() if tc.scheduled_at else None,
         "teacher_name": teacher.full_name if teacher else None,
         "completed_at": tc.completed_at.isoformat() if tc.completed_at else None,
+        # V3.4: campos de reagenda (para la página de clase de prueba)
+        "can_reschedule": (tc.status == "no_show" and (tc.reschedule_count or 0) < 1 and not tc.reschedule_requested),
+        "reschedule_requested": bool(tc.reschedule_requested),
     }
 
 
