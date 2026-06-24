@@ -345,4 +345,18 @@ async def request_trial_class(
 
     await log_action(db, user.user_id, "request_trial_class", "payments", target_id=tc.id)
     await db.commit()
+
+    # V3.6: Avisar al dueño por email de la solicitud de clase de prueba
+    try:
+        from app.services.email_service import send_admin_trial_request_email, is_email_configured
+        if is_email_configured() and student_user:
+            await send_admin_trial_request_email(
+                student_name=student_user.full_name,
+                student_email=student_user.email,
+                modality=modality.value,
+                preferred_level=body.get("preferred_level"),
+            )
+    except Exception:
+        pass
+
     return {"id": tc.id, "status": "requested"}

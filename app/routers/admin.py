@@ -3899,6 +3899,21 @@ async def schedule_trial_class(
         except Exception:
             pass  # no bloquear si el email falla
 
+    # V3.6: Avisar al MAESTRO por email que le asignaron esta clase de prueba
+    if teacher_user and teacher_user.email:
+        try:
+            from app.services.email_service import send_teacher_class_assigned_email
+            await send_teacher_class_assigned_email(
+                teacher_email=teacher_user.email,
+                teacher_name=teacher_user.full_name,
+                class_title="🎁 Clase de prueba",
+                when_local=scheduled_at.strftime("%d/%m/%Y a las %H:%M UTC"),
+                modality=tc.modality.value if tc.modality else "online",
+                is_trial=True,
+            )
+        except Exception:
+            pass
+
     await log_action(db, admin.user_id, "schedule_trial_class", "admin", target_id=trial_id)
     await db.commit()
     return {"ok": True, "session_created": trial_session is not None}

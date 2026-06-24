@@ -286,9 +286,21 @@ async def submit_placement(
 
     await db.commit()
 
+    # V3.6: Avisar al dueño por email que un estudiante completó el test de nivel
+    try:
+        from app.services.email_service import send_admin_test_completed_email, is_email_configured
+        if is_email_configured():
+            student_user = await db.get(User, user.user_id)
+            if student_user:
+                await send_admin_test_completed_email(
+                    student_name=student_user.full_name,
+                    student_email=student_user.email,
+                    level=suggested_code,
+                )
+    except Exception:
+        pass
+
     return {
-        "test_id": test.id,
-        "correct_count": correct_count,
         "total_questions": total,
         "score_pct": round(score_pct, 2),
         "suggested_level_code": suggested_code,

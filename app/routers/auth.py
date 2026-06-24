@@ -103,6 +103,15 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
 
     await log_action(db, user.id, "register", "auth", target_id=user.id)
     await db.commit()
+
+    # V3.6: Avisar al dueño por email del nuevo registro (en segundo plano, no bloquea)
+    if is_email_configured():
+        try:
+            from app.services.email_service import send_admin_new_registration_email
+            await send_admin_new_registration_email(body.full_name, body.email, "estudiante")
+        except Exception:
+            pass
+
     return TokenResponse(
         access_token=create_access_token(user.id, user.role.value),
         refresh_token=create_refresh_token(user.id),

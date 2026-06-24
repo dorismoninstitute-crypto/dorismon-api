@@ -492,3 +492,95 @@ async def send_trial_class_scheduled_email(
         + "\n¡Nos vemos pronto!\n\n— Dorismon Language Institute"
     )
     return await send_email(to_email, subject, html, text)
+
+
+# ============= V3.6 — AVISOS AL DUEÑO Y AL MAESTRO =============
+
+import os as _os
+
+def _admin_notify_email() -> str:
+    """Correo donde el dueño recibe avisos. Configurable por env."""
+    return _os.getenv("ADMIN_NOTIFY_EMAIL", "dorismoninstitute@gmail.com")
+
+
+async def send_admin_new_registration_email(student_name: str, student_email: str, role: str = "estudiante") -> bool:
+    """V3.6: Avisa al dueño que se registró un nuevo usuario."""
+    subject = f"🆕 Nuevo registro: {student_name}"
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#2563eb;margin:0 0 16px">🆕 Nuevo usuario registrado</h2>
+      <div style="background:#eff6ff;border-left:4px solid #2563eb;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0"><strong>Nombre:</strong> {student_name}</p>
+        <p style="margin:8px 0 0"><strong>Correo:</strong> {student_email}</p>
+        <p style="margin:8px 0 0"><strong>Tipo:</strong> {role}</p>
+      </div>
+      <p style="color:#475569">Entra al panel para ver más detalles.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute (aviso automático)</p>
+    </div>
+    """
+    text = f"Nuevo usuario registrado:\n\n  Nombre: {student_name}\n  Correo: {student_email}\n  Tipo: {role}\n\n— Dorismon"
+    return await send_email(_admin_notify_email(), subject, html, text)
+
+
+async def send_admin_trial_request_email(student_name: str, student_email: str, modality: str, preferred_level: str | None = None) -> bool:
+    """V3.6: Avisa al dueño que alguien pidió clase de prueba."""
+    subject = f"🎁 Solicitud de clase de prueba: {student_name}"
+    nivel = f"<p style='margin:8px 0 0'><strong>Nivel preferido:</strong> {preferred_level}</p>" if preferred_level else ""
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#16a34a;margin:0 0 16px">🎁 Nueva solicitud de clase de prueba</h2>
+      <p>Un estudiante quiere su clase de prueba gratis. Asígnale profesor y hora desde el panel.</p>
+      <div style="background:#f0fdf4;border-left:4px solid #16a34a;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0"><strong>Estudiante:</strong> {student_name}</p>
+        <p style="margin:8px 0 0"><strong>Correo:</strong> {student_email}</p>
+        <p style="margin:8px 0 0"><strong>Modalidad:</strong> {modality}</p>
+        {nivel}
+      </div>
+      <p style="color:#475569">⏱️ Mientras más rápido lo agendes, más posibilidades de que se inscriba.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute (aviso automático)</p>
+    </div>
+    """
+    text = f"Nueva solicitud de clase de prueba:\n\n  Estudiante: {student_name}\n  Correo: {student_email}\n  Modalidad: {modality}\n\n— Dorismon"
+    return await send_email(_admin_notify_email(), subject, html, text)
+
+
+async def send_admin_test_completed_email(student_name: str, student_email: str, level: str | None = None) -> bool:
+    """V3.6: Avisa al dueño que un estudiante completó el test de nivel."""
+    subject = f"📝 Test de nivel completado: {student_name}"
+    nivel = f"<p style='margin:8px 0 0'><strong>Nivel obtenido:</strong> {level}</p>" if level else ""
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#7c3aed;margin:0 0 16px">📝 Test de nivel completado</h2>
+      <div style="background:#faf5ff;border-left:4px solid #7c3aed;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0"><strong>Estudiante:</strong> {student_name}</p>
+        <p style="margin:8px 0 0"><strong>Correo:</strong> {student_email}</p>
+        {nivel}
+      </div>
+      <p style="color:#475569">Un coordinador debería contactarlo para confirmar su nivel y asignarlo a un grupo.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute (aviso automático)</p>
+    </div>
+    """
+    text = f"Test de nivel completado:\n\n  Estudiante: {student_name}\n  Correo: {student_email}\n  Nivel: {level or '—'}\n\n— Dorismon"
+    return await send_email(_admin_notify_email(), subject, html, text)
+
+
+async def send_teacher_class_assigned_email(teacher_email: str, teacher_name: str, class_title: str, when_local: str, modality: str, is_trial: bool = False) -> bool:
+    """V3.6: Avisa al MAESTRO que le asignaron una clase."""
+    tipo = "clase de prueba" if is_trial else "clase"
+    subject = f"📅 Te asignaron una {tipo}: {class_title}"
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#2563eb;margin:0 0 16px">📅 Nueva {tipo} asignada</h2>
+      <p>Hola {teacher_name},</p>
+      <p>Se te asignó una nueva {tipo}. Estos son los detalles:</p>
+      <div style="background:#eff6ff;border-left:4px solid #2563eb;padding:16px;margin:16px 0;border-radius:4px">
+        <p style="margin:0"><strong>Clase:</strong> {class_title}</p>
+        <p style="margin:8px 0 0"><strong>📅 Fecha:</strong> {when_local}</p>
+        <p style="margin:8px 0 0"><strong>📍 Modalidad:</strong> {modality}</p>
+      </div>
+      <p style="color:#475569">Revisa tu agenda en el panel para ver todos los detalles.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute</p>
+    </div>
+    """
+    text = f"Hola {teacher_name},\n\nSe te asignó una nueva {tipo}:\n\n  Clase: {class_title}\n  Fecha: {when_local}\n  Modalidad: {modality}\n\n— Dorismon"
+    return await send_email(teacher_email, subject, html, text)
