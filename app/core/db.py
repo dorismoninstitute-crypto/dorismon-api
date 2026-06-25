@@ -170,6 +170,10 @@ async def init_db():
         v302_migrations = [
             "ALTER TABLE trial_classes ADD COLUMN IF NOT EXISTS reschedule_count INTEGER DEFAULT 0",
             "ALTER TABLE trial_classes ADD COLUMN IF NOT EXISTS reschedule_requested BOOLEAN DEFAULT FALSE",
+            # V3.9: Archivado de perfil de estudiante (al convertir a profesor)
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP WITH TIME ZONE",
+            "ALTER TABLE students ADD COLUMN IF NOT EXISTS archived_reason VARCHAR",
         ]
         migrations.extend(v302_migrations)
         for m in migrations:

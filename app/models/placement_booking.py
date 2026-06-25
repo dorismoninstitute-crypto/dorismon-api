@@ -117,6 +117,11 @@ class Student(Base):
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False)
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pause_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    # V3.9: Perfil de estudiante archivado (ej: convertido a profesor). No se borra,
+    # solo se marca inactivo para que no aparezca en listas/reportes de estudiantes.
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     streak_days: Mapped[int] = mapped_column(Integer, default=0)
     last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

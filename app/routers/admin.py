@@ -170,6 +170,11 @@ async def list_users(
                 if st.current_level_id:
                     lvl = await db.get(Level, st.current_level_id)
                     item["level_code"] = lvl.code if lvl else None
+            # V3.9.2: ¿tiene inscripciones? (para saber si se puede convertir a profesor)
+            enr = (await db.execute(
+                select(func.count()).select_from(Enrollment).where(Enrollment.student_id == u.id)
+            )).scalar() or 0
+            item["has_enrollments"] = enr > 0
         out_items.append(item)
     return {
         "items": out_items,
@@ -231,6 +236,104 @@ async def create_user(
                      details=f"role={role.value}, email={body['email']}")
     await db.commit()
     return {"id": user.id}
+
+
+@router.post("/users/{user_id}/change-role", status_code=200)
+async def change_user_role(
+    user_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.8: Cambiar el rol de un usuario existente (ej: un estudiante que en
+    realidad es profesor y se registró por el formulario público).
+
+    Reutiliza la MISMA cuenta y correo — no crea una nueva. Conserva los datos
+    del perfil anterior (no borra nada), solo crea el perfil del nuevo rol si
+    no existe y actualiza el rol de la cuenta.
+    """
+    new_role_str = body.get("new_role")
+    if not new_role_str:
+        raise HTTPException(400, "new_role requerido")
+    try:
+        new_role = UserRole(new_role_str)
+    except ValueError:
+        raise HTTPException(400, "Rol inválido")
+
+    # No permitir cambiar a/desde admin por esta vía (seguridad)
+    if new_role == UserRole.super_admin:
+        raise HTTPException(403, "No se puede asignar rol de administrador por esta vía")
+
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "Usuario no encontrado")
+    if user.role == UserRole.super_admin:
+        raise HTTPException(403, "No se puede cambiar el rol de un administrador")
+    if user.role == new_role:
+        raise HTTPException(400, f"El usuario ya tiene el rol {new_role.value}")
+
+    # V3.9.2: Bloquear conversión estudiante → profesor si ya tiene historial de
+    # clases. Solo se permite convertir cuentas "limpias" (ej: un maestro que se
+    # registró por el formulario público y aún no tomó clases). Esto evita dejar
+    # inscripciones "colgando" de una persona que ya no es estudiante.
+    if new_role == UserRole.teacher and user.role == UserRole.student:
+        enroll_count = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.student_id == user.id
+            )
+        )).scalar() or 0
+        if enroll_count > 0:
+            raise HTTPException(
+                409,
+                "No se puede convertir en profesor: este estudiante ya tiene clases o "
+                "inscripciones registradas. Solo se pueden convertir cuentas sin historial "
+                "de clases (por ejemplo, un maestro que se registró por error y aún no tomó clases)."
+            )
+
+    old_role = user.role.value
+    user.role = new_role
+
+    # Crear el perfil del nuevo rol si no existe (conservamos el perfil anterior)
+    if new_role == UserRole.teacher:
+        existing_teacher = await db.get(Teacher, user.id)
+        if not existing_teacher:
+            db.add(Teacher(
+                user_id=user.id,
+                specialties=body.get("specialties", ""),
+                modalities=body.get("modalities", "online"),
+                bio=body.get("bio"),
+                levels_taught=body.get("levels_taught"),
+                rate_group=body.get("rate_group", 500.0),
+                rate_private=body.get("rate_private", 1000.0),
+                rate_event=body.get("rate_event", 750.0),
+            ))
+        # V3.9: Archivar el perfil de estudiante (no se borra, solo se marca inactivo
+        # para que no aparezca en listas/reportes de estudiantes). Reversible.
+        student_profile = await db.get(Student, user.id)
+        if student_profile and not student_profile.archived:
+            student_profile.archived = True
+            student_profile.archived_at = datetime.now(tz.utc)
+            student_profile.archived_reason = "Convertido a profesor"
+    elif new_role == UserRole.student:
+        existing_student = await db.get(Student, user.id)
+        if not existing_student:
+            db.add(Student(user_id=user.id))
+        else:
+            # V3.9: Si vuelve a ser estudiante, des-archivar su perfil
+            existing_student.archived = False
+            existing_student.archived_at = None
+            existing_student.archived_reason = None
+
+    await log_action(db, admin.user_id, "change_role", "admin", target_id=user.id,
+                     details=f"{old_role} → {new_role.value}, email={user.email}")
+    await db.commit()
+    return {
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name,
+        "old_role": old_role,
+        "new_role": new_role.value,
+    }
 
 
 @router.patch("/users/{user_id}")
