@@ -3451,6 +3451,9 @@ async def admin_get_student_profile(
         "special_notes": s.special_notes if s else None,
         "enrolled_at": s.enrolled_at.isoformat() if s and s.enrolled_at else None,
         "is_paused": s.is_paused if s else False,
+        # V3.9.9: nivel actual del estudiante (para poder cambiarlo)
+        "current_level_id": s.current_level_id if s else None,
+        "current_level_code": (await db.get(Level, s.current_level_id)).code if s and s.current_level_id else None,
     }
 
 
@@ -3493,6 +3496,108 @@ async def admin_update_student_profile(
     return {"ok": True}
 
 
+@router.patch("/students/{student_id}/level")
+async def admin_change_student_level(
+    student_id: str, body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.9: Cambiar el nivel actual de un estudiante (ej: empezar de cero,
+    subir/bajar de nivel por decisión pedagógica). No toca inscripciones ni pagos.
+
+    Body:
+    - level_id: int (nuevo nivel)
+    - reason: str opcional (motivo, queda en el log)
+    """
+    s = await db.get(Student, student_id)
+    if not s:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    level_id = body.get("level_id")
+    if not level_id:
+        raise HTTPException(400, "level_id requerido")
+
+    level = await db.get(Level, level_id)
+    if not level:
+        raise HTTPException(404, "Nivel no encontrado")
+
+    old_level_id = s.current_level_id
+    old_level = await db.get(Level, old_level_id) if old_level_id else None
+    old_label = old_level.code if old_level else "sin nivel"
+
+    s.current_level_id = level_id
+
+    reason = body.get("reason", "")
+    # Notificar al estudiante del cambio
+    db.add(Notification(
+        user_id=student_id,
+        type=NotificationType.info,
+        title="📚 Tu nivel fue actualizado",
+        body=f"Tu nivel ahora es {level.code} ({level.name})." + (f" Motivo: {reason}" if reason else ""),
+    ))
+
+    await log_action(db, admin.user_id, "change_student_level", "students",
+                     target_id=student_id, details=f"{old_label} → {level.code}" + (f" ({reason})" if reason else ""))
+    await db.commit()
+    return {
+        "ok": True,
+        "old_level": old_label,
+        "new_level": level.code,
+        "new_level_name": level.name,
+    }
+
+
+
+
+@router.get("/students-by-teacher")
+async def admin_students_by_teacher(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.9: Lista cada profesor con SUS estudiantes (los que tiene asignados
+    vía inscripciones activas). Para que el admin vea de un vistazo quién tiene
+    a quién.
+    """
+    # Todos los profesores activos
+    teachers = (await db.execute(
+        select(User).where(User.role == UserRole.teacher, User.is_active.is_(True))
+    )).scalars().all()
+
+    result = []
+    for t in teachers:
+        # Estudiantes con inscripción activa con este profesor
+        enroll_rows = (await db.execute(
+            select(Enrollment.student_id, Level.code)
+            .outerjoin(Level, Enrollment.level_id == Level.id)
+            .where(Enrollment.teacher_id == t.id, Enrollment.is_active.is_(True))
+        )).all()
+
+        students = []
+        seen = set()
+        for student_id, level_code in enroll_rows:
+            if student_id in seen:
+                continue
+            seen.add(student_id)
+            stu_user = await db.get(User, student_id)
+            if stu_user:
+                students.append({
+                    "id": stu_user.id,
+                    "full_name": stu_user.full_name,
+                    "email": stu_user.email,
+                    "level_code": level_code,
+                })
+
+        result.append({
+            "teacher_id": t.id,
+            "teacher_name": t.full_name,
+            "teacher_email": t.email,
+            "student_count": len(students),
+            "students": students,
+        })
+
+    # Ordenar: los que tienen más estudiantes primero
+    result.sort(key=lambda x: x["student_count"], reverse=True)
+    return {"teachers": result}
 
 
 @router.get("/finance/transactions")
