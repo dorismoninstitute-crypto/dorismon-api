@@ -2842,6 +2842,116 @@ async def delete_class_series(
     return {"ok": True, "deleted_classes": count}
 
 
+@router.patch("/class-series/{series_id}/reschedule")
+async def reschedule_class_series(
+    series_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.8: Reprograma una serie a FUTURO. Cambia hora, días y/o profesor y
+    regenera SOLO las clases futuras (las pasadas quedan intactas).
+
+    Seguro para producción: nunca toca clases que ya ocurrieron ni su historial.
+
+    Body (todos opcionales — solo se cambia lo que se envía):
+    - days_of_week: "mon,wed,fri"
+    - start_time_hhmm: "17:00"
+    - duration_min: 90
+    - teacher_id: "uuid"
+    - modality: "online" | "presencial" | "hibrida"
+    - meeting_url: "https://..."
+    """
+    from datetime import datetime as dt, timedelta as td
+
+    series = await db.get(ClassSeries, series_id)
+    if not series:
+        raise HTTPException(404, "Serie no encontrada")
+
+    now = datetime.now(tz.utc)
+
+    # Aplicar cambios a la serie (solo los campos enviados)
+    if body.get("days_of_week"):
+        series.days_of_week = body["days_of_week"]
+    if body.get("start_time_hhmm"):
+        series.start_time_hhmm = body["start_time_hhmm"]
+    if body.get("duration_min"):
+        series.duration_min = int(body["duration_min"])
+    if body.get("teacher_id"):
+        # Validar que el profesor exista
+        t = await db.get(Teacher, body["teacher_id"])
+        if not t:
+            raise HTTPException(404, "Profesor no encontrado")
+        series.teacher_id = body["teacher_id"]
+    if body.get("modality"):
+        series.modality = Modality(body["modality"])
+    if "meeting_url" in body:
+        series.meeting_url = body["meeting_url"]
+
+    # Contar clases futuras y pasadas
+    future_sessions = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.series_id == series_id,
+            ClassSession.starts_at_utc > now,
+        )
+    )).scalars().all()
+    past_count = (await db.execute(
+        select(func.count()).select_from(ClassSession).where(
+            ClassSession.series_id == series_id,
+            ClassSession.starts_at_utc <= now,
+        )
+    )).scalar() or 0
+
+    # ¿Cuántas clases futuras hay que regenerar? (misma cantidad que se borra)
+    num_to_regen = len(future_sessions)
+    if num_to_regen == 0:
+        raise HTTPException(400, "Esta serie no tiene clases futuras para reprogramar.")
+
+    # Borrar las clases futuras
+    for sess in future_sessions:
+        await db.delete(sess)
+    await db.flush()
+
+    # Regenerar a partir de mañana, con la misma cantidad de clases futuras
+    regen_start = (now + td(days=1)).date()
+    new_dates = _generate_session_dates(
+        regen_start, None, num_to_regen,
+        series.days_of_week, series.start_time_hhmm
+    )
+
+    created = 0
+    duration = series.duration_min or 90
+    # Continuar la numeración después de las clases pasadas
+    for i, naive_dt in enumerate(new_dates):
+        starts_at = naive_dt.replace(tzinfo=tz.utc)
+        ends_at = starts_at + td(minutes=duration)
+        session = ClassSession(
+            course_id=series.course_id,
+            level_id=series.level_id,
+            teacher_id=series.teacher_id,
+            title=f"{series.name} — Clase {past_count + i + 1}",
+            modality=series.modality,
+            starts_at_utc=starts_at,
+            ends_at_utc=ends_at,
+            meeting_url=series.meeting_url,
+            branch_id=series.branch_id,
+            classroom_id=series.classroom_id,
+            capacity=series.capacity,
+            series_id=series.id,
+        )
+        db.add(session)
+        created += 1
+
+    await log_action(db, admin.user_id, "update_class_series", "sessions",
+                     target_id=series_id, details=f"reschedule: regen={created}, kept_past={past_count}")
+    await db.commit()
+    return {
+        "ok": True,
+        "regenerated_classes": created,
+        "kept_past_classes": past_count,
+    }
+
+
 # === CLASES PRIVADAS 1-a-1 ===
 @router.post("/private-classes", status_code=201)
 async def create_private_class(
