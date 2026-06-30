@@ -4237,6 +4237,72 @@ async def schedule_trial_class(
     return {"ok": True, "session_created": trial_session is not None}
 
 
+@router.post("/trial-classes/{trial_id}/result")
+async def set_trial_result(
+    trial_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.10: Cerrar una clase de prueba marcando el resultado.
+
+    Body:
+    - attended: bool (True = asistió → completed, False = no asistió → no_show)
+    - notes: str opcional (cómo fue la prueba, nivel sugerido, etc.)
+
+    Tras cerrarla, el admin ve el siguiente paso sugerido:
+    - Si asistió → "inscribir al estudiante"
+    - Si no asistió → "reagendar o descartar"
+    """
+    tc = await db.get(TrialClass, trial_id)
+    if not tc:
+        raise HTTPException(404, "Clase de prueba no encontrada")
+
+    attended = body.get("attended")
+    if attended is None:
+        raise HTTPException(400, "Indica si el estudiante asistió (attended: true/false)")
+
+    tc.status = "completed" if attended else "no_show"
+    tc.completed_at = datetime.now(tz.utc) if hasattr(tc, "completed_at") else None
+    if body.get("notes"):
+        tc.notes = (tc.notes or "") + f"\n[Resultado] {body['notes']}"
+
+    # Notificar al estudiante según el resultado
+    stu = await db.get(User, tc.student_id)
+    if stu:
+        if attended:
+            db.add(Notification(
+                user_id=tc.student_id,
+                type=NotificationType.info,
+                title="✅ ¡Gracias por tu clase de prueba!",
+                body="Esperamos que la hayas disfrutado. Pronto te contactaremos para que continúes aprendiendo con nosotros.",
+            ))
+        else:
+            db.add(Notification(
+                user_id=tc.student_id,
+                type=NotificationType.info,
+                title="Te extrañamos en tu clase de prueba",
+                body="No pudiste asistir a tu clase de prueba. Si quieres, puedes reagendarla desde tu panel.",
+            ))
+
+    await log_action(db, admin.user_id, "set_trial_result", "trial_classes",
+                     target_id=trial_id, details=f"attended={attended}")
+    await db.commit()
+
+    return {
+        "ok": True,
+        "status": tc.status,
+        "student_id": tc.student_id,
+        "student_name": stu.full_name if stu else None,
+        "next_step": "enroll" if attended else "reschedule_or_discard",
+        "next_step_label": (
+            "El estudiante asistió. Siguiente paso: inscribirlo en un plan."
+            if attended else
+            "El estudiante no asistió. Siguiente paso: reagendar o descartar."
+        ),
+    }
+
+
 # ============= V2.8 — SOFT DELETE DE USUARIOS =============
 
 @router.delete("/users/{user_id}")
