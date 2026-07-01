@@ -3527,6 +3527,26 @@ async def admin_change_student_level(
 
     s.current_level_id = level_id
 
+    # V3.9.11 FIX: actualizar también las INSCRIPCIONES activas al nuevo nivel.
+    # Esto es lo que hace que el cambio se refleje de verdad: el dashboard del
+    # estudiante, sus clases, tareas y la vista del profesor leen de la inscripción
+    # (Enrollment.level_id), no de current_level_id. Sin esto, el nivel cambiaba
+    # "en la etiqueta" pero el estudiante seguía viendo las clases del nivel viejo.
+    active_enrollments = (await db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == student_id,
+            Enrollment.is_active.is_(True),
+        )
+    )).scalars().all()
+
+    # El nuevo nivel pertenece a un curso; usamos ese curso para la inscripción
+    enrollments_updated = 0
+    for enr in active_enrollments:
+        enr.level_id = level_id
+        if level.course_id:
+            enr.course_id = level.course_id
+        enrollments_updated += 1
+
     reason = body.get("reason", "")
     # Notificar al estudiante del cambio
     db.add(Notification(
@@ -3537,13 +3557,14 @@ async def admin_change_student_level(
     ))
 
     await log_action(db, admin.user_id, "change_student_level", "students",
-                     target_id=student_id, details=f"{old_label} → {level.code}" + (f" ({reason})" if reason else ""))
+                     target_id=student_id, details=f"{old_label} → {level.code}, enrollments_updated={enrollments_updated}" + (f" ({reason})" if reason else ""))
     await db.commit()
     return {
         "ok": True,
         "old_level": old_label,
         "new_level": level.code,
         "new_level_name": level.name,
+        "enrollments_updated": enrollments_updated,
     }
 
 
