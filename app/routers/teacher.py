@@ -358,6 +358,8 @@ async def save_attendance(
         if not att:
             att = SessionAttendance(session_id=session_id, student_id=sid)
             db.add(att)
+        # V3.9.12: detectar la transición a "ausente" para avisar al estudiante
+        was_absent = (att.state == AttendanceState.absent)
         if r.get("state"):
             try:
                 att.state = AttendanceState(r["state"])
@@ -366,6 +368,29 @@ async def save_attendance(
         if "notes" in r:
             att.notes = r["notes"]
         att.recorded_at = now
+        # V3.9.12: si quedó marcado como ausente y ANTES no lo estaba, avisar (una sola vez)
+        if att.state == AttendanceState.absent and not was_absent:
+            # Evitar duplicar el aviso para esta misma clase
+            existing = (await db.execute(
+                select(Notification).where(
+                    Notification.user_id == sid,
+                    Notification.link == f"absence:{session_id}",
+                )
+            )).scalar_one_or_none()
+            if not existing:
+                fecha_txt = ""
+                if session.starts_at_utc:
+                    sa = session.starts_at_utc if session.starts_at_utc.tzinfo else session.starts_at_utc.replace(tzinfo=tz.utc)
+                    fecha_txt = sa.strftime("%d/%m/%Y")
+                db.add(Notification(
+                    user_id=sid,
+                    type=NotificationType.info,
+                    title="Faltaste a tu clase",
+                    body=f"No registramos tu asistencia a la clase de {session.title or 'tu curso'}"
+                         + (f" del {fecha_txt}" if fecha_txt else "")
+                         + ". Si crees que es un error, contáctanos.",
+                    link=f"absence:{session_id}",
+                ))
         updated += 1
     await log_action(db, teacher.user_id, "save_attendance", "teacher", target_id=session_id)
 

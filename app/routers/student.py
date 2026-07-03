@@ -307,6 +307,23 @@ async def student_dashboard(
         )).scalars().all()
         my_absence_ids = list(notices)
 
+    # V3.9.12: avisos de "faltaste a clase" NO leídos (tarjetas que desaparecen al leerlas)
+    missed_class_alerts = []
+    absence_notifs = (await db.execute(
+        select(Notification).where(
+            Notification.user_id == user.user_id,
+            Notification.link.like("absence:%"),
+            Notification.is_read.is_(False),
+        ).order_by(Notification.created_at.desc()).limit(5)
+    )).scalars().all()
+    for n in absence_notifs:
+        missed_class_alerts.append({
+            "notification_id": n.id,
+            "title": n.title,
+            "body": n.body,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        })
+
     return {
         "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
                  "avatar_url": u.avatar_url, "role": "student"},
@@ -324,6 +341,7 @@ async def student_dashboard(
         "last_grade": last_grade_data,
         "recent_cancelled": recent_cancelled,  # V3.0
         "my_absence_session_ids": my_absence_ids,  # V3.0
+        "missed_class_alerts": missed_class_alerts,  # V3.9.12
         "trial_info": trial_info,  # V3.0.1
     }
 
