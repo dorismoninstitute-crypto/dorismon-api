@@ -2790,8 +2790,13 @@ async def create_class_series(
     # Crear las clases
     duration = body.get("duration_min", 90)
     created_classes = 0
+    from zoneinfo import ZoneInfo
+    _rd_tz = ZoneInfo("America/Santo_Domingo")
     for i, naive_dt in enumerate(dates):
-        starts_at = naive_dt.replace(tzinfo=tz.utc)  # Asumimos UTC; conversión TZ ya se hace en frontend
+        # V3.9.16 FIX: la hora que escribe el admin es hora DOMINICANA (UTC-4),
+        # no UTC. Antes se guardaba como UTC crudo y las clases quedaban corridas
+        # 4 horas (ej: escribías 10:00 y salían a las 06:00).
+        starts_at = naive_dt.replace(tzinfo=_rd_tz).astimezone(tz.utc)
         ends_at = starts_at + timedelta(minutes=duration)
         mod_id = assign_module(i, len(dates), module_ids) if module_ids else None
 
@@ -2999,9 +3004,12 @@ async def reschedule_class_series(
 
     created = 0
     duration = series.duration_min or 90
+    from zoneinfo import ZoneInfo as _ZI
+    _rd = _ZI("America/Santo_Domingo")
     # Continuar la numeración después de las clases pasadas
     for i, naive_dt in enumerate(new_dates):
-        starts_at = naive_dt.replace(tzinfo=tz.utc)
+        # V3.9.16 FIX: la hora es hora DOMINICANA (UTC-4), convertir a UTC
+        starts_at = naive_dt.replace(tzinfo=_rd).astimezone(tz.utc)
         ends_at = starts_at + td(minutes=duration)
         session = ClassSession(
             course_id=series.course_id,
