@@ -684,6 +684,84 @@ async def create_session(
     return {"id": s.id}
 
 
+@router.post("/events", status_code=201)
+async def create_open_event(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.15: Crear un EVENTO ABIERTO de forma simple (webinar, club de
+    conversación, taller). A diferencia de una clase, NO exige curso/nivel:
+    los eventos abiertos son visibles para TODOS los estudiantes sin importar
+    su nivel. Soporta modalidad híbrida (link para online + sede para presencial).
+
+    Body:
+    - title: str (requerido)
+    - starts_at_utc, ends_at_utc: ISO (requeridos)
+    - modality: online | presencial | hibrida (requerido)
+    - teacher_id: str (anfitrión del evento, requerido)
+    - description: str (opcional)
+    - meeting_url: str (requerido si online o hibrida)
+    - branch_id: int (requerido si presencial o hibrida)
+    - classroom_id: int (opcional)
+    - capacity: int (default 30)
+    """
+    for f in ("title", "starts_at_utc", "ends_at_utc", "modality", "teacher_id"):
+        if not body.get(f):
+            raise HTTPException(400, f"{f} requerido")
+
+    modality = Modality(body["modality"])
+    if modality in (Modality.online, Modality.hibrida) and not body.get("meeting_url"):
+        raise HTTPException(400, "Un evento online o híbrido necesita el link (meeting_url)")
+    if modality in (Modality.presencial, Modality.hibrida) and not body.get("branch_id"):
+        raise HTTPException(400, "Un evento presencial o híbrido necesita la sede (branch_id)")
+
+    # Validar anfitrión
+    t = await db.get(Teacher, body["teacher_id"])
+    if not t:
+        raise HTTPException(404, "Anfitrión (profesor) no encontrado")
+
+    # Curso/nivel: irrelevantes para eventos abiertos (los ven todos), pero el
+    # modelo los exige — usamos el primero disponible como relleno técnico.
+    first_course = (await db.execute(select(Course).limit(1))).scalar_one_or_none()
+    if not first_course:
+        raise HTTPException(400, "No hay cursos en el sistema")
+    first_level = (await db.execute(
+        select(Level).where(Level.course_id == first_course.id).order_by(Level.order_index).limit(1)
+    )).scalar_one_or_none()
+    if not first_level:
+        first_level = (await db.execute(select(Level).limit(1))).scalar_one_or_none()
+    if not first_level:
+        raise HTTPException(400, "No hay niveles en el sistema")
+
+    starts_at = datetime.fromisoformat(body["starts_at_utc"].replace("Z", "+00:00"))
+    ends_at = datetime.fromisoformat(body["ends_at_utc"].replace("Z", "+00:00"))
+    if ends_at <= starts_at:
+        raise HTTPException(400, "La hora de fin debe ser posterior a la de inicio")
+
+    s = ClassSession(
+        title=body["title"],
+        description=body.get("description"),
+        course_id=first_course.id,
+        level_id=first_level.id,
+        teacher_id=body["teacher_id"],
+        modality=modality,
+        starts_at_utc=starts_at,
+        ends_at_utc=ends_at,
+        meeting_url=body.get("meeting_url"),
+        branch_id=body.get("branch_id"),
+        classroom_id=body.get("classroom_id"),
+        capacity=int(body.get("capacity", 30)),
+        is_open_event=True,
+    )
+    db.add(s)
+    await db.flush()
+
+    await log_action(db, admin.user_id, "create_open_event", "admin", target_id=s.id)
+    await db.commit()
+    return {"id": s.id, "ok": True}
+
+
 @router.delete("/sessions/{session_id}")
 async def cancel_session(
     session_id: str,
