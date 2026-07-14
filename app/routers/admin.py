@@ -2996,7 +2996,18 @@ async def reschedule_class_series(
     await db.flush()
 
     # Regenerar a partir de mañana, con la misma cantidad de clases futuras
-    regen_start = (now + td(days=1)).date()
+    # V3.9.17 FIX: si la hora nueva de HOY (en hora dominicana) todavía no pasó,
+    # la primera clase regenerada puede ser HOY mismo. Antes siempre saltaba a
+    # mañana, y si cambiabas "hoy 7pm → hoy 7am" la clase de hoy desaparecía.
+    from zoneinfo import ZoneInfo as _ZI2
+    _rd2 = _ZI2("America/Santo_Domingo")
+    now_rd = now.astimezone(_rd2)
+    try:
+        _hh, _mm = (series.start_time_hhmm or "00:00").split(":")
+        new_time_today = now_rd.replace(hour=int(_hh), minute=int(_mm), second=0, microsecond=0)
+        regen_start = now_rd.date() if new_time_today > now_rd else (now_rd + td(days=1)).date()
+    except Exception:
+        regen_start = (now_rd + td(days=1)).date()
     new_dates = _generate_session_dates(
         regen_start, None, num_to_regen,
         series.days_of_week, series.start_time_hhmm

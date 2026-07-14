@@ -544,6 +544,34 @@ async def send_admin_trial_request_email(student_name: str, student_email: str, 
     return await send_email(_admin_notify_email(), subject, html, text)
 
 
+async def send_student_test_result_email(student_name: str, student_email: str, level: str, level_name: str = "") -> bool:
+    """V3.9.17: Email AUTOMÁTICO al ESTUDIANTE con su resultado del test + siguiente paso.
+    Antes solo se avisaba al admin y el estudiante quedaba esperando que alguien
+    le escribiera — acá se invierte: recibe su nivel y el CTA de inmediato."""
+    first_name = (student_name or "").split(" ")[0] or "estudiante"
+    subject = f"🎉 ¡Felicidades {first_name}! Tu nivel de inglés es {level}"
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:600px;margin:0 auto;padding:20px;color:#1e293b">
+      <h2 style="color:#2563eb;margin:0 0 16px">🎉 ¡Completaste tu test de nivel!</h2>
+      <p>Hola {first_name},</p>
+      <p>¡Excelente trabajo! Según tu resultado, tu nivel de inglés es:</p>
+      <div style="background:#eff6ff;border:2px solid #2563eb;padding:20px;margin:16px 0;border-radius:12px;text-align:center">
+        <p style="margin:0;font-size:32px;font-weight:800;color:#2563eb">{level}</p>
+        <p style="margin:4px 0 0;color:#475569">{level_name}</p>
+      </div>
+      <p><strong>¿Cuál es el siguiente paso?</strong></p>
+      <p>Agenda tu <strong>clase de prueba GRATIS</strong> para conocer a tu profesor y confirmar tu nivel:</p>
+      <div style="text-align:center;margin:24px 0">
+        <a href="https://dorismon.com/dashboard/student/trial" style="background:#2563eb;color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:700;display:inline-block">📅 Agendar mi clase gratis</a>
+      </div>
+      <p style="color:#475569">¿Tienes preguntas? Responde este correo o escríbenos por WhatsApp desde tu panel — estamos para ayudarte.</p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:30px">— Dorismon Language Institute · Santo Domingo, RD 🇩🇴</p>
+    </div>
+    """
+    text = f"¡Felicidades {first_name}! Tu nivel de inglés es {level} ({level_name}).\n\nSiguiente paso: agenda tu clase de prueba GRATIS en https://dorismon.com/dashboard/student/trial\n\n— Dorismon Language Institute"
+    return await send_email(student_email, subject, html, text)
+
+
 async def send_admin_test_completed_email(student_name: str, student_email: str, level: str | None = None) -> bool:
     """V3.6: Avisa al dueño que un estudiante completó el test de nivel."""
     subject = f"📝 Test de nivel completado: {student_name}"
