@@ -141,13 +141,13 @@ async def teacher_dashboard(
                 Enrollment.is_active.is_(True),
             )
         )).all()
-        for u, e, l in my_students_q:
+        for stu, e, l in my_students_q:
             # Asistencia del estudiante en mis clases
             att_rows = (await db.execute(
                 select(SessionAttendance.state)
                 .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
                 .where(
-                    SessionAttendance.student_id == u.id,
+                    SessionAttendance.student_id == stu.id,
                     ClassSession.teacher_id == teacher.user_id,
                 )
             )).all()
@@ -158,9 +158,9 @@ async def teacher_dashboard(
             pct = round((present / total) * 100, 1)
             if pct < 70:
                 students_at_risk.append({
-                    "student_id": u.id,
-                    "student_name": u.full_name,
-                    "gender": u.gender,
+                    "student_id": stu.id,
+                    "student_name": stu.full_name,
+                    "gender": stu.gender,
                     "level_code": l.code,
                     "attendance_pct": pct,
                     "total_classes": total,
