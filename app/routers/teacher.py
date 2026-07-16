@@ -13,7 +13,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizQuestion, QuizAttempt,
     Material, Observation, Notification, Student,
     AttendanceState, QuestionType, MaterialType, NotificationType, SessionStatus,
-    Course, Level, UserRole, Branch, Classroom,
+    Course, Level, UserRole, Branch, Classroom, EventRegistration,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
@@ -88,6 +88,8 @@ async def teacher_dashboard(
             "level_code": level.code if level else None,
             "is_private": s.student_id is not None,  # V1.7
             "module_id": s.module_id,
+            "status": s.status.value if s.status else "scheduled",  # V3.9.19
+            "is_open_event": bool(s.is_open_event),  # V3.9.19: para etiqueta 🎉
         })
 
     # V1.8: Próximas clases de la semana (no solo hoy)
@@ -260,15 +262,27 @@ async def get_attendance(
         raise HTTPException(403, "No es tu sesión")
 
     # Inscritos a este level del curso
-    students_q = (
-        select(Enrollment, User)
-        .join(User, Enrollment.student_id == User.id)
-        .where(
-            Enrollment.course_id == session.course_id,
-            Enrollment.level_id == session.level_id,
-            Enrollment.is_active.is_(True),
+    # V3.9.19: si es un EVENTO ABIERTO, la lista de asistencia son los
+    # REGISTRADOS al evento (no el curso/nivel, que en eventos es relleno técnico)
+    if session.is_open_event:
+        students_q = (
+            select(EventRegistration, User)
+            .join(User, EventRegistration.student_id == User.id)
+            .where(
+                EventRegistration.session_id == session_id,
+                EventRegistration.cancelled_at.is_(None),
+            )
         )
-    )
+    else:
+        students_q = (
+            select(Enrollment, User)
+            .join(User, Enrollment.student_id == User.id)
+            .where(
+                Enrollment.course_id == session.course_id,
+                Enrollment.level_id == session.level_id,
+                Enrollment.is_active.is_(True),
+            )
+        )
     rows = (await db.execute(students_q)).all()
     # V3.0: avisos de ausencia para esta clase
     from app.models import AbsenceNotice
@@ -428,6 +442,46 @@ async def save_attendance(
         await db.commit()
 
     return {"ok": True, "updated": updated}
+
+
+@router.post("/sessions/{session_id}/finalize")
+async def finalize_session(
+    session_id: str,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.19: Finalizar una clase manualmente. Disponible para CUALQUIER clase
+    del profe (normal, evento, prueba) que esté en curso o ya pasada. Marca la
+    sesión como completada — deja de mostrarse "EN CURSO" de inmediato, sin
+    esperar la hora de fin programada.
+    Se puede finalizar sin haber pasado lista: la respuesta indica si falta
+    asistencia para que el frontend recuerde pasarla."""
+    session = await db.get(ClassSession, session_id)
+    if not session:
+        raise HTTPException(404, "Sesión no encontrada")
+    if teacher.role == "teacher" and session.teacher_id != teacher.user_id:
+        raise HTTPException(403, "No es tu sesión")
+    if session.status == SessionStatus.cancelled:
+        raise HTTPException(400, "La clase está cancelada, no se puede finalizar")
+    now = datetime.now(tz.utc)
+    starts = session.starts_at_utc
+    if starts and starts.tzinfo is None:
+        starts = starts.replace(tzinfo=tz.utc)
+    if starts and starts > now:
+        raise HTTPException(400, "La clase aún no ha empezado")
+
+    session.status = SessionStatus.completed
+
+    # ¿Se pasó asistencia? (para el recordatorio del frontend)
+    att_count = (await db.execute(
+        select(func.count()).select_from(SessionAttendance).where(
+            SessionAttendance.session_id == session_id,
+            SessionAttendance.state.is_not(None),
+        )
+    )).scalar() or 0
+
+    await db.commit()
+    return {"ok": True, "attendance_taken": att_count > 0, "attendance_count": att_count}
 
 
 @router.get("/assignments")
