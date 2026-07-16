@@ -10,7 +10,7 @@ from app.core.db import get_db
 from app.models import (
     User, Student, Module, Lesson, Level, Course, Enrollment,
     SessionAttendance, ClassSession, ModuleProgress, Quiz, QuizAttempt,
-    AttendanceState, Branch, Classroom,
+    AttendanceState, Branch, Classroom, SessionStatus,
 )
 
 router = APIRouter(prefix="/progress", tags=["progress"])
@@ -85,6 +85,10 @@ async def my_course_progress(
             ),
             ClassSession.ends_at_utc > datetime.now(tz.utc),  # V1.6.4
             ClassSession.is_open_event.is_(False),
+            # V3.9.20 FIX: solo clases PROGRAMADAS — una finalizada por el profe
+            # o cancelada ya no es "tu próxima clase" (antes seguía apareciendo
+            # como EN CURSO para el estudiante aunque el profe la finalizara)
+            ClassSession.status == SessionStatus.scheduled,
         ).order_by(ClassSession.starts_at_utc).limit(1)
     )).scalar_one_or_none()
     next_session_data = None

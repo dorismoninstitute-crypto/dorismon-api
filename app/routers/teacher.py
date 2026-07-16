@@ -597,7 +597,17 @@ async def grade_submission(
     a = await db.get(Assignment, sub.assignment_id)
     if teacher.role == "teacher" and a.teacher_id != teacher.user_id:
         raise HTTPException(403)
-    sub.score = body.get("score")
+    # V3.9.20 FIX: validar la nota — antes aceptaba cualquier body y podía marcar
+    # "calificado" sin nota (y notificar "Tu calificación es None")
+    if body.get("score") is None:
+        raise HTTPException(400, "Falta la nota (score)")
+    try:
+        score_val = float(body["score"])
+    except (TypeError, ValueError):
+        raise HTTPException(400, "La nota debe ser un número")
+    if score_val < 0 or (a.max_score and score_val > float(a.max_score)):
+        raise HTTPException(400, f"La nota debe estar entre 0 y {a.max_score}")
+    sub.score = score_val
     sub.feedback = body.get("feedback")
     sub.graded_at = datetime.now(tz.utc)
 

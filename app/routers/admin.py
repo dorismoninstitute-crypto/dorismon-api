@@ -772,6 +772,47 @@ async def cancel_session(
     if not s:
         raise HTTPException(404)
     s.status = SessionStatus.cancelled
+    # V3.9.20 FIX: antes el cancel del admin solo cambiaba el estado — no seteaba
+    # cancelled_at (el aviso del dashboard del estudiante filtra por ese campo,
+    # así que la cancelación quedaba invisible) ni notificaba a nadie.
+    s.cancelled_at = datetime.now(tz.utc)
+    s.cancelled_by_user_id = admin.user_id
+    if not s.cancellation_reason:
+        s.cancellation_reason = "Cancelada por administración"
+
+    # Notificar a los estudiantes afectados (grupal: inscritos al nivel; privada: el asignado)
+    try:
+        starts_for_msg = s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)
+        from zoneinfo import ZoneInfo as _ZIc
+        when_local = starts_for_msg.astimezone(_ZIc("America/Santo_Domingo")).strftime("%d/%m/%Y %I:%M %p")
+        affected_ids = set()
+        if s.student_id:
+            affected_ids.add(s.student_id)
+        else:
+            enr_rows = (await db.execute(
+                select(Enrollment.student_id).where(
+                    Enrollment.course_id == s.course_id,
+                    Enrollment.level_id == s.level_id,
+                    Enrollment.is_active.is_(True),
+                )
+            )).all()
+            affected_ids.update(sid for (sid,) in enr_rows)
+        for st_id in affected_ids:
+            db.add(Notification(
+                user_id=st_id, type=NotificationType.info,
+                title="❌ Clase cancelada",
+                body=f"Tu clase '{s.title}' del {when_local} fue cancelada. {s.cancellation_reason or ''}".strip(),
+            ))
+        # Avisar también al profe de la clase
+        if s.teacher_id:
+            db.add(Notification(
+                user_id=s.teacher_id, type=NotificationType.info,
+                title="❌ Clase cancelada por administración",
+                body=f"Tu clase '{s.title}' del {when_local} fue cancelada.",
+            ))
+    except Exception:
+        pass
+
     await log_action(db, admin.user_id, "cancel_session", "admin", target_id=session_id)
     await db.commit()
     return {"ok": True}
