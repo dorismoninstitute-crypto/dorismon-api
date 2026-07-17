@@ -13,7 +13,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizQuestion, QuizAttempt,
     Material, Observation, Notification, Student,
     AttendanceState, QuestionType, MaterialType, NotificationType, SessionStatus,
-    Course, Level, UserRole, Branch, Classroom, EventRegistration,
+    Course, Level, UserRole, Branch, Classroom, EventRegistration, ClassConfirmation, TrialClass,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
@@ -75,6 +75,15 @@ async def teacher_dashboard(
             select(func.count(func.distinct(Enrollment.student_id))).where(Enrollment.is_active.is_(True))
         )).scalar() or 0
 
+    # V3.9.21: identificar cuáles clases de hoy son CLASES DE PRUEBA (para etiqueta 🎯)
+    today_ids = [s.id for s in today_classes]
+    trial_session_ids = set()
+    if today_ids:
+        trial_rows = (await db.execute(
+            select(TrialClass.session_id).where(TrialClass.session_id.in_(today_ids))
+        )).all()
+        trial_session_ids = {x for (x,) in trial_rows if x}
+
     today_data = []
     for s in today_classes:
         teacher_user = await db.get(User, s.teacher_id)
@@ -90,6 +99,7 @@ async def teacher_dashboard(
             "module_id": s.module_id,
             "status": s.status.value if s.status else "scheduled",  # V3.9.19
             "is_open_event": bool(s.is_open_event),  # V3.9.19: para etiqueta 🎉
+            "is_trial": s.id in trial_session_ids,  # V3.9.21: para etiqueta 🎯 Prueba
         })
 
     # V1.8: Próximas clases de la semana (no solo hoy)
@@ -291,6 +301,12 @@ async def get_attendance(
         select(AbsenceNotice).where(AbsenceNotice.session_id == session_id)
     )).scalars().all():
         absence_map[an.student_id] = an
+    # V3.9.21: quiénes confirmaron asistencia a esta clase
+    conf_rows = (await db.execute(
+        select(ClassConfirmation.student_id).where(ClassConfirmation.session_id == session_id)
+    )).all()
+    confirmed_ids = {x for (x,) in conf_rows}
+
     out_students = []
     for e, u in rows:
         att = (await db.execute(
@@ -305,6 +321,7 @@ async def get_attendance(
             "attendance_id": att.id if att else None,
             "state": att.state.value if att and att.state else None,
             "notes": att.notes if att else None,
+            "confirmed": u.id in confirmed_ids,  # V3.9.21: confirmó que asistirá
             # V3.0: aviso de ausencia del estudiante
             "absence_notice": ({
                 "reason": notice.reason,

@@ -10,7 +10,7 @@ from app.core.db import get_db
 from app.models import (
     User, Student, Module, Lesson, Level, Course, Enrollment,
     SessionAttendance, ClassSession, ModuleProgress, Quiz, QuizAttempt,
-    AttendanceState, Branch, Classroom, SessionStatus,
+    AttendanceState, Branch, Classroom, SessionStatus, ClassConfirmation,
 )
 
 router = APIRouter(prefix="/progress", tags=["progress"])
@@ -113,6 +113,13 @@ async def my_course_progress(
                     "classroom_name": classroom.name if classroom else None,
                     "maps_url": maps_url,
                 }
+        # V3.9.21: ¿este estudiante ya confirmó su asistencia a esta clase?
+        my_conf = (await db.execute(
+            select(ClassConfirmation).where(
+                ClassConfirmation.session_id == next_session.id,
+                ClassConfirmation.student_id == user.user_id,
+            )
+        )).scalar_one_or_none()
         next_session_data = {
             "id": next_session.id, "title": next_session.title,
             "starts_at_utc": next_session.starts_at_utc.isoformat() if next_session.starts_at_utc else None,
@@ -124,6 +131,8 @@ async def my_course_progress(
             "module_id": next_session.module_id,
             "is_private": next_session.student_id is not None,  # V1.7
             "location": location,  # V3.0.3
+            "status": next_session.status.value if next_session.status else "scheduled",  # V3.9.21
+            "my_confirmed": my_conf is not None,  # V3.9.21
         }
 
     # Última clase asistida con notas del profe

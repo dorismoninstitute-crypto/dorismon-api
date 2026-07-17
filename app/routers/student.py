@@ -13,7 +13,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
     ClassSession, SessionAttendance, Certificate, Notification, Material,
     AttendanceState, QuestionType, AbsenceNotice, NotificationType, SessionStatus, UserRole,
-    Branch, Classroom,
+    Branch, Classroom, ClassConfirmation,
 )
 from datetime import timezone as _tz, datetime as _dt, timedelta as _td
 
@@ -715,6 +715,38 @@ async def my_notifications(
         "link": n.link, "is_read": n.is_read,
         "created_at": n.created_at.isoformat(),
     } for n in items]
+
+
+@router.post("/sessions/{session_id}/confirm")
+async def confirm_class_attendance(
+    session_id: str,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.21: El estudiante confirma que asistirá a una clase próxima.
+    El profe/admin ve quién confirmó al abrir la asistencia."""
+    s = await db.get(ClassSession, session_id)
+    if not s:
+        raise HTTPException(404, "Clase no encontrada")
+    if s.status != SessionStatus.scheduled:
+        raise HTTPException(400, "La clase no está programada")
+    ends = s.ends_at_utc
+    if ends and ends.tzinfo is None:
+        ends = ends.replace(tzinfo=_tz.utc)
+    if ends and ends <= _dt.now(_tz.utc):
+        raise HTTPException(400, "La clase ya pasó")
+
+    existing = (await db.execute(
+        select(ClassConfirmation).where(
+            ClassConfirmation.session_id == session_id,
+            ClassConfirmation.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        return {"ok": True, "already": True}
+    db.add(ClassConfirmation(session_id=session_id, student_id=user.user_id))
+    await db.commit()
+    return {"ok": True, "already": False}
 
 
 @router.post("/notifications/{notif_id}/read")

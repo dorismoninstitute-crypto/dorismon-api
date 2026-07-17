@@ -1571,6 +1571,11 @@ async def update_session(
         starts = starts.replace(tzinfo=tz.utc)
     is_past = starts <= datetime.now(tz.utc)
     allowed_past = {"title", "description", "recording_url", "teacher_notes"}
+    # V3.9.21: guardar valores previos para detectar cambios que importan al estudiante
+    old_starts = s.starts_at_utc
+    old_teacher = s.teacher_id
+    old_modality = s.modality
+    old_url = s.meeting_url
     for field, value in body.items():
         if is_past and field not in allowed_past:
             continue  # ignorar campos no permitidos para clases pasadas
@@ -1582,6 +1587,45 @@ async def update_session(
             s.modality = Modality(value)
         elif hasattr(s, field):
             setattr(s, field, value)
+
+    # V3.9.21: si cambió hora/profesor/modalidad/link de una clase FUTURA,
+    # avisar a los estudiantes afectados (antes editabas y nadie se enteraba)
+    if not is_past:
+        cambios = []
+        if s.starts_at_utc != old_starts:
+            from zoneinfo import ZoneInfo as _ZIu
+            nueva = (s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)).astimezone(_ZIu("America/Santo_Domingo"))
+            cambios.append(f"nueva fecha/hora: {nueva.strftime('%d/%m/%Y %I:%M %p')}")
+        if s.teacher_id != old_teacher:
+            nt = await db.get(User, s.teacher_id)
+            cambios.append(f"nuevo profesor: {nt.full_name if nt else '—'}")
+        if s.modality != old_modality:
+            cambios.append(f"nueva modalidad: {s.modality.value}")
+        if s.meeting_url != old_url and s.meeting_url:
+            cambios.append("nuevo link de clase")
+        if cambios:
+            try:
+                affected = set()
+                if s.student_id:
+                    affected.add(s.student_id)
+                else:
+                    rows = (await db.execute(
+                        select(Enrollment.student_id).where(
+                            Enrollment.course_id == s.course_id,
+                            Enrollment.level_id == s.level_id,
+                            Enrollment.is_active.is_(True),
+                        )
+                    )).all()
+                    affected.update(x for (x,) in rows)
+                for st_id in affected:
+                    db.add(Notification(
+                        user_id=st_id, type=NotificationType.info,
+                        title="🔄 Tu clase cambió",
+                        body=f"'{s.title}': " + " · ".join(cambios) + ".",
+                    ))
+            except Exception:
+                pass
+
     await log_action(db, admin.user_id, "update_session", "class_sessions", session_id)
     await db.commit()
     return {"ok": True, "is_past": is_past}
@@ -3083,6 +3127,33 @@ async def reschedule_class_series(
     await log_action(db, admin.user_id, "update_class_series", "sessions",
                      target_id=series_id, details=f"reschedule: regen={created}, kept_past={past_count}")
     await db.commit()
+    # V3.9.21: avisar a los estudiantes del nivel que el horario de su serie cambió
+    try:
+        dias_map = {"mon": "Lun", "tue": "Mar", "wed": "Mié", "thu": "Jue", "fri": "Vie", "sat": "Sáb", "sun": "Dom"}
+        dias_txt = ", ".join(dias_map.get(d.strip(), d) for d in (series.days_of_week or "").split(",") if d.strip())
+        try:
+            _h, _m = (series.start_time_hhmm or "00:00").split(":")
+            _dt12 = datetime(2000, 1, 1, int(_h), int(_m))
+            hora_txt = _dt12.strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            hora_txt = series.start_time_hhmm or ""
+        rows = (await db.execute(
+            select(Enrollment.student_id).where(
+                Enrollment.course_id == series.course_id,
+                Enrollment.level_id == series.level_id,
+                Enrollment.is_active.is_(True),
+            )
+        )).all()
+        for (st_id,) in rows:
+            db.add(Notification(
+                user_id=st_id, type=NotificationType.info,
+                title="🔄 Tu horario de clases cambió",
+                body=f"'{series.name}' ahora es: {dias_txt} a las {hora_txt}. Revisa tu calendario.",
+            ))
+        await db.commit()
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "regenerated_classes": created,
@@ -4639,10 +4710,71 @@ async def send_class_reminders(
         sessions_processed += 1
 
     await db.commit()
+
+    # V3.9.21: RECORDATORIO DE TAREAS por vencer (mismo cron, cero config extra).
+    # Tareas con fecha límite entre 23h y 25h desde ahora → aviso a estudiantes
+    # del curso/nivel que NO han entregado. Dedup vía Notification.link.
+    tasks_processed = 0
+    task_notifs = 0
+    try:
+        from zoneinfo import ZoneInfo
+        t_start = now + timedelta(hours=23)
+        t_end = now + timedelta(hours=25)
+        due_assignments = (await db.execute(
+            select(Assignment).where(
+                Assignment.due_at.is_not(None),
+                Assignment.due_at >= t_start,
+                Assignment.due_at <= t_end,
+            )
+        )).scalars().all()
+        for a in due_assignments:
+            # Estudiantes del nivel con inscripción activa (Assignment se ata a level)
+            conds = [Enrollment.is_active.is_(True)]
+            if a.level_id:
+                conds.append(Enrollment.level_id == a.level_id)
+            enr_rows = (await db.execute(select(Enrollment.student_id).where(*conds))).all()
+            student_ids = {x for (x,) in enr_rows}
+            if not student_ids:
+                continue
+            # Excluir quienes YA entregaron
+            subs = (await db.execute(
+                select(AssignmentSubmission.student_id).where(
+                    AssignmentSubmission.assignment_id == a.id,
+                )
+            )).all()
+            entregaron = {x for (x,) in subs}
+            pendientes = student_ids - entregaron
+            due_local = a.due_at
+            if due_local.tzinfo is None:
+                due_local = due_local.replace(tzinfo=tz.utc)
+            due_txt = due_local.astimezone(ZoneInfo("America/Santo_Domingo")).strftime("%d/%m %I:%M %p")
+            for st_id in pendientes:
+                # Dedup: una sola vez por tarea+estudiante
+                ya = (await db.execute(
+                    select(Notification).where(
+                        Notification.user_id == st_id,
+                        Notification.link == f"taskrem:{a.id}",
+                    )
+                )).scalar_one_or_none()
+                if ya:
+                    continue
+                db.add(Notification(
+                    user_id=st_id, type=NotificationType.info,
+                    title="📝 Tu tarea vence mañana",
+                    body=f"'{a.title}' vence el {due_txt}. ¡Aún estás a tiempo de entregarla!",
+                    link=f"taskrem:{a.id}",
+                ))
+                task_notifs += 1
+            tasks_processed += 1
+        await db.commit()
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "sessions_processed": sessions_processed,
         "emails_sent": total_emails_sent,
+        "task_reminders": {"assignments": tasks_processed, "notified": task_notifs},
         "now_utc": now.isoformat(),
     }
 

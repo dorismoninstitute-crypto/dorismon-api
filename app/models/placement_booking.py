@@ -744,6 +744,17 @@ class EventRegistration(Base):
     __table_args__ = (UniqueConstraint("session_id", "student_id"),)
 
 
+class ClassConfirmation(Base):
+    """V3.9.21: Confirmación de asistencia del estudiante a una clase próxima.
+    El estudiante toca 'Confirmar asistencia' → el profe/admin ve quién confirmó."""
+    __tablename__ = "class_confirmations"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id", ondelete="CASCADE"))
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (UniqueConstraint("session_id", "student_id"),)
+
+
 
 # ============= V1.3 — Progress tracking =============
 class ModuleProgress(Base):
