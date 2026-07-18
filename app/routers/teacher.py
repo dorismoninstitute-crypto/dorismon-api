@@ -274,6 +274,11 @@ async def get_attendance(
     # Inscritos a este level del curso
     # V3.9.19: si es un EVENTO ABIERTO, la lista de asistencia son los
     # REGISTRADOS al evento (no el curso/nivel, que en eventos es relleno técnico)
+    # V3.9.22: si la clase tiene un ESTUDIANTE ASIGNADO (clase de prueba o
+    # privada), la lista es ESE estudiante — esté inscrito o no. Antes, la
+    # clase de prueba mostraba "Estudiantes (0)" porque el estudiante de
+    # prueba aún no tiene inscripción, y el profe no podía pasar asistencia
+    # (ni cobrar la clase).
     if session.is_open_event:
         students_q = (
             select(EventRegistration, User)
@@ -283,6 +288,10 @@ async def get_attendance(
                 EventRegistration.cancelled_at.is_(None),
             )
         )
+        rows = (await db.execute(students_q)).all()
+    elif session.student_id:
+        assigned_user = await db.get(User, session.student_id)
+        rows = [(None, assigned_user)] if assigned_user else []
     else:
         students_q = (
             select(Enrollment, User)
@@ -293,7 +302,7 @@ async def get_attendance(
                 Enrollment.is_active.is_(True),
             )
         )
-    rows = (await db.execute(students_q)).all()
+        rows = (await db.execute(students_q)).all()
     # V3.0: avisos de ausencia para esta clase
     from app.models import AbsenceNotice
     absence_map = {}
@@ -459,6 +468,59 @@ async def save_attendance(
         await db.commit()
 
     return {"ok": True, "updated": updated}
+
+
+@router.get("/pending-attendance")
+async def pending_attendance(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.22: Clases del profe YA TERMINADAS (últimos 7 días) que aún NO
+    tienen asistencia registrada. Para el bloque '⏳ Clases sin asistencia' —
+    el profe termina su clase y la encuentra ahí arriba, con acceso directo,
+    sin buscar entre las pasadas. Al pasar la lista, desaparece del bloque."""
+    now = datetime.now(tz.utc)
+    week_ago = now - timedelta(days=7)
+    q = select(ClassSession).where(
+        ClassSession.teacher_id == teacher.user_id,
+        ClassSession.ends_at_utc <= now,
+        ClassSession.ends_at_utc >= week_ago,
+        ClassSession.status != SessionStatus.cancelled,
+    ).order_by(ClassSession.ends_at_utc.desc())
+    sessions = (await db.execute(q)).scalars().all()
+
+    # Cuáles ya tienen asistencia registrada
+    ids = [s.id for s in sessions]
+    att_ids = set()
+    if ids:
+        att_rows = (await db.execute(
+            select(SessionAttendance.session_id).where(
+                SessionAttendance.session_id.in_(ids),
+                SessionAttendance.state.is_not(None),
+            ).distinct()
+        )).all()
+        att_ids = {x for (x,) in att_rows}
+
+    # Cuáles son clases de prueba (para la etiqueta)
+    trial_ids = set()
+    if ids:
+        t_rows = (await db.execute(
+            select(TrialClass.session_id).where(TrialClass.session_id.in_(ids))
+        )).all()
+        trial_ids = {x for (x,) in t_rows if x}
+
+    out = []
+    for s in sessions:
+        if s.id in att_ids:
+            continue  # ya tiene lista pasada
+        out.append({
+            "id": s.id, "title": s.title,
+            "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+            "is_trial": s.id in trial_ids,
+            "is_open_event": bool(s.is_open_event),
+            "is_private": s.student_id is not None,
+        })
+    return {"items": out, "count": len(out)}
 
 
 @router.post("/sessions/{session_id}/finalize")
