@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, date, timedelta, timezone as tz
 from secrets import token_urlsafe
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from sqlalchemy import select, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,7 @@ from app.models import (
     Enrollment, Branch, Classroom, ClassSession, ClassSeries, SessionAttendance,
     Assignment, AssignmentSubmission, Quiz, Material, Plan, Payment,
     Certificate, InstituteSetting, AuditLog, Notification, TeacherPayment,
+    SiteImage, Testimonial,
     UserRole, Modality, SessionStatus, MaterialType, PaymentStatus, NotificationType,
     PlanFeature, ModuleProgress, EventRegistration, AttendanceState,
     # V2.6: Pagos por transferencia + clase de prueba
@@ -5051,3 +5052,239 @@ async def teachers_schedule(
         })
 
     return {"teachers": out, "now_utc": now.isoformat()}
+
+
+# ============================================================================
+# V3.9.23 — IMÁGENES DEL SITIO (subida desde el admin vía Cloudinary)
+# ============================================================================
+
+@router.get("/site-images")
+async def list_site_images(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Lista los espacios de imagen de la página pública con su foto actual.
+
+    Devuelve también si Cloudinary está configurado, para que el panel
+    pueda avisar en vez de fallar en silencio."""
+    from app.services.cloudinary_service import SITE_IMAGE_SLOTS, cloudinary_ready
+
+    rows = (await db.execute(select(SiteImage))).scalars().all()
+    current = {r.slot: r for r in rows}
+
+    items = []
+    for spec in SITE_IMAGE_SLOTS:
+        row = current.get(spec["slot"])
+        items.append({
+            **spec,
+            "url": row.url if row else None,
+            "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+        })
+    return {"items": items, "cloudinary_ready": cloudinary_ready()}
+
+
+@router.post("/site-images/{slot}")
+async def upload_site_image(
+    slot: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sube (o reemplaza) la imagen de un espacio de la página pública."""
+    from starlette.concurrency import run_in_threadpool
+    from app.services.cloudinary_service import (
+        SLOT_KEYS, cloudinary_ready, upload_image_sync,
+    )
+
+    if slot not in SLOT_KEYS:
+        raise HTTPException(404, "Ese espacio de imagen no existe")
+    # Primero lo que depende del usuario (mensaje más útil), luego la config
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(400, "El archivo debe ser una imagen (JPG o PNG)")
+    if not cloudinary_ready():
+        raise HTTPException(
+            503,
+            "Falta configurar Cloudinary. Agrega la variable CLOUDINARY_URL en Render y vuelve a intentar.",
+        )
+
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "La imagen es muy pesada. El máximo son 10 MB.")
+    if not data:
+        raise HTTPException(400, "El archivo llegó vacío")
+
+    try:
+        res = await run_in_threadpool(
+            upload_image_sync, data, f"site_{slot}", "dorismon/site"
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Cloudinary rechazó la imagen: {e}")
+
+    existing = await db.get(SiteImage, slot)
+    if existing:
+        existing.url = res["url"]
+        existing.public_id = res["public_id"]
+        existing.updated_at = datetime.now(tz.utc)
+    else:
+        db.add(SiteImage(slot=slot, url=res["url"], public_id=res["public_id"]))
+
+    await log_action(db, admin.user_id, "upload_site_image", "site_images", target_id=slot)
+    await db.commit()
+    return {"ok": True, "slot": slot, "url": res["url"]}
+
+
+@router.delete("/site-images/{slot}")
+async def delete_site_image(
+    slot: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Quita la imagen de un espacio (la página vuelve a su estado sin foto)."""
+    from starlette.concurrency import run_in_threadpool
+    from app.services.cloudinary_service import delete_image_sync
+
+    row = await db.get(SiteImage, slot)
+    if not row:
+        raise HTTPException(404, "Ese espacio no tiene imagen")
+    if row.public_id:
+        await run_in_threadpool(delete_image_sync, row.public_id)
+    await db.delete(row)
+    await log_action(db, admin.user_id, "delete_site_image", "site_images", target_id=slot)
+    await db.commit()
+    return {"ok": True}
+
+
+# ============================================================================
+# V3.9.23 — TESTIMONIOS (la sección solo aparece si hay al menos uno activo)
+# ============================================================================
+
+@router.get("/testimonials")
+async def list_testimonials_admin(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (await db.execute(
+        select(Testimonial).order_by(Testimonial.sort_order, Testimonial.created_at)
+    )).scalars().all()
+    return {"items": [{
+        "id": t.id, "name": t.name, "role": t.role, "text": t.text,
+        "photo_url": t.photo_url, "rating": t.rating,
+        "is_active": t.is_active, "sort_order": t.sort_order,
+    } for t in rows]}
+
+
+@router.post("/testimonials", status_code=201)
+async def create_testimonial(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    name = (body.get("name") or "").strip()
+    text = (body.get("text") or "").strip()
+    if not name or not text:
+        raise HTTPException(400, "El nombre y el testimonio son obligatorios")
+    rating = body.get("rating", 5)
+    try:
+        rating = max(1, min(5, int(rating)))
+    except (TypeError, ValueError):
+        rating = 5
+
+    t = Testimonial(
+        name=name, role=(body.get("role") or "").strip() or None,
+        text=text, rating=rating,
+        is_active=bool(body.get("is_active", True)),
+        sort_order=int(body.get("sort_order") or 0),
+    )
+    db.add(t)
+    await log_action(db, admin.user_id, "create_testimonial", "testimonials", target_id=t.id)
+    await db.commit()
+    return {"id": t.id, "ok": True}
+
+
+@router.patch("/testimonials/{tid}")
+async def update_testimonial(
+    tid: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    t = await db.get(Testimonial, tid)
+    if not t:
+        raise HTTPException(404, "Testimonio no encontrado")
+    if "name" in body and (body["name"] or "").strip():
+        t.name = body["name"].strip()
+    if "role" in body:
+        t.role = (body["role"] or "").strip() or None
+    if "text" in body and (body["text"] or "").strip():
+        t.text = body["text"].strip()
+    if "rating" in body:
+        try:
+            t.rating = max(1, min(5, int(body["rating"])))
+        except (TypeError, ValueError):
+            pass
+    if "is_active" in body:
+        t.is_active = bool(body["is_active"])
+    if "sort_order" in body:
+        try:
+            t.sort_order = int(body["sort_order"])
+        except (TypeError, ValueError):
+            pass
+    await log_action(db, admin.user_id, "update_testimonial", "testimonials", target_id=tid)
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/testimonials/{tid}/photo")
+async def upload_testimonial_photo(
+    tid: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Foto del estudiante. Se muestra en círculo, así que conviene cuadrada."""
+    from starlette.concurrency import run_in_threadpool
+    from app.services.cloudinary_service import cloudinary_ready, upload_image_sync
+
+    t = await db.get(Testimonial, tid)
+    if not t:
+        raise HTTPException(404, "Testimonio no encontrado")
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(400, "El archivo debe ser una imagen")
+    if not cloudinary_ready():
+        raise HTTPException(503, "Falta configurar Cloudinary (variable CLOUDINARY_URL en Render)")
+
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "La imagen es muy pesada. El máximo son 10 MB.")
+
+    try:
+        res = await run_in_threadpool(
+            upload_image_sync, data, f"testimonial_{tid}", "dorismon/testimonials"
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Cloudinary rechazó la imagen: {e}")
+
+    t.photo_url = res["url"]
+    t.photo_public_id = res["public_id"]
+    await db.commit()
+    return {"ok": True, "url": res["url"]}
+
+
+@router.delete("/testimonials/{tid}")
+async def delete_testimonial(
+    tid: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from starlette.concurrency import run_in_threadpool
+    from app.services.cloudinary_service import delete_image_sync
+
+    t = await db.get(Testimonial, tid)
+    if not t:
+        raise HTTPException(404, "Testimonio no encontrado")
+    if t.photo_public_id:
+        await run_in_threadpool(delete_image_sync, t.photo_public_id)
+    await db.delete(t)
+    await log_action(db, admin.user_id, "delete_testimonial", "testimonials", target_id=tid)
+    await db.commit()
+    return {"ok": True}

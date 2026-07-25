@@ -263,3 +263,35 @@ async def list_public_plans(db: AsyncSession = Depends(get_db)):
             ],
         })
     return out
+
+
+# ============================================================================
+# V3.9.23 — CONTENIDO PÚBLICO DE LA LANDING (imágenes y testimonios)
+# ============================================================================
+
+@router.get("/site-images")
+async def get_site_images_public(db: AsyncSession = Depends(get_db)):
+    """Imágenes de la página pública. Devuelve {slot: url}.
+
+    Si un espacio no tiene imagen cargada, simplemente no aparece y la
+    landing usa su estado por defecto (no se rompe nada)."""
+    from app.models import SiteImage
+    rows = (await db.execute(select(SiteImage))).scalars().all()
+    return {r.slot: r.url for r in rows}
+
+
+@router.get("/testimonials")
+async def get_testimonials_public(db: AsyncSession = Depends(get_db)):
+    """Testimonios activos para la landing.
+
+    Si la lista vuelve vacía, la landing NO muestra la sección."""
+    from app.models import Testimonial
+    rows = (await db.execute(
+        select(Testimonial)
+        .where(Testimonial.is_active.is_(True))
+        .order_by(Testimonial.sort_order, Testimonial.created_at)
+    )).scalars().all()
+    return {"items": [{
+        "id": t.id, "name": t.name, "role": t.role,
+        "text": t.text, "photo_url": t.photo_url, "rating": t.rating,
+    } for t in rows]}

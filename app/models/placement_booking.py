@@ -674,6 +674,39 @@ class InstituteSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class SiteImage(Base):
+    """V3.9.23 — Imágenes de la página pública, subibles desde el admin.
+
+    Cada 'slot' es un espacio con nombre fijo en la landing (foto principal,
+    captura de la plataforma, etc). El admin sube la imagen, se guarda en
+    Cloudinary y aquí queda el enlace. Cambiar la foto NO requiere deploy.
+    """
+    __tablename__ = "site_images"
+    slot: Mapped[str] = mapped_column(String, primary_key=True)
+    url: Mapped[str] = mapped_column(String)
+    public_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Testimonial(Base):
+    """V3.9.23 — Testimonios reales de estudiantes para la landing.
+
+    La sección solo se muestra en la página cuando hay al menos uno activo:
+    si está vacía, no aparece y el diseño no se rompe.
+    """
+    __tablename__ = "testimonials"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String)
+    role: Mapped[str | None] = mapped_column(String, nullable=True)  # "Arquitecta", "Estudiante"
+    text: Mapped[str] = mapped_column(Text)
+    photo_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    photo_public_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    rating: Mapped[int] = mapped_column(Integer, default=5)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
 Index("ix_attendance_session", SessionAttendance.session_id)
 Index("ix_progress_student", LessonProgress.student_id)
