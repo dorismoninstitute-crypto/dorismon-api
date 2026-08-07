@@ -68,11 +68,49 @@ def upload_image_sync(file_bytes: bytes, public_id: str, folder: str = "dorismon
         overwrite=True,
         invalidate=True,
         resource_type="image",
-        # Optimización automática de formato y calidad
-        fetch_format="auto",
-        quality="auto:good",
     )
     return {"url": res.get("secure_url"), "public_id": res.get("public_id")}
+
+
+# Ancho máximo de entrega por espacio. Nadie necesita descargar una foto de
+# 4000 px para verla en un recuadro de 600.
+SLOT_MAX_WIDTH = {
+    "hero": 1200,
+    "og": 1200,
+    "platform": 1600,
+    "mini_class": 800,
+    "mini_progress": 800,
+    "mini_certificate": 800,
+    "group": 1200,
+    "cta": 900,
+}
+
+
+def optimized_url(url: str | None, width: int = 1200) -> str | None:
+    """V3.9.25 — Devuelve la URL optimizada de una imagen de Cloudinary.
+
+    EL PROBLEMA QUE RESUELVE: antes se guardaba la URL del archivo ORIGINAL.
+    Una foto de 3 MB sacada del celular se descargaba entera en cada visita,
+    y la página tardaba muchísimo en cargar.
+
+    Ahora se le pide a Cloudinary la versión servida:
+      f_auto  → el mejor formato para cada navegador (WebP/AVIF, mucho más liviano)
+      q_auto  → la calidad justa, sin diferencia visible
+      w_...   → el ancho que realmente se necesita
+      c_limit → nunca agranda una imagen pequeña (no se pixela)
+      dpr_auto→ nítida en pantallas de alta resolución
+
+    Se aplica al LEER, no al subir: así también arregla las imágenes que ya
+    estaban cargadas, sin tener que volver a subirlas.
+    """
+    if not url or "/upload/" not in url:
+        return url
+    transform = f"f_auto,q_auto,w_{width},c_limit,dpr_auto"
+    head, tail = url.split("/upload/", 1)
+    # Si ya venía con transformación aplicada, no la duplicamos
+    if tail.startswith("f_auto"):
+        return url
+    return f"{head}/upload/{transform}/{tail}"
 
 
 def delete_image_sync(public_id: str) -> bool:

@@ -276,8 +276,10 @@ async def get_site_images_public(db: AsyncSession = Depends(get_db)):
     Si un espacio no tiene imagen cargada, simplemente no aparece y la
     landing usa su estado por defecto (no se rompe nada)."""
     from app.models import SiteImage
+    from app.services.cloudinary_service import optimized_url, SLOT_MAX_WIDTH
     rows = (await db.execute(select(SiteImage))).scalars().all()
-    return {r.slot: r.url for r in rows}
+    # V3.9.25: se entrega la versión optimizada, no el archivo original pesado
+    return {r.slot: optimized_url(r.url, SLOT_MAX_WIDTH.get(r.slot, 1200)) for r in rows}
 
 
 @router.get("/testimonials")
@@ -291,7 +293,11 @@ async def get_testimonials_public(db: AsyncSession = Depends(get_db)):
         .where(Testimonial.is_active.is_(True))
         .order_by(Testimonial.sort_order, Testimonial.created_at)
     )).scalars().all()
+    from app.services.cloudinary_service import optimized_url
     return {"items": [{
         "id": t.id, "name": t.name, "role": t.role,
-        "text": t.text, "photo_url": t.photo_url, "rating": t.rating,
+        "text": t.text,
+        # V3.9.25: la foto se muestra en un círculo pequeño
+        "photo_url": optimized_url(t.photo_url, 200),
+        "rating": t.rating,
     } for t in rows]}

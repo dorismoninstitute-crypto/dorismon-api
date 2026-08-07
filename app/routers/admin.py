@@ -5067,7 +5067,7 @@ async def list_site_images(
 
     Devuelve también si Cloudinary está configurado, para que el panel
     pueda avisar en vez de fallar en silencio."""
-    from app.services.cloudinary_service import SITE_IMAGE_SLOTS, cloudinary_ready
+    from app.services.cloudinary_service import SITE_IMAGE_SLOTS, cloudinary_ready, optimized_url
 
     rows = (await db.execute(select(SiteImage))).scalars().all()
     current = {r.slot: r for r in rows}
@@ -5077,7 +5077,8 @@ async def list_site_images(
         row = current.get(spec["slot"])
         items.append({
             **spec,
-            "url": row.url if row else None,
+            # V3.9.25: vista previa liviana (el panel no necesita el original)
+            "url": optimized_url(row.url, 600) if row else None,
             "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
         })
     return {"items": items, "cloudinary_ready": cloudinary_ready()}
