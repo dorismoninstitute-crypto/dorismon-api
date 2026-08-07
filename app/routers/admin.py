@@ -1228,6 +1228,38 @@ async def issue_cert(
     for f in ("student_id", "course_id", "level_id"):
         if not body.get(f):
             raise HTTPException(400)
+    # V3.9.28 — Red de seguridad: avisar si el estudiante NO parece haber
+    # terminado el nivel. Se puede certificar igual (a veces hay razones),
+    # pero hay que confirmarlo a propósito, no por accidente.
+    if not body.get("confirmar_incompleto"):
+        enr = (await db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == body["student_id"],
+                Enrollment.course_id == body["course_id"],
+                Enrollment.level_id == body["level_id"],
+            )
+        )).scalar_one_or_none()
+        motivos = []
+        if not enr:
+            motivos.append("no está inscrito en ese nivel")
+        elif enr.is_active:
+            motivos.append("todavía está activo en ese nivel (no lo ha terminado)")
+        ya = (await db.execute(
+            select(Certificate).where(
+                Certificate.student_id == body["student_id"],
+                Certificate.level_id == body["level_id"],
+                Certificate.revoked.is_(False),
+            )
+        )).scalar_one_or_none()
+        if ya:
+            motivos.append(f"ya tiene un certificado de ese nivel ({ya.code})")
+        if motivos:
+            raise HTTPException(409, {
+                "necesita_confirmacion": True,
+                "motivos": motivos,
+                "mensaje": "Este estudiante " + " y ".join(motivos) + ".",
+            })
+
     c = Certificate(
         code=_generate_code(),
         student_id=body["student_id"], course_id=body["course_id"], level_id=body["level_id"],
@@ -1244,6 +1276,66 @@ async def issue_cert(
     await db.commit()
     await db.refresh(c)
     return {"id": c.id, "code": c.code}
+
+
+@router.post("/certificates/{cert_id}/revoke")
+async def revoke_cert(
+    cert_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.28 — Anular un certificado emitido por error.
+
+    NO se borra: queda el registro de que existió y fue anulado, con el
+    motivo y la fecha. Eso es lo correcto para un documento oficial.
+
+    Efectos: desaparece del panel del estudiante y su código deja de
+    verificar como válido.
+    """
+    c = await db.get(Certificate, cert_id)
+    if not c:
+        raise HTTPException(404, "Certificado no encontrado")
+    if c.revoked:
+        raise HTTPException(400, "Ese certificado ya está anulado")
+
+    motivo = (body.get("reason") or "").strip()
+    if not motivo:
+        raise HTTPException(400, "Indica el motivo de la anulación")
+
+    c.revoked = True
+    c.revoked_reason = motivo
+    c.revoked_at = datetime.now(tz.utc)
+
+    # Avisar al estudiante para que no quede con un certificado que ya no vale
+    db.add(Notification(
+        user_id=c.student_id, type=NotificationType.info,
+        title="Certificado anulado",
+        body=f"El certificado {c.code} fue anulado. Motivo: {motivo}. Si tienes dudas, escríbenos.",
+        link="/dashboard/student/certificates",
+    ))
+    await log_action(db, admin.user_id, "revoke_certificate", "admin",
+                     target_id=cert_id, details=motivo)
+    await db.commit()
+    return {"ok": True, "code": c.code}
+
+
+@router.post("/certificates/{cert_id}/restore")
+async def restore_cert(
+    cert_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Deshacer la anulación, por si también eso fue un error."""
+    c = await db.get(Certificate, cert_id)
+    if not c:
+        raise HTTPException(404, "Certificado no encontrado")
+    c.revoked = False
+    c.revoked_reason = None
+    c.revoked_at = None
+    await log_action(db, admin.user_id, "restore_certificate", "admin", target_id=cert_id)
+    await db.commit()
+    return {"ok": True}
 
 
 # === SETTINGS ===

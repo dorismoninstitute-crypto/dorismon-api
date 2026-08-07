@@ -181,6 +181,12 @@ async def init_db():
         # Las clases que ya existen quedan en "meet" (su enlace de siempre),
         # así nada cambia para las clases ya agendadas.
         # V3.9.27: la tabla video_presence la crea sola Base.metadata.create_all
+        v3928_migrations = [
+            "ALTER TABLE certificates ADD COLUMN IF NOT EXISTS revoked_reason VARCHAR",
+            "ALTER TABLE certificates ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ",
+        ]
+        migrations.extend(v3928_migrations)
+
         v3926_migrations = [
             "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS video_provider VARCHAR DEFAULT 'meet'",
             "UPDATE class_sessions SET video_provider = 'meet' WHERE video_provider IS NULL",

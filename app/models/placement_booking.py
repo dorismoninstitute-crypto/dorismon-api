@@ -506,6 +506,10 @@ class Certificate(Base):
     issued_at: Mapped[date] = mapped_column(Date, default=date.today)
     pdf_url: Mapped[str | None] = mapped_column(String, nullable=True)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    # V3.9.28: por qué se anuló y cuándo. No se borra el certificado: queda
+    # el registro de que existió y fue anulado (eso es lo correcto).
+    revoked_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Plan(Base):

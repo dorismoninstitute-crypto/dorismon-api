@@ -13,7 +13,7 @@ from app.models import (
     Assignment, AssignmentSubmission, Quiz, QuizAttempt, QuizQuestion, QuizAnswer,
     ClassSession, SessionAttendance, Certificate, Notification, Material,
     AttendanceState, QuestionType, AbsenceNotice, NotificationType, SessionStatus, UserRole,
-    Branch, Classroom, ClassConfirmation,
+    Branch, Classroom, ClassConfirmation, InstituteSetting,
 )
 from datetime import timezone as _tz, datetime as _dt, timedelta as _td
 
@@ -692,11 +692,17 @@ async def my_certificates(
         .where(Certificate.student_id == user.user_id, Certificate.revoked.is_(False))
         .order_by(Certificate.issued_at.desc())
     )).all()
+    # Datos del instituto para el certificado (nombre y firma)
+    ajustes = await db.get(InstituteSetting, 1)
+    yo = await db.get(User, user.user_id)
     return [{
         "id": c.id, "code": c.code, "course_name": course.name,
         "level_code": l.code, "level_name": l.name,
         "hours": c.hours, "final_grade": float(c.final_grade) if c.final_grade else None,
         "issued_at": c.issued_at.isoformat(), "color": course.color,
+        # V3.9.28: lo que hace falta para imprimir el certificado de verdad
+        "student_name": yo.full_name if yo else "",
+        "institute_name": (ajustes.name if ajustes else None) or "Dorismon Language Institute",
     } for c, course, l in certs]
 
 

@@ -158,12 +158,15 @@ async def mute_participant(session_id: str, identity: str, muted: bool = True) -
     parts = await list_participants(session_id)
     target = next((p for p in parts if p.get("identity") == identity), None)
     if not target:
+        log.warning("No se encontró a %s en la sala. Conectados: %s",
+                    identity, [p.get("identity") for p in parts])
         return False
     ok = False
     async with httpx.AsyncClient(timeout=10) as c:
         for track in target.get("tracks", []) or []:
-            # type 0 = audio en el protocolo de LiveKit
-            if track.get("type") not in (0, "AUDIO"):
+            # El tipo llega como texto ("AUDIO") o número (0) según la versión
+            tipo = track.get("type")
+            if tipo not in (0, "0", "AUDIO", "audio"):
                 continue
             r = await c.post(
                 f"{_http_base()}/twirp/livekit.RoomService/MutePublishedTrack",
@@ -171,7 +174,9 @@ async def mute_participant(session_id: str, identity: str, muted: bool = True) -
                 json={
                     "room": room_name(session_id),
                     "identity": identity,
-                    "track_sid": track.get("sid"),
+                    # LiveKit espera "trackSid" (no "track_sid"): este era el
+                    # bug por el que silenciar nunca funcionaba.
+                    "trackSid": track.get("sid"),
                     "muted": muted,
                 },
             )
