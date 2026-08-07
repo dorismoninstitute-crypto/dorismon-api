@@ -101,3 +101,93 @@ def build_token(
         "metadata": "teacher" if is_moderator else "student",
     }
     return jwt.encode(payload, api_secret, algorithm="HS256")
+
+
+# ============================================================================
+# V3.9.27 — Moderación de la sala (silenciar y sacar participantes)
+# ============================================================================
+
+def _admin_token() -> str:
+    """Permiso de administración para hablarle al servidor de LiveKit."""
+    api_key = (os.getenv("LIVEKIT_API_KEY") or "").strip()
+    api_secret = (os.getenv("LIVEKIT_API_SECRET") or "").strip()
+    if not api_key or not api_secret:
+        raise RuntimeError("LiveKit no está configurado")
+    now = int(time.time())
+    payload = {
+        "iss": api_key,
+        "sub": api_key,
+        "nbf": now - 10,
+        "exp": now + 600,
+        "video": {"roomAdmin": True, "roomList": True},
+    }
+    return jwt.encode(payload, api_secret, algorithm="HS256")
+
+
+def _http_base() -> str:
+    """El servidor de LiveKit para llamadas normales (no de video)."""
+    url = livekit_url() or ""
+    if url.startswith("wss://"):
+        return "https://" + url[len("wss://"):]
+    if url.startswith("ws://"):
+        return "http://" + url[len("ws://"):]
+    return url
+
+
+async def list_participants(session_id: str) -> list[dict]:
+    """Quiénes están conectados ahora mismo en la sala de esa clase."""
+    import httpx
+
+    token = _admin_token()
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(
+            f"{_http_base()}/twirp/livekit.RoomService/ListParticipants",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"room": room_name(session_id)},
+        )
+        if r.status_code != 200:
+            return []
+        return (r.json() or {}).get("participants", []) or []
+
+
+async def mute_participant(session_id: str, identity: str, muted: bool = True) -> bool:
+    """El profesor silencia (o deja hablar) a un participante."""
+    import httpx
+
+    token = _admin_token()
+    parts = await list_participants(session_id)
+    target = next((p for p in parts if p.get("identity") == identity), None)
+    if not target:
+        return False
+    ok = False
+    async with httpx.AsyncClient(timeout=10) as c:
+        for track in target.get("tracks", []) or []:
+            # type 0 = audio en el protocolo de LiveKit
+            if track.get("type") not in (0, "AUDIO"):
+                continue
+            r = await c.post(
+                f"{_http_base()}/twirp/livekit.RoomService/MutePublishedTrack",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "room": room_name(session_id),
+                    "identity": identity,
+                    "track_sid": track.get("sid"),
+                    "muted": muted,
+                },
+            )
+            ok = ok or r.status_code == 200
+    return ok
+
+
+async def remove_participant(session_id: str, identity: str) -> bool:
+    """El profesor saca a alguien de la clase."""
+    import httpx
+
+    token = _admin_token()
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(
+            f"{_http_base()}/twirp/livekit.RoomService/RemoveParticipant",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"room": room_name(session_id), "identity": identity},
+        )
+        return r.status_code == 200

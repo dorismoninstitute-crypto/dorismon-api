@@ -713,7 +713,31 @@ class Testimonial(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class VideoPresence(Base):
+    """V3.9.27 — Quién estuvo en la videollamada de una clase y cuánto tiempo.
+
+    PARA QUÉ SIRVE: con Google Meet el sistema no sabe nada de quién entró y
+    el profesor pasa lista a mano siempre. Aquí, como cada quien entra con su
+    cuenta de Dorismon, se registra la presencia y al abrir la asistencia los
+    que estuvieron vienen SUGERIDOS como presentes.
+
+    IMPORTANTE: es una sugerencia, no una decisión. El profesor confirma o
+    corrige; puede haber quien entró y se fue, o quien tuvo problemas de
+    conexión y participó por teléfono.
+    """
+    __tablename__ = "video_presence"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Se actualiza mientras la persona sigue conectada (cada ~1 minuto)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Minutos acumulados; es lo que decide si se sugiere "presente"
+    minutes: Mapped[int] = mapped_column(Integer, default=0)
+
+
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
+Index("ix_video_presence_session_user", VideoPresence.session_id, VideoPresence.user_id)
 Index("ix_attendance_session", SessionAttendance.session_id)
 Index("ix_progress_student", LessonProgress.student_id)
 

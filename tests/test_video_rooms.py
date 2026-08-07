@@ -133,6 +133,35 @@ async def main():
         ns = prog.get("next_session") or {}
         check("La próxima clase informa qué video usa", "video_provider" in ns)
 
+        # ---------- V3.9.27: moderación y asistencia sugerida ----------
+        h1 = await c.post(f"/video/sessions/{mia}/heartbeat", headers=SH)
+        h2 = await c.post(f"/video/sessions/{mia}/heartbeat", headers=SH)
+        check("El aviso de presencia responde", h1.status_code == 200)
+        check("Avisos seguidos NO inflan el tiempo", h2.json().get("minutes") == 0)
+
+        att = (await c.get(f"/teacher/sessions/{mia}/attendance", headers=TH)).json()
+        alumnos = att.get("students", [])
+        check("La asistencia trae la presencia del video",
+              any(s.get("video_minutes") is not None for s in alumnos))
+
+        r7 = await c.post(f"/video/sessions/{mia}/moderate", headers=SH,
+                          json={"action": "mute", "identity": "cualquiera"})
+        check("Un estudiante NO puede moderar", r7.status_code == 403)
+
+        r8 = await c.post(f"/video/sessions/{mia}/moderate", headers=TH,
+                          json={"action": "remove", "identity": profe["id"]})
+        check("No se puede sacar al profesor de su propia clase", r8.status_code == 400)
+
+        r9 = await c.post(f"/video/sessions/{mia}/moderate", headers=TH,
+                          json={"action": "accion_inventada", "identity": "x"})
+        check("Acción de moderación inválida rechazada", r9.status_code == 400)
+
+        r10 = await c.get(f"/video/sessions/{mia}/participants", headers=SH)
+        check("Un estudiante NO ve la lista de conectados", r10.status_code == 403)
+
+        r11 = await c.get(f"/video/sessions/{mia}/participants", headers=TH)
+        check("El profesor sí puede ver quién está conectado", r11.status_code == 200)
+
         # Limpieza
         for s in (mia, ajena, futura):
             await c.delete(f"/admin/sessions/{s}", headers=AH)

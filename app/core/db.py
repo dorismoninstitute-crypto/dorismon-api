@@ -180,6 +180,7 @@ async def init_db():
         # V3.9.26 — dónde ocurre el video de cada clase.
         # Las clases que ya existen quedan en "meet" (su enlace de siempre),
         # así nada cambia para las clases ya agendadas.
+        # V3.9.27: la tabla video_presence la crea sola Base.metadata.create_all
         v3926_migrations = [
             "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS video_provider VARCHAR DEFAULT 'meet'",
             "UPDATE class_sessions SET video_provider = 'meet' WHERE video_provider IS NULL",

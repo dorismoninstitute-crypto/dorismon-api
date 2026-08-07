@@ -14,6 +14,7 @@ from app.models import (
     Material, Observation, Notification, Student,
     AttendanceState, QuestionType, MaterialType, NotificationType, SessionStatus,
     Course, Level, UserRole, Branch, Classroom, EventRegistration, ClassConfirmation, TrialClass,
+    VideoPresence,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
@@ -317,6 +318,14 @@ async def get_attendance(
     )).all()
     confirmed_ids = {x for (x,) in conf_rows}
 
+    # V3.9.27: quiénes estuvieron en la videollamada y cuánto tiempo.
+    # Se usa para SUGERIR la asistencia; el profesor confirma o corrige.
+    MIN_PRESENTE = 10
+    pres_rows = (await db.execute(
+        select(VideoPresence).where(VideoPresence.session_id == session_id)
+    )).scalars().all()
+    presencia = {p.user_id: (p.minutes or 0) for p in pres_rows}
+
     out_students = []
     for e, u in rows:
         att = (await db.execute(
@@ -332,6 +341,9 @@ async def get_attendance(
             "state": att.state.value if att and att.state else None,
             "notes": att.notes if att else None,
             "confirmed": u.id in confirmed_ids,  # V3.9.21: confirmó que asistirá
+            # V3.9.27: presencia detectada en la videollamada
+            "video_minutes": presencia.get(u.id),
+            "video_suggests_present": (presencia.get(u.id, 0) >= MIN_PRESENTE) if u.id in presencia else None,
             # V3.0: aviso de ausencia del estudiante
             "absence_notice": ({
                 "reason": notice.reason,
