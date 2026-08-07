@@ -133,6 +133,7 @@ async def my_course_progress(
             "location": location,  # V3.0.3
             "status": next_session.status.value if next_session.status else "scheduled",  # V3.9.21
             "my_confirmed": my_conf is not None,  # V3.9.21
+            "video_provider": getattr(next_session, "video_provider", "meet") or "meet",  # V3.9.26
         }
 
     # Última clase asistida con notas del profe

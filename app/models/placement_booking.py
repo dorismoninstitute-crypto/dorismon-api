@@ -313,6 +313,12 @@ class ClassSession(Base):
     # V1.7: Serie y clase privada
     series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id", ondelete="SET NULL"), nullable=True)  # V1.7: pertenece a una serie
     student_id: Mapped[str | None] = mapped_column(ForeignKey("students.user_id"), nullable=True)  # V1.7: si está seteado = clase privada 1-a-1
+    # V3.9.26: dónde ocurre el video de esta clase.
+    #   "meet"     → el enlace de meeting_url (Google Meet, Zoom, el que sea)
+    #   "dorismon" → sala propia dentro de dorismon.com (LiveKit)
+    # Se guarda por clase para poder cambiar una sola sin tocar las demás,
+    # y para tener plan B si el video propio falla en vivo.
+    video_provider: Mapped[str] = mapped_column(String, default="meet", server_default="meet")
     counts_for_progress: Mapped[bool] = mapped_column(Boolean, default=True)  # V1.7: privadas pueden no contar para CEFR
     # V2.9: Recordatorios automáticos + cancelaciones del profe
     reminder_24h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

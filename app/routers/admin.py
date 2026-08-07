@@ -660,6 +660,7 @@ async def create_session(
         meeting_url=body.get("meeting_url"),
         branch_id=body.get("branch_id"), classroom_id=body.get("classroom_id"),
         capacity=body.get("capacity", 15),
+        video_provider=("dorismon" if body.get("video_provider") == "dorismon" else "meet"),  # V3.9.26
         module_id=body.get("module_id"),  # V1.5
         is_open_event=body.get("is_open_event", False),
     )
@@ -1586,6 +1587,9 @@ async def update_session(
             s.ends_at_utc = datetime.fromisoformat(value.replace("Z", "+00:00"))
         elif field == "modality" and value:
             s.modality = Modality(value)
+        elif field == "video_provider":
+            # V3.9.26: solo dos valores válidos; cualquier otra cosa cae en "meet"
+            s.video_provider = "dorismon" if value == "dorismon" else "meet"
         elif hasattr(s, field):
             setattr(s, field, value)
 

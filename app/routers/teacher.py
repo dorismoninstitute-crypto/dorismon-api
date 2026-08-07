@@ -100,6 +100,7 @@ async def teacher_dashboard(
             "status": s.status.value if s.status else "scheduled",  # V3.9.19
             "is_open_event": bool(s.is_open_event),  # V3.9.19: para etiqueta 🎉
             "is_trial": s.id in trial_session_ids,  # V3.9.21: para etiqueta 🎯 Prueba
+            "video_provider": getattr(s, "video_provider", "meet") or "meet",  # V3.9.26
         })
 
     # V1.8: Próximas clases de la semana (no solo hoy)
