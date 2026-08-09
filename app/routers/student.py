@@ -1,7 +1,7 @@
 """Student — dashboard, cursos inscritos, tareas, quizzes, expediente, calendario."""
 from typing import Annotated
 from datetime import datetime, date, timezone as tz, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1174,3 +1174,99 @@ async def request_trial_reschedule(
     await log_action(db, user.user_id, "request_trial_reschedule", "student")
     await db.commit()
     return {"ok": True, "message": "Solicitud enviada. Te contactaremos para coordinar la nueva fecha."}
+
+
+# ============================================================================
+# V3.9.30 — ENTREGAR TAREAS CON ARCHIVO O AUDIO
+# ============================================================================
+
+@router.post("/assignments/{assignment_id}/upload")
+async def upload_assignment_file(
+    assignment_id: int,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """El estudiante entrega su tarea como archivo: foto de su hoja, PDF o
+    una grabación de audio (para practicar pronunciación).
+
+    Se guarda en Cloudinary y queda enlazado a su entrega. El profesor lo ve
+    al calificar, sin salir de la plataforma.
+    """
+    from starlette.concurrency import run_in_threadpool
+    from app.services.cloudinary_service import cloudinary_ready, upload_image_sync
+
+    a = await db.get(Assignment, assignment_id)
+    if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+
+    tipo = (file.content_type or "").lower()
+    permitido = (
+        tipo.startswith("image/")
+        or tipo.startswith("audio/")
+        or tipo == "application/pdf"
+    )
+    if not permitido:
+        raise HTTPException(
+            400,
+            "Solo se admiten imágenes (foto de tu hoja), PDF o audio.",
+        )
+
+    if not cloudinary_ready():
+        raise HTTPException(
+            503,
+            "La subida de archivos no está disponible. Avísale a tu profesor.",
+        )
+
+    datos = await file.read()
+    if not datos:
+        raise HTTPException(400, "El archivo llegó vacío")
+    limite = 20 * 1024 * 1024
+    if len(datos) > limite:
+        raise HTTPException(400, "El archivo es muy pesado. El máximo son 20 MB.")
+
+    # Cloudinary guarda audio y PDF como "video"/"raw"; se marca el tipo
+    es_medio = tipo.startswith("audio/") or tipo == "application/pdf"
+    try:
+        res = await run_in_threadpool(
+            _subir_entrega, datos, f"entrega_{assignment_id}_{user.user_id}", es_medio
+        )
+    except Exception as e:
+        raise HTTPException(502, f"No se pudo subir el archivo: {e}")
+
+    sub = (await db.execute(
+        select(AssignmentSubmission).where(
+            AssignmentSubmission.assignment_id == assignment_id,
+            AssignmentSubmission.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+    if not sub:
+        sub = AssignmentSubmission(
+            assignment_id=assignment_id, student_id=user.user_id,
+            submitted_at=_dt.now(_tz.utc),
+        )
+        db.add(sub)
+    sub.file_url = res["url"]
+    sub.file_name = (file.filename or "entrega")[:120]
+    if not sub.submitted_at:
+        sub.submitted_at = _dt.now(_tz.utc)
+    await db.commit()
+    return {"ok": True, "file_url": sub.file_url, "file_name": sub.file_name}
+
+
+def _subir_entrega(datos: bytes, public_id: str, es_medio: bool) -> dict:
+    """Sube el archivo de una entrega. Audio y PDF necesitan otro modo."""
+    import cloudinary
+    import cloudinary.uploader
+    from app.services.cloudinary_service import _ensure_config
+
+    _ensure_config()
+    res = cloudinary.uploader.upload(
+        datos,
+        public_id=public_id,
+        folder="dorismon/entregas",
+        overwrite=True,
+        invalidate=True,
+        resource_type="auto" if es_medio else "image",
+    )
+    return {"url": res.get("secure_url"), "public_id": res.get("public_id")}

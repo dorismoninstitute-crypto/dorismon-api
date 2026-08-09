@@ -15,7 +15,7 @@ from app.models import (
     Enrollment, Branch, Classroom, ClassSession, ClassSeries, SessionAttendance,
     Assignment, AssignmentSubmission, Quiz, Material, Plan, Payment,
     Certificate, InstituteSetting, AuditLog, Notification, TeacherPayment,
-    SiteImage, Testimonial,
+    SiteImage, Testimonial, AlertAction, AbsenceNotice,
     UserRole, Modality, SessionStatus, MaterialType, PaymentStatus, NotificationType,
     PlanFeature, ModuleProgress, EventRegistration, AttendanceState,
     # V2.6: Pagos por transferencia + clase de prueba
@@ -615,6 +615,15 @@ async def list_admin_sessions(
     stmt = stmt.offset(offset).limit(limit)
 
     sessions = (await db.execute(stmt)).scalars().all()
+    # V3.9.30: cuáles de estas clases son clases de prueba
+    _ids = [s.id for s in sessions]
+    trial_ids = set()
+    if _ids:
+        _tr = (await db.execute(
+            select(TrialClass.session_id).where(TrialClass.session_id.in_(_ids))
+        )).all()
+        trial_ids = {x for (x,) in _tr if x}
+
     out = []
     for s in sessions:
         teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
@@ -630,6 +639,20 @@ async def list_admin_sessions(
             "branch_id": s.branch_id, "classroom_id": s.classroom_id,
             "meeting_url": s.meeting_url, "capacity": s.capacity,
             "status": s.status.value if s.status else "scheduled",
+            # V3.9.30 — para agrupar por tipo en el panel:
+            #   evento · prueba · privada · serie · suelta
+            "is_open_event": bool(s.is_open_event),
+            "is_private": s.student_id is not None,
+            "series_id": s.series_id,
+            "is_trial": s.id in trial_ids,
+            "kind": (
+                "event" if s.is_open_event
+                else "trial" if s.id in trial_ids
+                else "private" if s.student_id is not None
+                else "series" if s.series_id
+                else "single"
+            ),
+            "video_provider": getattr(s, "video_provider", "meet") or "meet",
         })
     return {"items": out, "page": page, "limit": limit, "filter_period": filter_period}
 
@@ -5541,3 +5564,230 @@ async def mark_contacted(
                      target_id=student_id, details=f"via={via}")
     await db.commit()
     return {"ok": True}
+
+
+# ============================================================================
+# V3.9.30 — ALERTAS QUE SE PUEDEN RESOLVER
+# ============================================================================
+
+@router.get("/alerts")
+async def get_alerts(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Lo que requiere atención HOY, agrupado y con salida.
+
+    Reglas para no generar ruido:
+    - Una falta suelta NO es alerta. Dos seguidas, sí.
+    - Si el estudiante avisó con tiempo, se marca aparte (no es urgente).
+    - Si el estudiante está en pausa a propósito, no aparece.
+    - Lo ya resuelto o descartado desaparece; lo pospuesto vuelve después.
+    - Si el estudiante vuelve a asistir, la alerta se resuelve SOLA.
+    """
+    now = datetime.now(tz.utc)
+
+    # Lo que el admin ya atendió
+    acciones = (await db.execute(select(AlertAction))).scalars().all()
+    ocultas = set()
+    for a in acciones:
+        if a.action in ("resolved", "dismissed"):
+            ocultas.add(a.alert_key)
+        elif a.action == "snoozed" and a.snooze_until:
+            hasta = a.snooze_until
+            if hasta.tzinfo is None:
+                hasta = hasta.replace(tzinfo=tz.utc)
+            if hasta > now:
+                ocultas.add(a.alert_key)
+
+    grupos = []
+
+    # ---------- Estudiantes con faltas seguidas ----------
+    desde = now - timedelta(days=21)
+    filas = (await db.execute(
+        select(SessionAttendance, ClassSession, User)
+        .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+        .join(User, SessionAttendance.student_id == User.id)
+        .where(ClassSession.starts_at_utc >= desde)
+        .order_by(ClassSession.starts_at_utc.desc())
+    )).all()
+
+    porestudiante: dict[str, list] = {}
+    for att, ses, u in filas:
+        porestudiante.setdefault(u.id, []).append((att, ses, u))
+
+    faltones = []
+    for uid, registros in porestudiante.items():
+        u = registros[0][2]
+        st = await db.get(Student, uid)
+        if st and st.is_paused:
+            continue  # en pausa a propósito
+        # Las más recientes primero
+        seguidas = 0
+        aviso_previo = False
+        for att, ses, _ in registros:
+            if att.state == AttendanceState.absent:
+                seguidas += 1
+            elif att.state == AttendanceState.present:
+                break  # volvió: se corta la racha (y la alerta muere sola)
+        if seguidas < 2:
+            continue
+        # ¿Avisó que faltaría?
+        avisos = (await db.execute(
+            select(func.count()).select_from(AbsenceNotice).where(
+                AbsenceNotice.student_id == uid,
+                AbsenceNotice.created_at >= desde,
+            )
+        )).scalar() or 0
+        aviso_previo = avisos > 0
+        clave = f"riesgo:{uid}"
+        if clave in ocultas:
+            continue
+        faltones.append({
+            "key": clave,
+            "student_id": uid,
+            "name": u.full_name,
+            "phone": u.phone,
+            "misses": seguidas,
+            "notified": aviso_previo,
+            "detail": (
+                f"{seguidas} ausencias seguidas"
+                + (" · avisó con tiempo" if aviso_previo else "")
+            ),
+            "urgency": "low" if aviso_previo else "high",
+        })
+
+    faltones.sort(key=lambda x: (x["urgency"] != "high", -x["misses"]))
+    if faltones:
+        grupos.append({
+            "type": "attendance_risk",
+            "title": (
+                "1 estudiante con ausencias seguidas" if len(faltones) == 1
+                else f"{len(faltones)} estudiantes con ausencias seguidas"
+            ),
+            "icon": "user-off",
+            "tone": "warning",
+            "items": faltones,
+        })
+
+    # ---------- Tareas esperando calificación ----------
+    pendientes = (await db.execute(
+        select(AssignmentSubmission, Assignment)
+        .join(Assignment, AssignmentSubmission.assignment_id == Assignment.id)
+        .where(
+            AssignmentSubmission.submitted_at.is_not(None),
+            AssignmentSubmission.score.is_(None),
+        )
+        .order_by(AssignmentSubmission.submitted_at)
+    )).all()
+    if pendientes:
+        primera = pendientes[0][0].submitted_at
+        if primera and primera.tzinfo is None:
+            primera = primera.replace(tzinfo=tz.utc)
+        dias = (now - primera).days if primera else 0
+        clave = "sin_calificar"
+        if clave not in ocultas:
+            grupos.append({
+                "type": "ungraded",
+                "title": (
+                    "1 tarea esperando calificación" if len(pendientes) == 1
+                    else f"{len(pendientes)} tareas esperando calificación"
+                ),
+                "subtitle": f"La más antigua lleva {dias} día{'s' if dias != 1 else ''}",
+                "icon": "file-check",
+                "tone": "accent",
+                "key": clave,
+                "count": len(pendientes),
+                "items": [],
+            })
+
+    # ---------- Clases sin asistencia registrada (no se cobran) ----------
+    hace7 = now - timedelta(days=7)
+    sesiones = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.ends_at_utc <= now,
+            ClassSession.ends_at_utc >= hace7,
+            ClassSession.status != SessionStatus.cancelled,
+        )
+    )).scalars().all()
+    ids = [s.id for s in sesiones]
+    con_asistencia = set()
+    if ids:
+        rows = (await db.execute(
+            select(SessionAttendance.session_id).where(
+                SessionAttendance.session_id.in_(ids),
+                SessionAttendance.state.is_not(None),
+            ).distinct()
+        )).all()
+        con_asistencia = {x for (x,) in rows}
+    sin_lista = [s for s in sesiones if s.id not in con_asistencia]
+    if sin_lista and "sin_asistencia" not in ocultas:
+        grupos.append({
+            "type": "no_attendance",
+            "title": (
+                "1 clase sin asistencia registrada" if len(sin_lista) == 1
+                else f"{len(sin_lista)} clases sin asistencia registrada"
+            ),
+            "subtitle": "Sin la lista, esas clases no cuentan para el pago del profesor",
+            "icon": "clipboard-x",
+            "tone": "warning",
+            "key": "sin_asistencia",
+            "count": len(sin_lista),
+            "items": [],
+        })
+
+    # Cuántas se resolvieron esta semana (motiva seguir usándolo)
+    semana = now - timedelta(days=7)
+    resueltas = (await db.execute(
+        select(func.count()).select_from(AlertAction).where(
+            AlertAction.created_at >= semana,
+            AlertAction.action.in_(["resolved", "dismissed"]),
+        )
+    )).scalar() or 0
+
+    total = sum(len(g.get("items") or []) or 1 for g in grupos)
+    return {"groups": grupos, "pending": total, "resolved_this_week": resueltas}
+
+
+@router.post("/alerts/action")
+async def act_on_alert(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolver, descartar o posponer una alerta.
+
+    - resolved:  ya lo atendí (le escribí, lo hablé)
+    - dismissed: no aplica, no quiero verlo
+    - snoozed:   recordámelo en X días
+    """
+    clave = (body.get("key") or "").strip()
+    accion = (body.get("action") or "").strip()
+    if not clave:
+        raise HTTPException(400, "Falta indicar la alerta")
+    if accion not in ("resolved", "dismissed", "snoozed"):
+        raise HTTPException(400, "Acción no válida")
+
+    hasta = None
+    if accion == "snoozed":
+        dias = body.get("days", 3)
+        try:
+            dias = max(1, min(30, int(dias)))
+        except (TypeError, ValueError):
+            dias = 3
+        hasta = datetime.now(tz.utc) + timedelta(days=dias)
+
+    # Si ya había una acción para esta alerta, se reemplaza
+    previa = (await db.execute(
+        select(AlertAction).where(AlertAction.alert_key == clave)
+    )).scalars().all()
+    for p in previa:
+        await db.delete(p)
+
+    db.add(AlertAction(
+        alert_key=clave, action=accion,
+        note=(body.get("note") or "")[:250] or None,
+        by_user_id=admin.user_id, snooze_until=hasta,
+    ))
+    await log_action(db, admin.user_id, f"alert_{accion}", "alerts", target_id=clave)
+    await db.commit()
+    return {"ok": True, "action": accion}

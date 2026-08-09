@@ -757,7 +757,30 @@ class PushSubscription(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AlertAction(Base):
+    """V3.9.30 — Lo que el admin ya hizo con una alerta.
+
+    EL PROBLEMA QUE RESUELVE: antes las alertas se quedaban ahí para siempre.
+    Una alerta que no se puede resolver deja de ser alerta y se vuelve ruido:
+    al tercer día nadie la mira, y tapa las que sí importan.
+
+    Ahora cada alerta tiene salida: resolverla, descartarla o posponerla.
+    Queda el registro de qué se hizo y cuándo.
+    """
+    __tablename__ = "alert_actions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    # Identifica la alerta: "riesgo:{student_id}", "sin_calificar:{teacher_id}"
+    alert_key: Mapped[str] = mapped_column(String, index=True)
+    action: Mapped[str] = mapped_column(String)  # resolved | dismissed | snoozed
+    note: Mapped[str | None] = mapped_column(String, nullable=True)
+    by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Para "posponer": hasta cuándo queda oculta
+    snooze_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
+Index("ix_alert_actions_key", AlertAction.alert_key)
 Index("ix_video_presence_session_user", VideoPresence.session_id, VideoPresence.user_id)
 Index("ix_attendance_session", SessionAttendance.session_id)
 Index("ix_progress_student", LessonProgress.student_id)
