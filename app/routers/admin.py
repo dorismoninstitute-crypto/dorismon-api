@@ -5601,8 +5601,12 @@ async def get_alerts(
 
     grupos = []
 
-    # ---------- Estudiantes con faltas seguidas ----------
-    desde = now - timedelta(days=21)
+    # ---------- Estudiantes con problema de asistencia ----------
+    # V3.9.31: se amplió la ventana a 60 días y se detectan DOS señales,
+    # porque con 21 días y solo faltas seguidas no se detectaba casi nada:
+    #   a) 2 o más ausencias SEGUIDAS (dejó de venir)
+    #   b) 3 o más ausencias en sus últimas 10 clases (viene salteado)
+    desde = now - timedelta(days=60)
     filas = (await db.execute(
         select(SessionAttendance, ClassSession, User)
         .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
@@ -5621,15 +5625,25 @@ async def get_alerts(
         st = await db.get(Student, uid)
         if st and st.is_paused:
             continue  # en pausa a propósito
-        # Las más recientes primero
+
+        # Las más recientes primero (la consulta viene ordenada así)
+        ultimas = registros[:10]
+
+        # Señal A: ausencias seguidas desde la clase más reciente.
+        # Si volvió a asistir, la racha se corta y la alerta muere sola.
         seguidas = 0
-        aviso_previo = False
-        for att, ses, _ in registros:
+        for att, _ses, _u in ultimas:
             if att.state == AttendanceState.absent:
                 seguidas += 1
             elif att.state == AttendanceState.present:
-                break  # volvió: se corta la racha (y la alerta muere sola)
-        if seguidas < 2:
+                break
+
+        # Señal B: cuántas faltó de sus últimas 10 clases
+        total_faltas = sum(
+            1 for att, _s, _u in ultimas if att.state == AttendanceState.absent
+        )
+
+        if seguidas < 2 and total_faltas < 3:
             continue
         # ¿Avisó que faltaría?
         avisos = (await db.execute(
@@ -5642,17 +5656,24 @@ async def get_alerts(
         clave = f"riesgo:{uid}"
         if clave in ocultas:
             continue
+        if seguidas >= 2:
+            detalle = f"{seguidas} ausencias seguidas"
+        else:
+            detalle = f"{total_faltas} faltas en sus últimas {len(ultimas)} clases"
+        if aviso_previo:
+            detalle += " · avisó con tiempo"
+
         faltones.append({
             "key": clave,
             "student_id": uid,
             "name": u.full_name,
+            "email": u.email,
             "phone": u.phone,
-            "misses": seguidas,
+            "misses": max(seguidas, total_faltas),
+            "consecutive": seguidas,
+            "total_absences": total_faltas,
             "notified": aviso_previo,
-            "detail": (
-                f"{seguidas} ausencias seguidas"
-                + (" · avisó con tiempo" if aviso_previo else "")
-            ),
+            "detail": detalle,
             "urgency": "low" if aviso_previo else "high",
         })
 

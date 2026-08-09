@@ -102,6 +102,24 @@ async def main():
                                 files={"file": ("t.jpg", b"\xff\xd8x", "image/jpeg")})
             check("Tarea inexistente devuelve 404", nada.status_code == 404)
 
+        # ---------- IA generadora de contenido (V3.9.31) ----------
+        st = await c.get("/ai/status", headers=AH)
+        check("El estado de la IA responde", st.status_code == 200)
+        configurada = bool(st.json().get("ready"))
+
+        v1 = await c.post("/ai/quiz", headers=AH, json={"topic": "", "level": "B1"})
+        check("Sin tema, la IA rechaza", v1.status_code == 400)
+
+        v2 = await c.post("/ai/quiz", headers=AH, json={"topic": "x", "level": "ZZ"})
+        check("Nivel inválido rechazado", v2.status_code == 400)
+
+        perm = await c.post("/ai/quiz", headers=SH, json={"topic": "x", "level": "B1"})
+        check("Un estudiante NO puede generar contenido", perm.status_code == 403)
+
+        if not configurada:
+            sin = await c.post("/ai/quiz", headers=AH, json={"topic": "Presente perfecto", "level": "B1"})
+            check("Sin clave, avisa con claridad", sin.status_code == 503)
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 
