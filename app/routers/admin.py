@@ -4802,6 +4802,23 @@ async def send_class_reminders(
                 except Exception:
                     pass
 
+        # V3.9.29: además del correo, avisar al teléfono de quien lo activó
+        try:
+            from app.services.push_service import notify_user
+            from zoneinfo import ZoneInfo as _ZI
+            _st = s.starts_at_utc
+            if _st and _st.tzinfo is None:
+                _st = _st.replace(tzinfo=tz.utc)
+            _hora = _st.astimezone(_ZI("America/Santo_Domingo")).strftime("%I:%M %p").lstrip("0") if _st else ""
+            for _sid in student_ids:
+                await notify_user(
+                    db, _sid, "📚 Tu clase es mañana",
+                    f"{s.title} — mañana a las {_hora}",
+                    "/dashboard/student", f"clase:{s.id}",
+                )
+        except Exception:
+            pass
+
         # Marcar como enviado (aunque algunos emails hayan fallado, evita reintentos infinitos)
         s.reminder_24h_sent_at = now
         sessions_processed += 1
@@ -4861,6 +4878,16 @@ async def send_class_reminders(
                     body=f"'{a.title}' vence el {due_txt}. ¡Aún estás a tiempo de entregarla!",
                     link=f"taskrem:{a.id}",
                 ))
+                # V3.9.29: y al teléfono
+                try:
+                    from app.services.push_service import notify_user
+                    await notify_user(
+                        db, st_id, "📝 Tu tarea vence mañana",
+                        f"{a.title} — vence el {due_txt}",
+                        "/dashboard/student/assignments", f"tarea:{a.id}",
+                    )
+                except Exception:
+                    pass
                 task_notifs += 1
             tasks_processed += 1
         await db.commit()
@@ -5383,5 +5410,134 @@ async def delete_testimonial(
         await run_in_threadpool(delete_image_sync, t.photo_public_id)
     await db.delete(t)
     await log_action(db, admin.user_id, "delete_testimonial", "testimonials", target_id=tid)
+    await db.commit()
+    return {"ok": True}
+
+
+# ============================================================================
+# V3.9.29 — REACTIVACIÓN: gente que ya mostró interés y se está perdiendo
+# ============================================================================
+
+@router.get("/reactivation")
+async def reactivation_panel(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    dias_inactivo: int = 21,
+):
+    """Las dos fugas de dinero del negocio, en un solo lugar:
+
+    1. LEADS FRÍOS: hicieron el test de nivel y NUNCA se inscribieron.
+       Ya mostraron interés; solo les faltó el empujón.
+    2. ESTUDIANTES APAGADOS: inscritos que no asisten hace semanas.
+       Cuesta mucho menos recuperar uno que conseguir uno nuevo.
+
+    Cada uno viene con su teléfono listo para escribirle por WhatsApp.
+    """
+    from app.models import PlacementTest
+
+    now = datetime.now(tz.utc)
+    hoy = date.today()
+
+    # ---------- 1. Hicieron el test y no se inscribieron ----------
+    q = (
+        select(PlacementTest, User, Student, Level)
+        .join(Student, PlacementTest.student_id == Student.user_id)
+        .join(User, Student.user_id == User.id)
+        .outerjoin(Level, PlacementTest.suggested_level_id == Level.id)
+        .where(PlacementTest.completed_at.is_not(None))
+        .order_by(PlacementTest.completed_at.desc())
+    )
+    rows = (await db.execute(q)).all()
+
+    leads = []
+    for test, u, s, lvl in rows:
+        inscrito = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.student_id == u.id, Enrollment.is_active.is_(True)
+            )
+        )).scalar() > 0
+        if inscrito:
+            continue
+        completado = test.completed_at
+        if completado and completado.tzinfo is None:
+            completado = completado.replace(tzinfo=tz.utc)
+        dias = (now - completado).days if completado else None
+        leads.append({
+            "student_id": u.id,
+            "name": u.full_name,
+            "email": u.email,
+            "phone": u.phone,
+            "level_code": lvl.code if lvl else None,
+            "days_ago": dias,
+            "completed_at": completado.isoformat() if completado else None,
+        })
+
+    # ---------- 2. Inscritos que dejaron de venir ----------
+    corte = now - timedelta(days=dias_inactivo)
+    activos = (await db.execute(
+        select(Enrollment, User, Student)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Student, Student.user_id == User.id)
+        .where(Enrollment.is_active.is_(True))
+    )).all()
+
+    vistos = set()
+    apagados = []
+    for enr, u, s in activos:
+        if u.id in vistos:
+            continue
+        vistos.add(u.id)
+        if s.is_paused:
+            continue  # está en pausa a propósito, no es un abandono
+        ultima = (await db.execute(
+            select(func.max(ClassSession.starts_at_utc))
+            .select_from(SessionAttendance)
+            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+            .where(
+                SessionAttendance.student_id == u.id,
+                SessionAttendance.state == AttendanceState.present,
+            )
+        )).scalar()
+        if ultima and ultima.tzinfo is None:
+            ultima = ultima.replace(tzinfo=tz.utc)
+        if ultima and ultima > corte:
+            continue  # vino hace poco, todo bien
+        apagados.append({
+            "student_id": u.id,
+            "name": u.full_name,
+            "email": u.email,
+            "phone": u.phone,
+            "last_class": ultima.isoformat() if ultima else None,
+            "days_ago": (now - ultima).days if ultima else None,
+            "never_attended": ultima is None,
+        })
+    apagados.sort(key=lambda x: (x["days_ago"] is None, -(x["days_ago"] or 0)))
+
+    return {
+        "leads": leads,
+        "inactive": apagados,
+        "dias_inactivo": dias_inactivo,
+        "totals": {"leads": len(leads), "inactive": len(apagados)},
+    }
+
+
+@router.post("/reactivation/{student_id}/contacted")
+async def mark_contacted(
+    student_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Deja constancia de que ya se le escribió, para no repetir el mensaje.
+
+    Se guarda en el registro de acciones, así queda el historial de a quién
+    se contactó y cuándo.
+    """
+    u = await db.get(User, student_id)
+    if not u:
+        raise HTTPException(404, "Estudiante no encontrado")
+    via = (body.get("via") or "whatsapp").strip()
+    await log_action(db, admin.user_id, "contacted_student", "reactivation",
+                     target_id=student_id, details=f"via={via}")
     await db.commit()
     return {"ok": True}

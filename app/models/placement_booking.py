@@ -740,6 +740,23 @@ class VideoPresence(Base):
     minutes: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class PushSubscription(Base):
+    """V3.9.29 — La 'dirección de entrega' del teléfono de una persona.
+
+    Cada dispositivo donde acepte recibir avisos genera una. Una misma
+    persona puede tener varias (su celular, su tablet, la computadora).
+    """
+    __tablename__ = "push_subscriptions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    endpoint: Mapped[str] = mapped_column(Text, unique=True)
+    p256dh: Mapped[str] = mapped_column(String)
+    auth: Mapped[str] = mapped_column(String)
+    device: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
 Index("ix_video_presence_session_user", VideoPresence.session_id, VideoPresence.user_id)
 Index("ix_attendance_session", SessionAttendance.session_id)
