@@ -930,6 +930,7 @@ async def list_enrollments(
             plan_name = p.name if p else None
         out.append({
             "id": e.id, "student_id": u.id, "student_name": u.full_name,
+            "series_id": getattr(e, "series_id", None),  # V3.9.33: su grupo
             "course_id": c.id, "course_name": c.name,
             "level_id": l.id, "level_code": l.code, "level_name": l.name,
             "teacher_id": e.teacher_id, "teacher_name": teacher_name,  # V1.5
@@ -1956,9 +1957,19 @@ async def add_plan_feature(
     admin: Annotated[CurrentUser, Depends(require_admin)],
     db: AsyncSession = Depends(get_db),
 ):
+    # V3.9.33 — EL BUG QUE ENCONTRÉ: antes solo se guardaba "feature" (el texto
+    # que lee el estudiante) y NUNCA "feature_key" (lo que de verdad desbloquea).
+    # Por eso podías escribir "Quizzes incluidos" en un plan y no pasaba nada.
+    from app.services.feature_gates import FEATURE_KEYS
+
+    llave = (body.get("feature_key") or "").strip() or None
+    if llave and llave not in FEATURE_KEYS:
+        raise HTTPException(400, f"Esa función no existe: {llave}")
+
     f = PlanFeature(
         plan_id=plan_id,
         feature=body.get("feature", ""),
+        feature_key=llave,
         is_included=body.get("is_included", True),
         order_index=body.get("order_index", 0),
     )
@@ -1977,6 +1988,13 @@ async def update_plan_feature(
     if not f: raise HTTPException(404)
     if "feature" in body: f.feature = body["feature"]
     if "is_included" in body: f.is_included = body["is_included"]
+    # V3.9.33: también se puede cambiar QUÉ desbloquea
+    if "feature_key" in body:
+        from app.services.feature_gates import FEATURE_KEYS
+        llave = (body.get("feature_key") or "").strip() or None
+        if llave and llave not in FEATURE_KEYS:
+            raise HTTPException(400, f"Esa función no existe: {llave}")
+        f.feature_key = llave
     await db.commit()
     return {"ok": True}
 
@@ -6134,3 +6152,195 @@ async def teacher_availability(
         "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
         "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
     } for s in filas], "count": len(filas)}
+
+
+# ============================================================================
+# V3.9.33 — GRUPOS: a qué horario pertenece cada estudiante
+# ============================================================================
+
+@router.get("/groups")
+async def list_groups(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Los grupos (series de clases) con cuánta gente tiene cada uno.
+
+    Con esto sabes de un vistazo: el B1 de la mañana tiene 4 de 6 cupos, el
+    de la noche está lleno. Antes no había forma de saberlo.
+    """
+    series = (await db.execute(
+        select(ClassSeries).order_by(ClassSeries.created_at.desc())
+    )).scalars().all()
+
+    out = []
+    for s in series:
+        inscritos = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.series_id == s.id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalar() or 0
+        curso = await db.get(Course, s.course_id) if s.course_id else None
+        nivel = await db.get(Level, s.level_id) if s.level_id else None
+        profe = await db.get(User, s.teacher_id) if s.teacher_id else None
+        cupo = s.capacity or 6
+        out.append({
+            "id": s.id,
+            "name": s.name,
+            "course_name": curso.name if curso else None,
+            "level_id": s.level_id,
+            "level_code": nivel.code if nivel else None,
+            "teacher_name": profe.full_name if profe else None,
+            "days_of_week": s.days_of_week,
+            "start_time_hhmm": s.start_time_hhmm,
+            "modality": s.modality.value if s.modality else None,
+            "students": inscritos,
+            "capacity": cupo,
+            "is_full": inscritos >= cupo,
+            "spots_left": max(0, cupo - inscritos),
+        })
+    return {"items": out}
+
+
+@router.get("/groups/{series_id}/students")
+async def group_students(
+    series_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Quiénes están en este grupo."""
+    rows = (await db.execute(
+        select(Enrollment, User)
+        .join(User, Enrollment.student_id == User.id)
+        .where(Enrollment.series_id == series_id, Enrollment.is_active.is_(True))
+        .order_by(User.full_name)
+    )).all()
+    return {"items": [{
+        "enrollment_id": e.id, "student_id": u.id,
+        "name": u.full_name, "email": u.email,
+    } for e, u in rows]}
+
+
+@router.post("/enrollments/{enrollment_id}/assign-group")
+async def assign_to_group(
+    enrollment_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Pone (o cambia) a un estudiante en un grupo.
+
+    Al asignarlo, deja de ver todas las clases de su nivel y solo ve las de
+    su grupo. Para sacarlo del grupo, se manda series_id vacío.
+
+    AVISA SI ESTÁ LLENO: se puede confirmar igual, pero a propósito.
+    """
+    enr = await db.get(Enrollment, enrollment_id)
+    if not enr:
+        raise HTTPException(404, "Inscripción no encontrada")
+
+    series_id = (body.get("series_id") or "").strip() or None
+
+    # Sacarlo del grupo
+    if not series_id:
+        enr.series_id = None
+        await log_action(db, admin.user_id, "unassign_group", "enrollments",
+                         target_id=enrollment_id)
+        await db.commit()
+        return {"ok": True, "assigned": False}
+
+    serie = await db.get(ClassSeries, series_id)
+    if not serie:
+        raise HTTPException(404, "Grupo no encontrado")
+
+    # Debe ser del mismo nivel, si no el estudiante vería clases que no le tocan
+    if serie.level_id != enr.level_id:
+        raise HTTPException(
+            400,
+            "Ese grupo es de otro nivel. Cambia primero el nivel del estudiante.",
+        )
+
+    if enr.series_id != series_id:
+        actuales = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.series_id == series_id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalar() or 0
+        cupo = serie.capacity or 6
+        if actuales >= cupo and not body.get("confirm_full"):
+            raise HTTPException(409, {
+                "necesita_confirmacion": True,
+                "mensaje": (
+                    f"El grupo '{serie.name}' ya tiene {actuales} de {cupo} cupos. "
+                    "¿Lo agregas igual?"
+                ),
+            })
+
+    enr.series_id = series_id
+    if serie.teacher_id:
+        enr.teacher_id = serie.teacher_id  # el profe del grupo pasa a ser el suyo
+
+    # Avisarle su horario
+    try:
+        from app.services.push_service import notify_user
+        dias_map = {"mon": "Lun", "tue": "Mar", "wed": "Mié", "thu": "Jue",
+                    "fri": "Vie", "sat": "Sáb", "sun": "Dom"}
+        dias = ", ".join(
+            dias_map.get(d.strip(), d)
+            for d in (serie.days_of_week or "").split(",") if d.strip()
+        )
+        try:
+            _h, _m = (serie.start_time_hhmm or "00:00").split(":")
+            hora = datetime(2000, 1, 1, int(_h), int(_m)).strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            hora = serie.start_time_hhmm or ""
+        cuerpo = f"Tu grupo es '{serie.name}': {dias} a las {hora}."
+        db.add(Notification(
+            user_id=enr.student_id, type=NotificationType.info,
+            title="👥 Ya tienes tu grupo y horario", body=cuerpo,
+            link="/dashboard/student",
+        ))
+        await notify_user(db, enr.student_id, "👥 Ya tienes tu grupo y horario",
+                          cuerpo, "/dashboard/student", f"grupo:{series_id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "assign_group", "enrollments",
+                     target_id=enrollment_id, details=series_id)
+    await db.commit()
+    return {"ok": True, "assigned": True, "group": serie.name}
+
+
+@router.get("/feature-keys")
+async def list_feature_keys(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+):
+    """Las funciones que un plan puede desbloquear, con nombre en español.
+
+    El panel muestra esta lista como casillas, para que no haya que escribir
+    la llave a mano (que era donde estaba el error).
+    """
+    catalogo = [
+        {"key": "grupal_classes", "label": "Clases grupales", "group": "Clases"},
+        {"key": "private_classes", "label": "Clases privadas 1 a 1", "group": "Clases"},
+        {"key": "assignments", "label": "Tareas con corrección", "group": "Aprendizaje"},
+        {"key": "quizzes", "label": "Quizzes evaluativos", "group": "Aprendizaje"},
+        {"key": "course_route", "label": "Ruta de curso personalizada", "group": "Aprendizaje"},
+        {"key": "placement_test", "label": "Test de nivel", "group": "Aprendizaje"},
+        {"key": "library_basic", "label": "Biblioteca básica", "group": "Materiales"},
+        {"key": "library_full", "label": "Biblioteca completa", "group": "Materiales"},
+        {"key": "materials_premium", "label": "Materiales descargables", "group": "Materiales"},
+        {"key": "certificates", "label": "Certificado al terminar el nivel", "group": "Extras"},
+        {"key": "events_view", "label": "Ver los eventos", "group": "Extras"},
+        {"key": "events_free", "label": "Entrar gratis a los eventos", "group": "Extras"},
+        {"key": "priority_support", "label": "Soporte prioritario", "group": "Extras"},
+    ]
+    # Lo que se recomienda incluir en TODOS los planes: si el profesor lo
+    # asigna en clase, todos deben poder abrirlo. Si la mitad del grupo no
+    # puede hacer el quiz que puso el profe, es un desastre en vivo.
+    basicas = {"grupal_classes", "assignments", "quizzes", "certificates",
+               "placement_test", "course_route", "events_view"}
+    for f in catalogo:
+        f["recommended_for_all"] = f["key"] in basicas
+    return {"items": catalogo}

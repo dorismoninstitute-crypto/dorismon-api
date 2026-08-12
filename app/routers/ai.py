@@ -90,3 +90,67 @@ async def crear_tarea(
         return await generar_tarea(tema, nivel)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
+
+
+@router.post("/quiz/create")
+async def crear_quiz_directo(
+    body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.33 — Genera el quiz Y LO GUARDA, listo para revisar y publicar.
+
+    ANTES había que generar, copiar y armarlo a mano en otra pantalla — medio
+    trabajo. Ahora el profesor genera, revisa y publica en un toque.
+
+    Se guarda SIN publicar: nadie lo ve hasta que el profesor lo apruebe.
+    """
+    from app.models import Quiz, QuizQuestion, QuestionType
+
+    u = await _solo_staff(user, db)
+    datos = body.get("quiz")
+    if not datos or not datos.get("questions"):
+        raise HTTPException(400, "Falta el quiz generado")
+
+    level_id = body.get("level_id")
+    if not level_id:
+        raise HTTPException(400, "Indica a qué nivel pertenece el quiz")
+
+    # El quiz queda a nombre de quien lo crea (si es admin, del profe indicado)
+    teacher_id = body.get("teacher_id") or user.user_id
+
+    q = Quiz(
+        title=str(datos.get("title") or "Quiz")[:150],
+        description=str(datos.get("description") or "")[:400],
+        level_id=int(level_id),
+        teacher_id=teacher_id,
+        is_published=False,  # el profesor lo revisa antes de publicarlo
+    )
+    db.add(q)
+    await db.flush()
+
+    guardadas = 0
+    for i, pregunta in enumerate(datos["questions"][:20]):
+        opciones = pregunta.get("options") or []
+        idx = pregunta.get("correct_index")
+        if len(opciones) != 4 or not isinstance(idx, int) or not (0 <= idx < 4):
+            continue
+        db.add(QuizQuestion(
+            quiz_id=q.id,
+            type=QuestionType.multiple_choice,
+            statement=str(pregunta.get("text") or "")[:500],
+            options=[str(o)[:200] for o in opciones],
+            correct_answer=str(opciones[idx])[:200],
+            points=10.0,
+            order_index=i,
+        ))
+        guardadas += 1
+
+    if guardadas == 0:
+        raise HTTPException(400, "Ninguna pregunta era válida. Genera de nuevo.")
+
+    await db.commit()
+    return {
+        "ok": True, "quiz_id": q.id, "title": q.title,
+        "questions": guardadas, "published": False,
+    }

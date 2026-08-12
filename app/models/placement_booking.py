@@ -264,6 +264,16 @@ class Enrollment(Base):
     level_id: Mapped[int] = mapped_column(ForeignKey("levels.id"))
     teacher_id: Mapped[str | None] = mapped_column(ForeignKey("teachers.user_id"), nullable=True)
     plan_id: Mapped[int | None] = mapped_column(ForeignKey("plans.id"), nullable=True)
+    # V3.9.33 — A qué GRUPO pertenece este estudiante.
+    #
+    # EL PROBLEMA QUE RESUELVE: antes el estudiante veía TODAS las clases de
+    # su nivel. Si tenías dos grupos de B1 (mañana y noche), todos los B1
+    # veían los dos horarios y no había forma de decir "María va al de la
+    # mañana".
+    #
+    # La serie de clases ES el grupo. Si queda vacío, el estudiante sigue
+    # viendo todo su nivel (así no se rompe nada de lo que ya existe).
+    series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id"), nullable=True)
     # V2.3: Modalidad de inscripción (online/presencial/hibrida)
     modality: Mapped[Modality] = mapped_column(default=Modality.online)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -429,6 +439,21 @@ class QuizAnswer(Base):
     points_earned: Mapped[float] = mapped_column(Numeric(5, 2), default=0.0)
 
 
+class AssignmentKind(str, enum.Enum):
+    """V3.9.33 — Los tipos de tarea que puede poner el profesor.
+
+    Antes solo existía "escribe tu respuesta". Para enseñar un idioma hace
+    falta más: sobre todo hablar y escuchar, que es lo que decide el nivel real.
+    """
+    written = "written"          # ✍️ Escribe su respuesta (el que ya existía)
+    file = "file"                # 📎 Sube foto de su hoja o un PDF
+    audio = "audio"              # 🎤 Graba su voz — practicar pronunciación
+    listening = "listening"      # 👂 Escucha un audio o video y responde
+    fill_blanks = "fill_blanks"  # ✏️ Completa los espacios (se califica solo)
+    link = "link"                # 🔗 Entrega un enlace
+    check = "check"              # ✅ Solo marcar como hecha (lecturas, repaso)
+
+
 class Assignment(Base):
     __tablename__ = "assignments"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -441,6 +466,13 @@ class Assignment(Base):
     max_score: Mapped[float] = mapped_column(Numeric(5, 2), default=100.0)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     allow_file_upload: Mapped[bool] = mapped_column(Boolean, default=True)
+    # V3.9.33 — Tipo de tarea y su contenido
+    kind: Mapped[AssignmentKind] = mapped_column(default=AssignmentKind.written,
+                                                 server_default="written")
+    # Para "escuchar y responder": el audio o video que deben escuchar
+    media_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Para "completar espacios": las frases y sus respuestas, en JSON
+    blanks_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

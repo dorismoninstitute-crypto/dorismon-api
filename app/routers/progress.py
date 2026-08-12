@@ -75,11 +75,24 @@ async def my_course_progress(
 
     # Próxima clase del estudiante
     # V1.7: filtrar grupales de su nivel + privadas asignadas a él
+    # V3.9.33 — Si el estudiante está asignado a un GRUPO (serie), solo ve las
+    # clases de ESE grupo. Antes veía todas las de su nivel: con dos grupos de
+    # B1 (mañana y noche), a todos les aparecían los dos horarios.
+    # Si no tiene grupo asignado, sigue viendo todo su nivel (compatibilidad).
+    _mi_grupo = getattr(enr, "series_id", None)
+    if _mi_grupo:
+        _condicion_grupal = (
+            (ClassSession.series_id == _mi_grupo) & (ClassSession.student_id.is_(None))
+        )
+    else:
+        _condicion_grupal = (
+            (ClassSession.level_id == enr.level_id) & (ClassSession.student_id.is_(None))
+        )
+
     next_session = (await db.execute(
         select(ClassSession).where(
             or_(
-                # Grupal del nivel correcto (no privada)
-                (ClassSession.level_id == enr.level_id) & (ClassSession.student_id.is_(None)),
+                _condicion_grupal,
                 # Privada para este estudiante
                 ClassSession.student_id == user.user_id,
             ),

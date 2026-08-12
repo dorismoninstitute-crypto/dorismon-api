@@ -49,6 +49,20 @@ async def _build_location(db: AsyncSession, session) -> dict | None:
     }
 
 
+
+
+def _leer_blanks_est(txt):
+    """Lee los ejercicios de completar espacios. Al estudiante NO se le manda
+    la respuesta correcta, solo el enunciado con el espacio."""
+    if not txt:
+        return None
+    import json as _json
+    try:
+        datos = _json.loads(txt)
+        return [{"text": b.get("text")} for b in datos if isinstance(b, dict)]
+    except Exception:
+        return None
+
 @router.get("/dashboard")
 async def student_dashboard(
     user: Annotated[CurrentUser, Depends(get_current_user)],
@@ -108,10 +122,16 @@ async def student_dashboard(
     # V1.7: condición compleja: (grupal de su nivel) OR (privada para él)
     if enrollments_rows:
         level_ids = [l.id for e, c, l in enrollments_rows]
+        # V3.9.33: los grupos (series) a los que pertenece
+        _mis_grupos = [e.series_id for e, c, l in enrollments_rows if getattr(e, "series_id", None)]
         next_sessions_stmt = next_sessions_stmt.where(
             or_(
                 # Grupales del nivel correcto (no privadas)
-                (ClassSession.level_id.in_(level_ids)) & (ClassSession.student_id.is_(None)),
+                # V3.9.33: si está en grupos, solo ve las clases de SUS grupos
+                (
+                    (ClassSession.series_id.in_(_mis_grupos)) if _mis_grupos
+                    else (ClassSession.level_id.in_(level_ids))
+                ) & (ClassSession.student_id.is_(None)),
                 # Privadas para este estudiante
                 ClassSession.student_id == user.user_id,
             )
@@ -268,6 +288,7 @@ async def student_dashboard(
     recent_cancelled = []
     cancelled_since = now - _td(days=7)
     level_ids_for_cancel = [l.id for e, c, l in enrollments_rows] if enrollments_rows else []
+    _mis_grupos_cancel = [e.series_id for e, c, l in enrollments_rows if getattr(e, "series_id", None)] if enrollments_rows else []
     cancel_stmt = (
         select(ClassSession)
         .where(
@@ -280,7 +301,11 @@ async def student_dashboard(
     if level_ids_for_cancel:
         cancel_stmt = cancel_stmt.where(
             or_(
-                (ClassSession.level_id.in_(level_ids_for_cancel)) & (ClassSession.student_id.is_(None)),
+                # V3.9.33: mismo filtro por grupo
+                (
+                    (ClassSession.series_id.in_(_mis_grupos_cancel)) if _mis_grupos_cancel
+                    else (ClassSession.level_id.in_(level_ids_for_cancel))
+                ) & (ClassSession.student_id.is_(None)),
                 ClassSession.student_id == user.user_id,
             )
         )
@@ -428,6 +453,10 @@ async def my_assignments(
             "instructions": a.instructions,
             "max_score": float(a.max_score),
             "due_at": a.due_at.isoformat() if a.due_at else None,
+            # V3.9.33 — Tipo de tarea: define cómo la entrega
+            "kind": (a.kind.value if a.kind else "written"),
+            "media_url": a.media_url,
+            "blanks": _leer_blanks_est(a.blanks_json),
             "submitted": bool(sub and sub.submitted_at),
             "graded": bool(sub and sub.graded_at),
             "score": float(sub.score) if sub and sub.score else None,

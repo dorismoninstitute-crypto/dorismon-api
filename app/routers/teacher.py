@@ -14,11 +14,52 @@ from app.models import (
     Material, Observation, Notification, Student,
     AttendanceState, QuestionType, MaterialType, NotificationType, SessionStatus,
     Course, Level, UserRole, Branch, Classroom, EventRegistration, ClassConfirmation, TrialClass,
-    VideoPresence,
+    VideoPresence, AssignmentKind,
 )
 
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
+
+
+
+def _tipo_tarea(valor) -> AssignmentKind:
+    """Convierte lo que llega del panel al tipo de tarea. Si no se reconoce,
+    queda como escrita (que es como funcionaba antes)."""
+    try:
+        return AssignmentKind(str(valor or "written"))
+    except ValueError:
+        return AssignmentKind.written
+
+
+def _blanks_json(blanks) -> str | None:
+    """Guarda los ejercicios de completar espacios.
+
+    Formato esperado: [{"text": "I ___ to school", "answer": "went"}, ...]
+    Se valida aquí para no guardar algo roto que después falle al calificar.
+    """
+    if not blanks or not isinstance(blanks, list):
+        return None
+    import json as _json
+    limpios = []
+    for b in blanks[:20]:
+        if not isinstance(b, dict):
+            continue
+        texto = str(b.get("text") or "").strip()
+        resp = str(b.get("answer") or "").strip()
+        if texto and resp:
+            limpios.append({"text": texto[:300], "answer": resp[:100]})
+    return _json.dumps(limpios, ensure_ascii=False) if limpios else None
+
+
+def _leer_blanks(txt):
+    """Lee los ejercicios de completar espacios guardados."""
+    if not txt:
+        return None
+    import json as _json
+    try:
+        return _json.loads(txt)
+    except Exception:
+        return None
 
 @router.get("/dashboard")
 async def teacher_dashboard(
@@ -603,6 +644,9 @@ async def list_assignments(
             "id": a.id, "title": a.title, "description": a.description,
             "max_score": float(a.max_score),
             "due_at": a.due_at.isoformat() if a.due_at else None,
+            "kind": (a.kind.value if a.kind else "written"),  # V3.9.33
+            "media_url": a.media_url,
+            "blanks": _leer_blanks(a.blanks_json),
             "level_id": a.level_id,
             "submitted": submitted, "graded": graded,
         })
@@ -625,6 +669,10 @@ async def create_assignment(
         lesson_id=body.get("lesson_id"),
         max_score=body.get("max_score", 100.0),
         due_at=datetime.fromisoformat(body["due_at"].replace("Z", "+00:00")) if body.get("due_at") else None,
+        # V3.9.33 — Tipo de tarea (escrita, audio, escuchar, completar...)
+        kind=_tipo_tarea(body.get("kind")),
+        media_url=(body.get("media_url") or "").strip() or None,
+        blanks_json=_blanks_json(body.get("blanks")),
     )
     db.add(a)
     await db.flush()
@@ -1180,3 +1228,36 @@ async def cancel_my_session(
         "students_notified": len(student_ids),
         "status": "cancelled",
     }
+
+
+@router.get("/my-levels")
+async def my_levels(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.33 — Los niveles donde este profesor da clase.
+
+    Sirve para saber dónde puede publicar un quiz o una tarea sin tener que
+    buscar entre todos los niveles del instituto.
+    """
+    filas = (await db.execute(
+        select(Level, Course)
+        .join(Course, Level.course_id == Course.id)
+        .join(ClassSession, ClassSession.level_id == Level.id)
+        .where(ClassSession.teacher_id == teacher.user_id)
+        .distinct()
+        .order_by(Level.order_index)
+    )).all()
+
+    # Si aún no tiene clases asignadas, mostrar todos (para no bloquearlo)
+    if not filas:
+        filas = (await db.execute(
+            select(Level, Course)
+            .join(Course, Level.course_id == Course.id)
+            .order_by(Level.order_index)
+        )).all()
+
+    return {"items": [{
+        "id": l.id, "code": l.code, "name": l.name,
+        "course_id": c.id, "course_name": c.name,
+    } for l, c in filas]}
