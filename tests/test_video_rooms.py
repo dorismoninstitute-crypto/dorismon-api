@@ -166,6 +166,44 @@ async def main():
         for s in (mia, ajena, futura):
             await c.delete(f"/admin/sessions/{s}", headers=AH)
 
+        # ---------- V3.9.32: video propio en TODOS los formularios ----------
+        import datetime as _d
+        hoy = _d.date.today().isoformat()
+        sr = await c.post("/admin/class-series", headers=AH, json={
+            "name": "Test Serie Video", "course_id": cid, "level_id": mi_nivel["id"],
+            "teacher_id": profe["id"], "days_of_week": "mon,wed",
+            "start_time_hhmm": "18:00", "duration_min": 60, "start_date": hoy,
+            "num_classes": 2, "modality": "online", "video_provider": "dorismon",
+        })
+        check("Una serie puede usar el video propio", sr.status_code == 201)
+
+        pv = await c.post("/admin/private-classes", headers=AH, json={
+            "student_id": mu["items"][0]["id"], "teacher_id": profe["id"],
+            "course_id": cid, "level_id": mi_nivel["id"], "title": "Test Privada Video",
+            "starts_at_utc": (now + _d.timedelta(days=1)).isoformat(),
+            "duration_min": 60, "modality": "online", "video_provider": "dorismon",
+        })
+        check("Una clase privada puede usar el video propio", pv.status_code == 201)
+
+        # ---------- V3.9.32: cambiar de profesor ----------
+        sl = (await c.get("/admin/class-series", headers=AH)).json()
+        slist = sl["items"] if isinstance(sl, dict) else sl
+        mia_serie = [s for s in slist if s.get("name") == "Test Serie Video"]
+        otros = [p for p in profes["items"]
+                 if p["email"] in SEED_TEACHERS and p["id"] != profe["id"]]
+        if mia_serie and otros:
+            ch = await c.post(f"/admin/class-series/{mia_serie[0]['id']}/change-teacher",
+                              headers=AH, json={"teacher_id": otros[0]["id"],
+                                                "confirm_overlap": True})
+            check("Se puede cambiar el profesor de una serie", ch.status_code == 200)
+
+            igual = await c.post(f"/admin/class-series/{mia_serie[0]['id']}/change-teacher",
+                                 headers=AH, json={"teacher_id": otros[0]["id"]})
+            check("No deja poner el mismo profesor que ya tenía", igual.status_code == 400)
+
+            av = await c.get(f"/admin/teachers/{otros[0]['id']}/availability", headers=AH)
+            check("Se puede consultar la disponibilidad de un profesor", av.status_code == 200)
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 

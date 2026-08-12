@@ -657,6 +657,62 @@ async def list_admin_sessions(
     return {"items": out, "page": page, "limit": limit, "filter_period": filter_period}
 
 
+
+
+async def _avisar_clase_nueva(db, s, es_serie: bool = False):
+    """V3.9.32 — Avisa a los estudiantes Y al profesor que hay clase nueva.
+
+    Antes no se avisaba nada: la clase aparecía en el calendario y nadie se
+    enteraba hasta el recordatorio de 24 horas. Si programabas una clase para
+    mañana temprano, el estudiante podía no verla nunca.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    try:
+        from app.services.push_service import notify_user
+
+        st = s.starts_at_utc
+        if st and st.tzinfo is None:
+            st = st.replace(tzinfo=tz.utc)
+        local = st.astimezone(_ZI("America/Santo_Domingo")) if st else None
+        cuando = local.strftime("%d/%m a las %I:%M %p").lstrip("0") if local else ""
+
+        # ¿A quién le toca esta clase?
+        destinatarios: set[str] = set()
+        if s.student_id:
+            destinatarios.add(s.student_id)
+        elif not s.is_open_event:
+            rows = (await db.execute(
+                select(Enrollment.student_id).where(
+                    Enrollment.course_id == s.course_id,
+                    Enrollment.level_id == s.level_id,
+                    Enrollment.is_active.is_(True),
+                )
+            )).all()
+            destinatarios |= {x for (x,) in rows}
+
+        titulo = "📅 Serie de clases programada" if es_serie else "📅 Tienes una clase nueva"
+        cuerpo = f"'{s.title}' — {cuando}"
+
+        for uid in destinatarios:
+            db.add(Notification(
+                user_id=uid, type=NotificationType.info,
+                title=titulo, body=cuerpo, link="/dashboard/student",
+            ))
+            await notify_user(db, uid, titulo, cuerpo, "/dashboard/student", f"nueva:{s.id}")
+
+        # Y al profesor, que hoy casi no recibe avisos
+        if s.teacher_id:
+            db.add(Notification(
+                user_id=s.teacher_id, type=NotificationType.info,
+                title="📅 Te asignaron una clase", body=cuerpo,
+                link="/dashboard/teacher",
+            ))
+            await notify_user(db, s.teacher_id, "📅 Te asignaron una clase",
+                              cuerpo, "/dashboard/teacher", f"nueva:{s.id}")
+        await db.commit()
+    except Exception:
+        pass  # un fallo avisando nunca debe impedir crear la clase
+
 @router.post("/sessions", status_code=201)
 async def create_session(
     body: dict,
@@ -706,6 +762,7 @@ async def create_session(
 
     await log_action(db, admin.user_id, "create_session", "admin", target_id=s.id)
     await db.commit()
+    await _avisar_clase_nueva(db, s)  # V3.9.32
     return {"id": s.id}
 
 
@@ -774,6 +831,7 @@ async def create_open_event(
         starts_at_utc=starts_at,
         ends_at_utc=ends_at,
         meeting_url=body.get("meeting_url"),
+        video_provider=("dorismon" if body.get("video_provider") == "dorismon" else "meet"),  # V3.9.32
         branch_id=body.get("branch_id"),
         classroom_id=body.get("classroom_id"),
         capacity=int(body.get("capacity", 30)),
@@ -2905,6 +2963,8 @@ async def create_class_series(
     admin: Annotated[CurrentUser, Depends(require_admin)],
     db: AsyncSession = Depends(get_db),
 ):
+    # V3.9.32: dónde ocurre el video de toda la serie
+    _vp = "dorismon" if body.get("video_provider") == "dorismon" else "meet"
     """V1.7: Crea una serie recurrente y genera N clases automáticamente.
 
     Body:
@@ -3019,6 +3079,7 @@ async def create_class_series(
             capacity=body.get("capacity", 15),
             module_id=mod_id,
             series_id=series.id,
+            video_provider=_vp,  # V3.9.32
         )
         db.add(session)
         created_classes += 1
@@ -3339,6 +3400,7 @@ async def create_private_class(
         starts_at_utc=starts_at,
         ends_at_utc=ends_at,
         meeting_url=body.get("meeting_url"),
+        video_provider=("dorismon" if body.get("video_provider") == "dorismon" else "meet"),  # V3.9.32
         branch_id=body.get("branch_id"),
         classroom_id=body.get("classroom_id"),
         capacity=1,  # privada → siempre 1
@@ -4917,11 +4979,99 @@ async def send_class_reminders(
     except Exception:
         pass
 
+    # ========================================================================
+    # V3.9.32 — AVISO DE 30 MINUTOS ANTES ("prepárate, ya casi empieza")
+    # ========================================================================
+    # Se busca en una ventana amplia (10 a 45 min) para que funcione aunque
+    # el cron corra cada 15 minutos y no justo en el minuto exacto.
+    # El campo reminder_30m_sent_at evita repetirlo.
+    pronto_procesadas = 0
+    pronto_avisos = 0
+    try:
+        from app.services.push_service import notify_user
+        from zoneinfo import ZoneInfo as _ZI
+
+        desde = now + timedelta(minutes=10)
+        hasta = now + timedelta(minutes=45)
+        proximas = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.starts_at_utc >= desde,
+                ClassSession.starts_at_utc <= hasta,
+                ClassSession.status == SessionStatus.scheduled,
+                ClassSession.reminder_30m_sent_at.is_(None),
+            )
+        )).scalars().all()
+
+        for s in proximas:
+            _st = s.starts_at_utc
+            if _st and _st.tzinfo is None:
+                _st = _st.replace(tzinfo=tz.utc)
+            minutos = int((_st - now).total_seconds() // 60) if _st else 30
+            hora_txt = (
+                _st.astimezone(_ZI("America/Santo_Domingo")).strftime("%I:%M %p").lstrip("0")
+                if _st else ""
+            )
+
+            # ¿Quiénes deben recibirlo?
+            destinatarios: set[str] = set()
+            if s.student_id:
+                destinatarios.add(s.student_id)  # privada o de prueba
+            elif s.is_open_event:
+                regs = (await db.execute(
+                    select(EventRegistration.student_id).where(
+                        EventRegistration.session_id == s.id,
+                        EventRegistration.cancelled_at.is_(None),
+                    )
+                )).all()
+                destinatarios |= {x for (x,) in regs}
+            else:
+                enr = (await db.execute(
+                    select(Enrollment.student_id).where(
+                        Enrollment.course_id == s.course_id,
+                        Enrollment.level_id == s.level_id,
+                        Enrollment.is_active.is_(True),
+                    )
+                )).all()
+                destinatarios |= {x for (x,) in enr}
+
+            cuerpo = f"'{s.title}' empieza a las {hora_txt}. ¡Prepárate!"
+            for uid in destinatarios:
+                db.add(Notification(
+                    user_id=uid, type=NotificationType.info,
+                    title=f"⏰ Tu clase empieza en {minutos} minutos",
+                    body=cuerpo, link="/dashboard/student",
+                ))
+                await notify_user(
+                    db, uid, f"⏰ Tu clase empieza en {minutos} minutos",
+                    cuerpo, "/dashboard/student", f"pronto:{s.id}",
+                )
+                pronto_avisos += 1
+
+            # Al profesor también: hoy casi no recibe avisos
+            if s.teacher_id:
+                db.add(Notification(
+                    user_id=s.teacher_id, type=NotificationType.info,
+                    title=f"⏰ Tu clase empieza en {minutos} minutos",
+                    body=cuerpo, link="/dashboard/teacher",
+                ))
+                await notify_user(
+                    db, s.teacher_id, f"⏰ Tu clase empieza en {minutos} minutos",
+                    cuerpo, "/dashboard/teacher", f"pronto:{s.id}",
+                )
+                pronto_avisos += 1
+
+            s.reminder_30m_sent_at = now
+            pronto_procesadas += 1
+        await db.commit()
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "sessions_processed": sessions_processed,
         "emails_sent": total_emails_sent,
         "task_reminders": {"assignments": tasks_processed, "notified": task_notifs},
+        "starting_soon": {"classes": pronto_procesadas, "notified": pronto_avisos},
         "now_utc": now.isoformat(),
     }
 
@@ -5812,3 +5962,175 @@ async def act_on_alert(
     await log_action(db, admin.user_id, f"alert_{accion}", "alerts", target_id=clave)
     await db.commit()
     return {"ok": True, "action": accion}
+
+
+# ============================================================================
+# V3.9.32 — CAMBIAR EL PROFESOR DE UNA SERIE (cuando uno no está disponible)
+# ============================================================================
+
+@router.post("/class-series/{series_id}/change-teacher")
+async def change_series_teacher(
+    series_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Pasa las clases futuras de una serie a otro profesor.
+
+    ANTES había que editar clase por clase. Si un profesor se enfermaba una
+    semana, eran diez ediciones a mano.
+
+    AVISA DE CHOQUES: si el profesor nuevo ya tiene clase a esa hora, lo dice
+    ANTES de hacer el cambio. Se puede confirmar igual (a veces hay razones),
+    pero a propósito, no por accidente.
+    """
+    series = await db.get(ClassSeries, series_id)
+    if not series:
+        raise HTTPException(404, "Serie no encontrada")
+
+    nuevo_id = (body.get("teacher_id") or "").strip()
+    if not nuevo_id:
+        raise HTTPException(400, "Indica el profesor nuevo")
+    if nuevo_id == series.teacher_id:
+        raise HTTPException(400, "Ese ya es el profesor de la serie")
+
+    nuevo = await db.get(User, nuevo_id)
+    if not nuevo or nuevo.role != UserRole.teacher:
+        raise HTTPException(404, "Profesor no encontrado")
+
+    now = datetime.now(tz.utc)
+    desde = now
+    if body.get("from_date"):
+        try:
+            desde = datetime.fromisoformat(body["from_date"].replace("Z", "+00:00"))
+        except ValueError:
+            pass
+
+    futuras = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.series_id == series_id,
+            ClassSession.starts_at_utc >= desde,
+            ClassSession.status != SessionStatus.cancelled,
+        ).order_by(ClassSession.starts_at_utc)
+    )).scalars().all()
+
+    if not futuras:
+        raise HTTPException(400, "Esta serie no tiene clases futuras que cambiar")
+
+    # ¿El profesor nuevo ya está ocupado en alguna de esas horas?
+    choques = []
+    for s in futuras:
+        ini, fin = s.starts_at_utc, s.ends_at_utc
+        if not ini or not fin:
+            continue
+        ocupado = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.teacher_id == nuevo_id,
+                ClassSession.id != s.id,
+                ClassSession.status != SessionStatus.cancelled,
+                ClassSession.starts_at_utc < fin,
+                ClassSession.ends_at_utc > ini,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if ocupado:
+            local = ini.replace(tzinfo=tz.utc) if ini.tzinfo is None else ini
+            choques.append({
+                "session_id": s.id,
+                "starts_at_utc": local.isoformat(),
+                "conflict_title": ocupado.title,
+            })
+
+    if choques and not body.get("confirm_overlap"):
+        raise HTTPException(409, {
+            "necesita_confirmacion": True,
+            "conflicts": choques[:5],
+            "mensaje": (
+                f"{nuevo.full_name} ya tiene clase a esa hora en "
+                f"{len(choques)} de las {len(futuras)} fechas."
+            ),
+        })
+
+    anterior = await db.get(User, series.teacher_id) if series.teacher_id else None
+    for s in futuras:
+        s.teacher_id = nuevo_id
+    series.teacher_id = nuevo_id
+
+    # Avisar a los tres lados
+    try:
+        from app.services.push_service import notify_user
+        cuerpo = f"'{series.name}': ahora la imparte {nuevo.full_name}."
+
+        db.add(Notification(
+            user_id=nuevo_id, type=NotificationType.info,
+            title="📅 Te asignaron una serie de clases",
+            body=f"'{series.name}' — {len(futuras)} clases.",
+            link="/dashboard/teacher",
+        ))
+        await notify_user(db, nuevo_id, "📅 Te asignaron una serie de clases",
+                          f"'{series.name}' — {len(futuras)} clases.",
+                          "/dashboard/teacher", f"serie:{series_id}")
+
+        if anterior:
+            db.add(Notification(
+                user_id=anterior.id, type=NotificationType.info,
+                title="📅 Ya no impartes esta serie",
+                body=f"'{series.name}' pasó a {nuevo.full_name}.",
+                link="/dashboard/teacher",
+            ))
+
+        estudiantes = (await db.execute(
+            select(Enrollment.student_id).where(
+                Enrollment.course_id == series.course_id,
+                Enrollment.level_id == series.level_id,
+                Enrollment.is_active.is_(True),
+            )
+        )).all()
+        for (uid,) in estudiantes:
+            db.add(Notification(
+                user_id=uid, type=NotificationType.info,
+                title="👨‍🏫 Cambio de profesor", body=cuerpo,
+                link="/dashboard/student",
+            ))
+            await notify_user(db, uid, "👨‍🏫 Cambio de profesor", cuerpo,
+                              "/dashboard/student", f"profe:{series_id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "change_series_teacher", "sessions",
+                     target_id=series_id,
+                     details=f"{series.teacher_id} → {nuevo_id}, {len(futuras)} clases")
+    await db.commit()
+    return {
+        "ok": True,
+        "changed": len(futuras),
+        "teacher": nuevo.full_name,
+        "had_conflicts": len(choques),
+    }
+
+
+@router.get("/teachers/{teacher_id}/availability")
+async def teacher_availability(
+    teacher_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    days: int = 14,
+):
+    """Qué tiene ocupado un profesor en los próximos días.
+
+    Sirve para decidir a quién pasarle una clase sin cruzarle el horario.
+    """
+    now = datetime.now(tz.utc)
+    hasta = now + timedelta(days=max(1, min(60, days)))
+    filas = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.teacher_id == teacher_id,
+            ClassSession.starts_at_utc >= now,
+            ClassSession.starts_at_utc <= hasta,
+            ClassSession.status != SessionStatus.cancelled,
+        ).order_by(ClassSession.starts_at_utc)
+    )).scalars().all()
+    return {"items": [{
+        "id": s.id, "title": s.title,
+        "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+        "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
+    } for s in filas], "count": len(filas)}

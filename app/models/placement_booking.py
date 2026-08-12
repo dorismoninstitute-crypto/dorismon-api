@@ -322,6 +322,8 @@ class ClassSession(Base):
     counts_for_progress: Mapped[bool] = mapped_column(Boolean, default=True)  # V1.7: privadas pueden no contar para CEFR
     # V2.9: Recordatorios automáticos + cancelaciones del profe
     reminder_24h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # V3.9.32: aviso de "tu clase empieza en 30 minutos" (para prepararse)
+    reminder_30m_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancellation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancelled_by_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
