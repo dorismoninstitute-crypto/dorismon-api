@@ -61,6 +61,61 @@ def _leer_blanks(txt):
     except Exception:
         return None
 
+
+
+async def _avisar_quiz_publicado(db, q, preguntas: int) -> int:
+    """V3.9.34 — Avisa a los estudiantes que hay un quiz nuevo.
+
+    Antes el quiz aparecía en silencio: nadie se enteraba salvo que entrara
+    por casualidad. Ahora llega a la campana, al teléfono y por correo.
+    """
+    from app.services.push_service import notify_user
+    from app.services.email_service import send_email
+
+    if not q.level_id:
+        return 0
+
+    filas = (await db.execute(
+        select(Enrollment.student_id, User.email, User.full_name)
+        .join(User, Enrollment.student_id == User.id)
+        .where(
+            Enrollment.level_id == q.level_id,
+            Enrollment.is_active.is_(True),
+        ).distinct()
+    )).all()
+
+    titulo = "📝 Nuevo quiz disponible"
+    cuerpo = f"'{q.title}' — {preguntas} preguntas. ¡Ponte a prueba!"
+    avisados = 0
+
+    for uid, email, nombre in filas:
+        db.add(Notification(
+            user_id=uid, type=NotificationType.info,
+            title=titulo, body=cuerpo, link="/dashboard/student/quizzes",
+        ))
+        try:
+            await notify_user(db, uid, titulo, cuerpo,
+                              "/dashboard/student/quizzes", f"quiz:{q.id}")
+        except Exception:
+            pass
+        try:
+            if email:
+                await send_email(
+                    to=email,
+                    subject=f"Nuevo quiz: {q.title}",
+                    html=(
+                        f"<p>Hola {nombre or ''},</p>"
+                        f"<p>Tu profesor publicó un nuevo quiz: "
+                        f"<strong>{q.title}</strong> ({preguntas} preguntas).</p>"
+                        f"<p>Entra a la plataforma para responderlo.</p>"
+                        f"<p>— Dorismon Language Institute</p>"
+                    ),
+                )
+        except Exception:
+            pass
+        avisados += 1
+    return avisados
+
 @router.get("/dashboard")
 async def teacher_dashboard(
     teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
@@ -822,7 +877,16 @@ async def create_quiz(
         ))
     await log_action(db, teacher.user_id, "create_quiz", "teacher", target_id=str(q.id))
     await db.commit()
-    return {"id": q.id, "title": q.title}
+
+    # V3.9.34 — Avisar a los estudiantes del nivel (el quiz nace publicado)
+    avisados = 0
+    if q.is_published and len(questions) > 0:
+        try:
+            avisados = await _avisar_quiz_publicado(db, q, len(questions))
+            await db.commit()
+        except Exception:
+            pass
+    return {"id": q.id, "notified": avisados}
 
 
 # === MATERIALES ===
@@ -1261,3 +1325,51 @@ async def my_levels(
         "id": l.id, "code": l.code, "name": l.name,
         "course_id": c.id, "course_name": c.name,
     } for l, c in filas]}
+
+
+@router.post("/quizzes/{quiz_id}/publish")
+async def publish_quiz(
+    quiz_id: int,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.34 — Publicar un quiz y avisarle a los estudiantes.
+
+    Útil cuando el quiz se guardó sin publicar (por ejemplo, los que genera
+    la IA, que quedan esperando revisión del profesor).
+    """
+    q = await db.get(Quiz, quiz_id)
+    if not q:
+        raise HTTPException(404, "Quiz no encontrado")
+
+    preguntas = (await db.execute(
+        select(func.count()).select_from(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id)
+    )).scalar() or 0
+    if preguntas == 0:
+        raise HTTPException(400, "El quiz no tiene preguntas todavía")
+
+    ya_estaba = q.is_published
+    q.is_published = True
+
+    # Si ya estaba publicado, se avisa igual (sirve como recordatorio)
+    avisados = await _avisar_quiz_publicado(db, q, preguntas)
+    await db.commit()
+    return {
+        "ok": True, "published": True, "notified": avisados,
+        "questions": preguntas, "was_published": ya_estaba,
+    }
+
+
+@router.post("/quizzes/{quiz_id}/unpublish")
+async def unpublish_quiz(
+    quiz_id: int,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Despublicar un quiz (por si se publicó por error). No borra nada."""
+    q = await db.get(Quiz, quiz_id)
+    if not q:
+        raise HTTPException(404, "Quiz no encontrado")
+    q.is_published = False
+    await db.commit()
+    return {"ok": True, "published": False}

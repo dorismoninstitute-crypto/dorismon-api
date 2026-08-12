@@ -137,6 +137,63 @@ async def main():
             filtrada = any("answer" in str(b) for b in (fb[0].get("blanks") or []))
             check("Al estudiante NO se le manda la respuesta correcta", not filtrada)
 
+        # ---------- V3.9.34: no ver clases de OTRO profesor ----------
+        otros = [p for p in profes["items"]
+                 if p["email"] in SEED_TEACHERS and p["id"] != profe["id"]]
+        if mia and otros:
+            # Su profesor es "profe"
+            await c.patch(f"/admin/enrollments/{mia[0]['id']}", headers=AH,
+                          json={"teacher_id": profe["id"]})
+            # Clase suya
+            await c.post("/admin/class-series", headers=AH, json={
+                "name": "Test Mi Grupo", "course_id": cid, "level_id": lvl["id"],
+                "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri",
+                "start_time_hhmm": "09:00", "duration_min": 60,
+                "start_date": hoy, "num_classes": 8, "modality": "online",
+            })
+            # Clase de OTRO estudiante con OTRO profesor, MISMO nivel
+            await c.post("/admin/class-series", headers=AH, json={
+                "name": "Test Clase Ajena", "course_id": cid, "level_id": lvl["id"],
+                "teacher_id": otros[0]["id"], "days_of_week": "mon,tue,wed,thu,fri",
+                "start_time_hhmm": "08:00", "duration_min": 60,
+                "start_date": hoy, "num_classes": 8, "modality": "online",
+            })
+            prog = (await c.get("/progress/my-course", headers=SH)).json()
+            ns = prog.get("next_session") or {}
+            check("Su próxima clase es con SU profesor, no con otro",
+                  ns.get("teacher_name") != otros[0]["full_name"])
+
+        # ---------- V3.9.34: quizzes y tareas en TODOS los planes ----------
+        qz = (await c.get("/student/quizzes", headers=SH)).json()
+        check("Los quizzes NO se bloquean por plan",
+              not (isinstance(qz, dict) and qz.get("blocked_by_plan")))
+        ta2 = (await c.get("/student/assignments", headers=SH)).json()
+        check("Las tareas NO se bloquean por plan",
+              not (isinstance(ta2, dict) and ta2.get("blocked_by_plan")))
+
+        # ---------- V3.9.34: aviso al publicar un quiz ----------
+        q = await c.post("/teacher/quizzes", headers=TH, json={
+            "title": "Test Quiz Aviso", "description": "x", "level_id": lvl["id"],
+            "questions": [{"type": "multiple_choice", "statement": "I ___ to school",
+                           "options": ["go", "goes", "going", "gone"],
+                           "correct_answer": "go", "points": 10}],
+        })
+        check("El profesor puede crear un quiz", q.status_code == 201)
+        if q.status_code == 201:
+            qid = q.json().get("id")
+            pub = await c.post(f"/teacher/quizzes/{qid}/publish", headers=TH)
+            check("Publicar avisa a los estudiantes",
+                  pub.status_code == 200 and pub.json().get("notified", 0) >= 1)
+
+            vacio = await c.post("/teacher/quizzes", headers=TH, json={
+                "title": "Test Quiz Vacio", "description": "x",
+                "level_id": lvl["id"], "questions": [],
+            })
+            if vacio.status_code == 201:
+                p2 = await c.post(f"/teacher/quizzes/{vacio.json().get('id')}/publish",
+                                  headers=TH)
+                check("No deja publicar un quiz sin preguntas", p2.status_code == 400)
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 

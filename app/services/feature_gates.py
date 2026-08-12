@@ -64,8 +64,34 @@ async def get_student_feature_keys(db: AsyncSession, user_id: str) -> set[str]:
     return feature_keys
 
 
+# ============================================================================
+# V3.9.34 — Lo que NUNCA se bloquea por plan
+# ============================================================================
+# REGLA DE NEGOCIO: los planes no pueden bloquear lo que pasa EN CLASE.
+# Si el profesor asigna un quiz o una tarea al grupo y la mitad no puede
+# abrirlo porque tiene el plan básico, es un desastre en vivo y el profesor
+# queda mal delante de todos.
+#
+# Los planes se diferencian en los EXTRAS que el estudiante usa por su cuenta:
+# biblioteca completa, materiales descargables, clases privadas, eventos
+# gratis, soporte prioritario.
+SIEMPRE_INCLUIDAS = {
+    "quizzes",         # el profe los asigna en clase
+    "assignments",     # tareas: cobrar por entregar tarea no tiene sentido
+    "grupal_classes",  # es el producto principal
+    "certificates",    # se ganó su nivel, le corresponde
+    "placement_test",  # es el gancho de entrada
+    "course_route",    # sin esto no puede estudiar
+    "events_view",     # ver que existen no cuesta nada
+}
+
+
 async def student_has_feature(db: AsyncSession, user_id: str, feature_key: str) -> bool:
     """Verifica si un estudiante tiene acceso a una feature específica."""
+    # V3.9.34: estas funciones llegan a TODOS los planes, sin excepción.
+    if feature_key in SIEMPRE_INCLUIDAS:
+        return True
+
     keys = await get_student_feature_keys(db, user_id)
     return feature_key in keys
 

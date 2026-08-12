@@ -85,9 +85,21 @@ async def my_course_progress(
             (ClassSession.series_id == _mi_grupo) & (ClassSession.student_id.is_(None))
         )
     else:
+        # V3.9.34 FIX — Antes bastaba con ser del mismo nivel, y eso hacía que a
+        # un estudiante le aparecieran las clases de OTRO con OTRO profesor:
+        # si creabas una serie para Marioli con la profesora Maryorit, a Juan
+        # (también B1, pero con el profesor Luis) le salía esa clase.
+        #
+        # Ahora, además del nivel, la clase debe ser de SU profesor. Si su
+        # inscripción no tiene profesor asignado, se mantiene el filtro por
+        # nivel como antes (para no ocultarle clases a nadie).
         _condicion_grupal = (
             (ClassSession.level_id == enr.level_id) & (ClassSession.student_id.is_(None))
         )
+        if getattr(enr, "teacher_id", None):
+            _condicion_grupal = _condicion_grupal & (
+                ClassSession.teacher_id == enr.teacher_id
+            )
 
     next_session = (await db.execute(
         select(ClassSession).where(

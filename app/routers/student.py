@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, date, timezone as tz, timedelta
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy import select, and_, or_, func
+from sqlalchemy import select, and_, or_, func, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -124,13 +124,21 @@ async def student_dashboard(
         level_ids = [l.id for e, c, l in enrollments_rows]
         # V3.9.33: los grupos (series) a los que pertenece
         _mis_grupos = [e.series_id for e, c, l in enrollments_rows if getattr(e, "series_id", None)]
+        # V3.9.34: sus profesores asignados
+        _mis_profes = [e.teacher_id for e, c, l in enrollments_rows if getattr(e, "teacher_id", None)]
         next_sessions_stmt = next_sessions_stmt.where(
             or_(
                 # Grupales del nivel correcto (no privadas)
                 # V3.9.33: si está en grupos, solo ve las clases de SUS grupos
+                # V3.9.34 FIX: si no tiene grupo, además del nivel debe coincidir
+                # el PROFESOR. Antes le aparecían clases de otros estudiantes del
+                # mismo nivel pero con otro profesor.
                 (
                     (ClassSession.series_id.in_(_mis_grupos)) if _mis_grupos
-                    else (ClassSession.level_id.in_(level_ids))
+                    else (
+                        (ClassSession.level_id.in_(level_ids)) &
+                        ((ClassSession.teacher_id.in_(_mis_profes)) if _mis_profes else true())
+                    )
                 ) & (ClassSession.student_id.is_(None)),
                 # Privadas para este estudiante
                 ClassSession.student_id == user.user_id,
@@ -289,6 +297,7 @@ async def student_dashboard(
     cancelled_since = now - _td(days=7)
     level_ids_for_cancel = [l.id for e, c, l in enrollments_rows] if enrollments_rows else []
     _mis_grupos_cancel = [e.series_id for e, c, l in enrollments_rows if getattr(e, "series_id", None)] if enrollments_rows else []
+    _mis_profes_cancel = [e.teacher_id for e, c, l in enrollments_rows if getattr(e, "teacher_id", None)] if enrollments_rows else []
     cancel_stmt = (
         select(ClassSession)
         .where(
@@ -301,10 +310,13 @@ async def student_dashboard(
     if level_ids_for_cancel:
         cancel_stmt = cancel_stmt.where(
             or_(
-                # V3.9.33: mismo filtro por grupo
+                # V3.9.33/34: mismo filtro por grupo y profesor
                 (
                     (ClassSession.series_id.in_(_mis_grupos_cancel)) if _mis_grupos_cancel
-                    else (ClassSession.level_id.in_(level_ids_for_cancel))
+                    else (
+                        (ClassSession.level_id.in_(level_ids_for_cancel)) &
+                        ((ClassSession.teacher_id.in_(_mis_profes_cancel)) if _mis_profes_cancel else true())
+                    )
                 ) & (ClassSession.student_id.is_(None)),
                 ClassSession.student_id == user.user_id,
             )
