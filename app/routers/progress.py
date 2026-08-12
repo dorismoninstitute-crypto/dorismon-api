@@ -97,6 +97,15 @@ async def my_course_progress(
             (ClassSession.level_id == enr.level_id) & (ClassSession.student_id.is_(None))
         )
         if getattr(enr, "teacher_id", None):
+            # V3.9.35 — REGLA: si tiene profesor asignado, SOLO ve las clases
+            # de ese profesor. Si su profesor no tiene clases proyectadas, no
+            # ve nada — y eso está bien.
+            #
+            # Antes se mostraba todo el nivel "para no ocultarle nada", pero
+            # eso hacía que a Juan (profesor Luis) le apareciera la clase de
+            # Marioli (profesora Maryorit) solo por ser los dos B1. Es mucho
+            # peor mostrar una clase ajena que no mostrar ninguna: el
+            # estudiante se presenta a una clase que no es suya.
             _condicion_grupal = _condicion_grupal & (
                 ClassSession.teacher_id == enr.teacher_id
             )

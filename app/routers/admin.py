@@ -3122,7 +3122,12 @@ async def list_class_series(
 ):
     """V1.7: Lista todas las series con conteo de clases."""
     series_list = (await db.execute(
-        select(ClassSeries).order_by(ClassSeries.created_at.desc())
+        # V3.9.35 — Solo grupos VIVOS. Antes se listaban todas las series,
+        # incluidas las canceladas y las que ya terminaron, así que al asignar
+        # aparecían clases viejas que ya no existen.
+        select(ClassSeries)
+        .where(ClassSeries.is_active.is_(True))
+        .order_by(ClassSeries.created_at.desc())
     )).scalars().all()
 
     out = []
@@ -6172,8 +6177,21 @@ async def list_groups(
         select(ClassSeries).order_by(ClassSeries.created_at.desc())
     )).scalars().all()
 
+    ahora = datetime.now(tz.utc)
     out = []
     for s in series:
+        # V3.9.35 — Un grupo sin clases futuras ya no sirve para asignar a
+        # nadie: o terminó, o le borraron las clases. No debe ofrecerse.
+        futuras = (await db.execute(
+            select(func.count()).select_from(ClassSession).where(
+                ClassSession.series_id == s.id,
+                ClassSession.starts_at_utc >= ahora,
+                ClassSession.status != SessionStatus.cancelled,
+            )
+        )).scalar() or 0
+        if futuras == 0:
+            continue
+
         inscritos = (await db.execute(
             select(func.count()).select_from(Enrollment).where(
                 Enrollment.series_id == s.id,
@@ -6198,6 +6216,7 @@ async def list_groups(
             "capacity": cupo,
             "is_full": inscritos >= cupo,
             "spots_left": max(0, cupo - inscritos),
+            "upcoming_classes": futuras,  # V3.9.35
         })
     return {"items": out}
 
@@ -6344,3 +6363,101 @@ async def list_feature_keys(
     for f in catalogo:
         f["recommended_for_all"] = f["key"] in basicas
     return {"items": catalogo}
+
+
+@router.get("/students/{student_id}/what-they-see")
+async def what_student_sees(
+    student_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.35 — Por qué este estudiante ve las clases que ve.
+
+    Sirve para diagnosticar sin adivinar: te dice si está filtrando por grupo,
+    por profesor o por nivel, y qué clases le van a aparecer. Si algo no
+    cuadra, aquí se ve el motivo.
+    """
+    u = await db.get(User, student_id)
+    if not u:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    ahora = datetime.now(tz.utc)
+    filas = (await db.execute(
+        select(Enrollment, Course, Level)
+        .join(Course, Enrollment.course_id == Course.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(Enrollment.student_id == student_id, Enrollment.is_active.is_(True))
+    )).all()
+
+    inscripciones = []
+    for e, curso, nivel in filas:
+        grupo = await db.get(ClassSeries, e.series_id) if getattr(e, "series_id", None) else None
+        profe = await db.get(User, e.teacher_id) if getattr(e, "teacher_id", None) else None
+
+        if grupo:
+            criterio = "grupo"
+            explicacion = f"Solo ve las clases del grupo '{grupo.name}'."
+            cond = ClassSession.series_id == grupo.id
+        elif profe:
+            criterio = "profesor"
+            explicacion = (
+                f"Solo ve las clases de {profe.full_name} en {nivel.code}. "
+                "Si ese profesor no tiene clases proyectadas, no verá ninguna."
+            )
+            cond = (ClassSession.teacher_id == profe.id) & (ClassSession.level_id == nivel.id)
+        else:
+            criterio = "nivel"
+            explicacion = (
+                f"⚠️ Ve TODAS las clases de {nivel.code}, de cualquier profesor. "
+                "Asígnale un profesor o un grupo para que solo vea las suyas."
+            )
+            cond = ClassSession.level_id == nivel.id
+
+        proximas = (await db.execute(
+            select(ClassSession).where(
+                cond,
+                ClassSession.student_id.is_(None),
+                ClassSession.is_open_event.is_(False),
+                ClassSession.starts_at_utc >= ahora,
+                ClassSession.status == SessionStatus.scheduled,
+            ).order_by(ClassSession.starts_at_utc).limit(5)
+        )).scalars().all()
+
+        clases = []
+        for s in proximas:
+            pr = await db.get(User, s.teacher_id) if s.teacher_id else None
+            clases.append({
+                "id": s.id, "title": s.title,
+                "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+                "teacher_name": pr.full_name if pr else None,
+            })
+
+        inscripciones.append({
+            "enrollment_id": e.id,
+            "course_name": curso.name,
+            "level_code": nivel.code,
+            "group_name": grupo.name if grupo else None,
+            "teacher_name": profe.full_name if profe else None,
+            "criterio": criterio,
+            "explicacion": explicacion,
+            "upcoming": clases,
+            "upcoming_count": len(clases),
+        })
+
+    # Sus clases privadas (esas siempre las ve, sin importar el filtro)
+    privadas = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.student_id == student_id,
+            ClassSession.starts_at_utc >= ahora,
+            ClassSession.status == SessionStatus.scheduled,
+        ).order_by(ClassSession.starts_at_utc).limit(5)
+    )).scalars().all()
+
+    return {
+        "student": {"id": u.id, "name": u.full_name, "email": u.email},
+        "enrollments": inscripciones,
+        "private_classes": [{
+            "id": s.id, "title": s.title,
+            "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+        } for s in privadas],
+    }

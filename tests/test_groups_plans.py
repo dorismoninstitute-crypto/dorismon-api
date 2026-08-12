@@ -194,6 +194,53 @@ async def main():
                                   headers=TH)
                 check("No deja publicar un quiz sin preguntas", p2.status_code == 400)
 
+        # ---------- V3.9.35: sin clases de su profesor, NO ve nada ----------
+        if mia and otros:
+            # Ponerle un profesor que NO tenga clases proyectadas
+            libre = [p for p in profes["items"]
+                     if p["email"] in SEED_TEACHERS and p["id"] not in
+                     (profe["id"], otros[0]["id"])]
+            if libre:
+                await c.patch(f"/admin/enrollments/{mia[0]['id']}", headers=AH,
+                              json={"teacher_id": libre[0]["id"]})
+                pr = (await c.get("/progress/my-course", headers=SH)).json()
+                sig = pr.get("next_session")
+                ajena = bool(sig) and sig.get("teacher_name") not in (
+                    None, libre[0]["full_name"])
+                check("Sin clases de su profesor, NO ve clases de otros", not ajena)
+                # Devolverlo a su profesor
+                await c.patch(f"/admin/enrollments/{mia[0]['id']}", headers=AH,
+                              json={"teacher_id": profe["id"]})
+
+        # ---------- V3.9.35: el panel de grupos no ofrece series muertas -----
+        g3 = await c.get("/admin/groups", headers=AH)
+        check("El panel de grupos responde", g3.status_code == 200)
+        ofrecidos = g3.json().get("items", [])
+        check("Cada grupo dice cuántas clases futuras le quedan",
+              all("upcoming_classes" in x for x in ofrecidos))
+        check("Ningún grupo ofrecido está vacío de clases",
+              all(x.get("upcoming_classes", 0) > 0 for x in ofrecidos))
+
+        # Cancelar una serie la saca de la lista
+        sl2 = (await c.get("/admin/class-series", headers=AH)).json()
+        slist2 = sl2["items"] if isinstance(sl2, dict) else sl2
+        borrable = [s for s in slist2 if s.get("name") == "Test Clase Ajena"]
+        if borrable:
+            await c.delete(f"/admin/class-series/{borrable[0]['id']}", headers=AH)
+            g4 = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
+            check("Una serie cancelada deja de ofrecerse como grupo",
+                  not any(x["name"] == "Test Clase Ajena" for x in g4))
+
+        # ---------- V3.9.35: diagnóstico ----------
+        diag = await c.get(f"/admin/students/{maria}/what-they-see", headers=AH)
+        check("El diagnóstico responde", diag.status_code == 200)
+        dd = diag.json()
+        check("El diagnóstico explica el criterio y las clases",
+              all("criterio" in e and "explicacion" in e and "upcoming" in e
+                  for e in dd.get("enrollments", [])))
+        nodiag = await c.get(f"/admin/students/{maria}/what-they-see", headers=SH)
+        check("Un estudiante NO ve el diagnóstico", nodiag.status_code in (401, 403))
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 

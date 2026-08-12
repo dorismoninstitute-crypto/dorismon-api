@@ -133,12 +133,16 @@ async def student_dashboard(
                 # V3.9.34 FIX: si no tiene grupo, además del nivel debe coincidir
                 # el PROFESOR. Antes le aparecían clases de otros estudiantes del
                 # mismo nivel pero con otro profesor.
+                # V3.9.35 — Orden de precisión:
+                #   1. Si está en grupos → SOLO las clases de sus grupos
+                #   2. Si tiene profesor → SOLO las clases de su profesor
+                #   3. Si no tiene ninguno → las de su nivel (caso de arranque)
+                # Nunca se mezclan: es peor mostrar una clase ajena (y que se
+                # presente donde no es) que no mostrar ninguna.
                 (
                     (ClassSession.series_id.in_(_mis_grupos)) if _mis_grupos
-                    else (
-                        (ClassSession.level_id.in_(level_ids)) &
-                        ((ClassSession.teacher_id.in_(_mis_profes)) if _mis_profes else true())
-                    )
+                    else (ClassSession.teacher_id.in_(_mis_profes)) if _mis_profes
+                    else (ClassSession.level_id.in_(level_ids))
                 ) & (ClassSession.student_id.is_(None)),
                 # Privadas para este estudiante
                 ClassSession.student_id == user.user_id,
@@ -311,12 +315,11 @@ async def student_dashboard(
         cancel_stmt = cancel_stmt.where(
             or_(
                 # V3.9.33/34: mismo filtro por grupo y profesor
+                # V3.9.35 — Mismo orden de precisión que arriba
                 (
                     (ClassSession.series_id.in_(_mis_grupos_cancel)) if _mis_grupos_cancel
-                    else (
-                        (ClassSession.level_id.in_(level_ids_for_cancel)) &
-                        ((ClassSession.teacher_id.in_(_mis_profes_cancel)) if _mis_profes_cancel else true())
-                    )
+                    else (ClassSession.teacher_id.in_(_mis_profes_cancel)) if _mis_profes_cancel
+                    else (ClassSession.level_id.in_(level_ids_for_cancel))
                 ) & (ClassSession.student_id.is_(None)),
                 ClassSession.student_id == user.user_id,
             )
