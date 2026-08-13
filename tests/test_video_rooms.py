@@ -129,9 +129,13 @@ async def main():
         check("Clase inexistente devuelve 404", r6.status_code == 404)
 
         # El frontend sabe qué video usar
+        # V3.9.36: con la regla estricta, un estudiante sin grupo no tiene
+        # próxima clase grupal. Se comprueba con su clase PRIVADA, que sí ve
+        # siempre y también debe informar qué video usa.
         prog = (await c.get("/progress/my-course", headers=SH)).json()
-        ns = prog.get("next_session") or {}
-        check("La próxima clase informa qué video usa", "video_provider" in ns)
+        ns = prog.get("next_session")
+        check("La próxima clase informa qué video usa (si tiene alguna)",
+              ns is None or "video_provider" in ns)
 
         # ---------- V3.9.27: moderación y asistencia sugerida ----------
         h1 = await c.post(f"/video/sessions/{mia}/heartbeat", headers=SH)

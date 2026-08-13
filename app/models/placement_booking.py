@@ -813,7 +813,37 @@ class AlertAction(Base):
     snooze_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MakeupRequest(Base):
+    """V3.9.36 — Reponer una clase perdida.
+
+    PARA QUÉ: si el estudiante faltó por algo, o el PROFESOR no llegó, esa
+    clase se perdía y punto. Ahora se puede reponer en otra fecha SIN tocar
+    la serie: se agrega una clase extra y la recurrencia sigue igual.
+
+    El estudiante la pide, el admin la aprueba y agenda. Así no se llena el
+    calendario de reposiciones sin control.
+    """
+    __tablename__ = "makeup_requests"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id"), index=True)
+    # La clase que se perdió
+    original_session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"))
+    # pending | approved | rejected | scheduled
+    status: Mapped[str] = mapped_column(String, default="pending")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Quién faltó: "student" o "teacher" (si fue el profe, no cuenta como
+    # ausencia del estudiante ni se le cobra)
+    missed_by: Mapped[str] = mapped_column(String, default="student")
+    preferred_date: Mapped[str | None] = mapped_column(String, nullable=True)
+    # La clase de reposición, una vez agendada
+    makeup_session_id: Mapped[str | None] = mapped_column(ForeignKey("class_sessions.id"), nullable=True)
+    admin_note: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
+Index("ix_makeup_student", MakeupRequest.student_id, MakeupRequest.status)
 Index("ix_alert_actions_key", AlertAction.alert_key)
 Index("ix_video_presence_session_user", VideoPresence.session_id, VideoPresence.user_id)
 Index("ix_attendance_session", SessionAttendance.session_id)

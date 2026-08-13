@@ -1,0 +1,151 @@
+"""V3.9.36 — Regla estricta de clases, reposiciones y sin-horario."""
+import sys
+import asyncio
+import datetime
+import httpx
+
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+STUDENT = {"email": "maria.estudiante@dorismon.do", "password": "Estudiante2026!"}
+SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
+
+
+async def main():
+    passed = total = 0
+
+    def check(label, ok):
+        nonlocal passed, total
+        total += 1
+        if ok:
+            passed += 1
+        print(f"  {'✓' if ok else '✗'} {label}")
+
+    async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
+        tok = (await c.post("/auth/login", json=ADMIN)).json()["access_token"]
+        AH = {"Authorization": f"Bearer {tok}"}
+        stok = (await c.post("/auth/login", json=STUDENT)).json()["access_token"]
+        SH = {"Authorization": f"Bearer {stok}"}
+
+        cid = (await c.get("/admin/courses", headers=AH)).json()[0]["id"]
+        lv = (await c.get(f"/admin/levels-by-course/{cid}", headers=AH)).json()
+        lvls = lv["items"] if isinstance(lv, dict) else lv
+        mu = (await c.get("/admin/users?q=maria.estudiante", headers=AH)).json()
+        est = mu["items"][0]["id"]
+        perfil = (await c.get(f"/admin/students/{est}/profile", headers=AH)).json()
+        lvl = [l for l in lvls if l["code"] == perfil.get("current_level_code")][0]
+        profes = (await c.get("/admin/users?role=teacher", headers=AH)).json()
+        profe = [p for p in profes["items"] if p["email"] in SEED_TEACHERS][0]
+        hoy = datetime.date.today().isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # ---------- Regla estricta ----------
+        enr = (await c.get("/admin/enrollments", headers=AH)).json()
+        ei = enr.get("items", enr) if isinstance(enr, dict) else enr
+        mia = [e for e in ei if e.get("student_id") == est and e.get("is_active")]
+        if mia:
+            # Sacarlo de cualquier grupo y darle profesor
+            await c.post(f"/admin/enrollments/{mia[0]['id']}/assign-group",
+                         headers=AH, json={"series_id": ""})
+            await c.patch(f"/admin/enrollments/{mia[0]['id']}", headers=AH,
+                          json={"teacher_id": profe["id"]})
+
+            # Su profesor tiene DOS horarios del mismo nivel
+            for nombre, hora in [("Test H1", "18:00"), ("Test H2", "20:00")]:
+                await c.post("/admin/class-series", headers=AH, json={
+                    "name": nombre, "course_id": cid, "level_id": lvl["id"],
+                    "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri",
+                    "start_time_hhmm": hora, "duration_min": 60,
+                    "start_date": hoy, "num_classes": 8, "modality": "online",
+                })
+
+            pr = (await c.get("/progress/my-course", headers=SH)).json()
+            check("Sin grupo NO ve ninguna clase grupal",
+                  (pr.get("next_session") or {}).get("series_id") is None
+                  and not (pr.get("next_session") or {}).get("title", "").startswith("Test H"))
+
+            # Al asignarle uno, solo ve el suyo
+            g = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
+            h1 = [x for x in g if x["name"] == "Test H1"]
+            if h1:
+                await c.post(f"/admin/enrollments/{mia[0]['id']}/assign-group",
+                             headers=AH, json={"series_id": h1[0]["id"]})
+                pr2 = (await c.get("/progress/my-course", headers=SH)).json()
+                titulo = (pr2.get("next_session") or {}).get("title", "")
+                check("Con grupo, solo ve las clases de SU horario",
+                      "Test H1" in titulo)
+                check("NO ve el otro horario del mismo profesor",
+                      "Test H2" not in titulo)
+
+        # ---------- Estudiantes sin horario ----------
+        sh = await c.get("/admin/students-without-schedule", headers=AH)
+        check("El aviso de sin-horario responde", sh.status_code == 200)
+        check("Trae el motivo de cada uno",
+              all("motivo" in x for x in sh.json().get("items", [])))
+        no = await c.get("/admin/students-without-schedule", headers=SH)
+        check("Un estudiante NO ve ese listado", no.status_code in (401, 403))
+
+        # ---------- Reposiciones ----------
+        sid = (await c.post("/admin/sessions", headers=AH, json={
+            "title": "Test clase perdida",
+            "starts_at_utc": (now - datetime.timedelta(days=2)).isoformat(),
+            "ends_at_utc": (now - datetime.timedelta(days=2, hours=-1)).isoformat(),
+            "modality": "online", "teacher_id": profe["id"],
+            "course_id": cid, "level_id": lvl["id"],
+        })).json()["id"]
+
+        sin_motivo = await c.post(f"/student/sessions/{sid}/request-makeup",
+                                  headers=SH, json={"reason": ""})
+        check("Sin motivo, no deja pedir reposición", sin_motivo.status_code == 400)
+
+        req = await c.post(f"/student/sessions/{sid}/request-makeup", headers=SH,
+                           json={"reason": "El profesor no llegó",
+                                 "missed_by": "teacher",
+                                 "preferred_date": "sábado"})
+        check("El estudiante puede pedir reponer", req.status_code == 200)
+        rid = req.json().get("id")
+
+        dup = await c.post(f"/student/sessions/{sid}/request-makeup", headers=SH,
+                           json={"reason": "otra vez"})
+        check("No deja pedir dos veces la misma", dup.status_code == 400)
+
+        lst = await c.get("/admin/makeup-requests", headers=AH)
+        check("El admin ve las solicitudes", lst.status_code == 200)
+        items = lst.json().get("items", [])
+        check("La solicitud dice quién faltó",
+              any(x.get("missed_by_label") for x in items))
+
+        # Agendar
+        sch = await c.post(f"/admin/makeup-requests/{rid}/schedule", headers=AH,
+                           json={"starts_at_utc": (now + datetime.timedelta(days=3)).isoformat(),
+                                 "duration_min": 60})
+        check("El admin agenda la reposición", sch.status_code == 200)
+
+        mias = (await c.get("/student/makeup-requests", headers=SH)).json()
+        check("El estudiante ve el estado de su solicitud",
+              any(x.get("status") == "scheduled" for x in mias.get("items", [])))
+
+        # Fecha en el pasado
+        sid2 = (await c.post("/admin/sessions", headers=AH, json={
+            "title": "Test otra perdida",
+            "starts_at_utc": (now - datetime.timedelta(days=3)).isoformat(),
+            "ends_at_utc": (now - datetime.timedelta(days=3, hours=-1)).isoformat(),
+            "modality": "online", "teacher_id": profe["id"],
+            "course_id": cid, "level_id": lvl["id"],
+        })).json()["id"]
+        r2 = await c.post(f"/student/sessions/{sid2}/request-makeup", headers=SH,
+                          json={"reason": "no pude"})
+        if r2.status_code == 200:
+            pasado = await c.post(f"/admin/makeup-requests/{r2.json()['id']}/schedule",
+                                  headers=AH,
+                                  json={"starts_at_utc": (now - datetime.timedelta(days=1)).isoformat()})
+            check("No deja agendar una reposición en el pasado", pasado.status_code == 400)
+
+        nop = await c.get("/admin/makeup-requests", headers=SH)
+        check("Un estudiante NO ve el panel de reposiciones", nop.status_code in (401, 403))
+
+    print(f"{passed}/{total} tests pasaron")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

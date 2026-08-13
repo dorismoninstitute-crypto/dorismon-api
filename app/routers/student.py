@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, date, timezone as tz, timedelta
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy import select, and_, or_, func, true
+from sqlalchemy import select, and_, or_, func, true, false
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -133,16 +133,12 @@ async def student_dashboard(
                 # V3.9.34 FIX: si no tiene grupo, además del nivel debe coincidir
                 # el PROFESOR. Antes le aparecían clases de otros estudiantes del
                 # mismo nivel pero con otro profesor.
-                # V3.9.35 — Orden de precisión:
-                #   1. Si está en grupos → SOLO las clases de sus grupos
-                #   2. Si tiene profesor → SOLO las clases de su profesor
-                #   3. Si no tiene ninguno → las de su nivel (caso de arranque)
-                # Nunca se mezclan: es peor mostrar una clase ajena (y que se
-                # presente donde no es) que no mostrar ninguna.
+                # V3.9.36 — REGLA ESTRICTA: solo las clases de SU grupo.
+                # Sin grupo no hay clases grupales suyas; verá únicamente sus
+                # privadas (que entran por la otra rama del or_).
                 (
                     (ClassSession.series_id.in_(_mis_grupos)) if _mis_grupos
-                    else (ClassSession.teacher_id.in_(_mis_profes)) if _mis_profes
-                    else (ClassSession.level_id.in_(level_ids))
+                    else false()
                 ) & (ClassSession.student_id.is_(None)),
                 # Privadas para este estudiante
                 ClassSession.student_id == user.user_id,
@@ -314,8 +310,13 @@ async def student_dashboard(
     if level_ids_for_cancel:
         cancel_stmt = cancel_stmt.where(
             or_(
-                # V3.9.33/34: mismo filtro por grupo y profesor
-                # V3.9.35 — Mismo orden de precisión que arriba
+                # V3.9.36 — Aquí SÍ se mantiene el filtro amplio, a propósito.
+                #
+                # Para las clases PRÓXIMAS aplicamos la regla estricta (mejor
+                # nada que una clase ajena). Pero un aviso de CANCELACIÓN es
+                # distinto: es información pasada, no lo manda a ningún lado,
+                # y si se le oculta puede quedarse esperando una clase que ya
+                # se canceló. Mejor que lo vea.
                 (
                     (ClassSession.series_id.in_(_mis_grupos_cancel)) if _mis_grupos_cancel
                     else (ClassSession.teacher_id.in_(_mis_profes_cancel)) if _mis_profes_cancel
@@ -1314,3 +1315,117 @@ def _subir_entrega(datos: bytes, public_id: str, es_medio: bool) -> dict:
         resource_type="auto" if es_medio else "image",
     )
     return {"url": res.get("secure_url"), "public_id": res.get("public_id")}
+
+
+# ============================================================================
+# V3.9.36 — PEDIR REPONER UNA CLASE PERDIDA
+# ============================================================================
+
+@router.post("/sessions/{session_id}/request-makeup")
+async def request_makeup(
+    session_id: str,
+    body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """El estudiante pide reponer una clase que perdió.
+
+    No agenda nada: crea una solicitud que el admin aprueba y agenda. Así el
+    calendario no se llena de reposiciones sin control.
+    """
+    from app.models import MakeupRequest
+
+    s = await db.get(ClassSession, session_id)
+    if not s:
+        raise HTTPException(404, "Clase no encontrada")
+
+    # Debe ser una clase que ya pasó
+    fin = s.ends_at_utc
+    if fin and fin.tzinfo is None:
+        fin = fin.replace(tzinfo=_tz.utc)
+    if fin and fin > _dt.now(_tz.utc):
+        raise HTTPException(400, "Esa clase todavía no ha pasado")
+
+    # No repetir la solicitud
+    ya = (await db.execute(
+        select(MakeupRequest).where(
+            MakeupRequest.student_id == user.user_id,
+            MakeupRequest.original_session_id == session_id,
+            MakeupRequest.status.in_(["pending", "approved", "scheduled"]),
+        )
+    )).scalar_one_or_none()
+    if ya:
+        raise HTTPException(400, "Ya pediste reponer esa clase")
+
+    motivo = (body.get("reason") or "").strip()
+    if not motivo:
+        raise HTTPException(400, "Cuéntanos brevemente qué pasó")
+
+    quien = "teacher" if body.get("missed_by") == "teacher" else "student"
+
+    req = MakeupRequest(
+        student_id=user.user_id,
+        original_session_id=session_id,
+        reason=motivo[:500],
+        missed_by=quien,
+        preferred_date=(body.get("preferred_date") or "")[:60] or None,
+    )
+    db.add(req)
+
+    # Avisar al admin para que la revise
+    try:
+        yo = await db.get(User, user.user_id)
+        admins = (await db.execute(
+            select(User).where(User.role == UserRole.super_admin)
+        )).scalars().all()
+        for a in admins:
+            db.add(Notification(
+                user_id=a.id, type=NotificationType.info,
+                title="🔄 Solicitud de reposición",
+                body=f"{yo.full_name if yo else 'Un estudiante'} pide reponer '{s.title}'.",
+                link="/dashboard/admin/makeups",
+            ))
+    except Exception:
+        pass
+
+    await db.commit()
+    return {"ok": True, "id": req.id, "status": "pending"}
+
+
+@router.get("/makeup-requests")
+async def my_makeup_requests(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Las reposiciones que pidió este estudiante y en qué van."""
+    from app.models import MakeupRequest
+
+    filas = (await db.execute(
+        select(MakeupRequest, ClassSession)
+        .join(ClassSession, MakeupRequest.original_session_id == ClassSession.id)
+        .where(MakeupRequest.student_id == user.user_id)
+        .order_by(MakeupRequest.created_at.desc())
+    )).all()
+
+    ESTADOS = {
+        "pending": "Esperando respuesta",
+        "approved": "Aprobada, buscando fecha",
+        "scheduled": "¡Ya tiene fecha!",
+        "rejected": "No aprobada",
+    }
+
+    out = []
+    for r, orig in filas:
+        nueva = await db.get(ClassSession, r.makeup_session_id) if r.makeup_session_id else None
+        out.append({
+            "id": r.id,
+            "original_title": orig.title,
+            "original_date": orig.starts_at_utc.isoformat() if orig.starts_at_utc else None,
+            "status": r.status,
+            "status_label": ESTADOS.get(r.status, r.status),
+            "reason": r.reason,
+            "admin_note": r.admin_note,
+            "makeup_date": nueva.starts_at_utc.isoformat() if nueva and nueva.starts_at_utc else None,
+            "makeup_title": nueva.title if nueva else None,
+        })
+    return {"items": out}

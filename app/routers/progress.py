@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, timezone as tz
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, false
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -79,36 +79,28 @@ async def my_course_progress(
     # clases de ESE grupo. Antes veía todas las de su nivel: con dos grupos de
     # B1 (mañana y noche), a todos les aparecían los dos horarios.
     # Si no tiene grupo asignado, sigue viendo todo su nivel (compatibilidad).
+    # V3.9.36 — REGLA ESTRICTA (decisión de Luis):
+    # Si al estudiante no se le proyectó SU clase, NO VE NADA.
+    #
+    # Antes había un filtro por profesor como respaldo, pero eso fallaba
+    # cuando un profesor daba dos horarios distintos del mismo nivel: Juan
+    # (lunes/miércoles) veía también las clases de Pedro (martes/jueves).
+    #
+    # Ahora solo se muestran clases que son SUYAS de verdad:
+    #   1. Las de su grupo asignado
+    #   2. Sus clases privadas o sueltas
+    # Cualquier otro caso: pantalla limpia.
+    #
+    # Es preferible que no vea nada a que se presente a una clase ajena.
     _mi_grupo = getattr(enr, "series_id", None)
     if _mi_grupo:
         _condicion_grupal = (
             (ClassSession.series_id == _mi_grupo) & (ClassSession.student_id.is_(None))
         )
     else:
-        # V3.9.34 FIX — Antes bastaba con ser del mismo nivel, y eso hacía que a
-        # un estudiante le aparecieran las clases de OTRO con OTRO profesor:
-        # si creabas una serie para Marioli con la profesora Maryorit, a Juan
-        # (también B1, pero con el profesor Luis) le salía esa clase.
-        #
-        # Ahora, además del nivel, la clase debe ser de SU profesor. Si su
-        # inscripción no tiene profesor asignado, se mantiene el filtro por
-        # nivel como antes (para no ocultarle clases a nadie).
-        _condicion_grupal = (
-            (ClassSession.level_id == enr.level_id) & (ClassSession.student_id.is_(None))
-        )
-        if getattr(enr, "teacher_id", None):
-            # V3.9.35 — REGLA: si tiene profesor asignado, SOLO ve las clases
-            # de ese profesor. Si su profesor no tiene clases proyectadas, no
-            # ve nada — y eso está bien.
-            #
-            # Antes se mostraba todo el nivel "para no ocultarle nada", pero
-            # eso hacía que a Juan (profesor Luis) le apareciera la clase de
-            # Marioli (profesora Maryorit) solo por ser los dos B1. Es mucho
-            # peor mostrar una clase ajena que no mostrar ninguna: el
-            # estudiante se presenta a una clase que no es suya.
-            _condicion_grupal = _condicion_grupal & (
-                ClassSession.teacher_id == enr.teacher_id
-            )
+        # Sin grupo: no hay clases grupales suyas. Solo verá las privadas
+        # (que se suman aparte en el or_ de abajo).
+        _condicion_grupal = false()
 
     next_session = (await db.execute(
         select(ClassSession).where(
