@@ -6930,3 +6930,229 @@ async def student_missed_classes(
         "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
         "already_requested": s.id in ya,
     } for a, s in filas]}
+
+
+@router.get("/students-for-makeup")
+async def students_for_makeup(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.39 — Los estudiantes a los que SÍ se les puede reponer una clase.
+
+    ANTES el selector mostraba a cualquiera con cuenta de estudiante: gente
+    que se registró y nunca se inscribió, los que hicieron el test y no
+    siguieron, cuentas de prueba... Una reposición se le agenda a alguien que
+    YA está estudiando, no a cualquiera.
+
+    Ahora solo salen los que tienen inscripción activa, y con el contexto que
+    hace falta para decidir: su nivel, su grupo y su profesor.
+    """
+    filas = (await db.execute(
+        select(Enrollment, User, Level, Course)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .join(Course, Enrollment.course_id == Course.id)
+        .where(Enrollment.is_active.is_(True), User.is_active.is_(True))
+        .order_by(User.full_name)
+    )).all()
+
+    vistos = set()
+    out = []
+    for e, u, nivel, curso in filas:
+        if u.id in vistos:
+            continue
+        vistos.add(u.id)
+
+        grupo = await db.get(ClassSeries, e.series_id) if getattr(e, "series_id", None) else None
+        profe = await db.get(User, e.teacher_id) if getattr(e, "teacher_id", None) else None
+        st = await db.get(Student, u.id)
+
+        out.append({
+            "student_id": u.id,
+            "name": u.full_name,
+            "email": u.email,
+            "enrollment_id": e.id,
+            "course_id": curso.id, "course_name": curso.name,
+            "level_id": nivel.id, "level_code": nivel.code,
+            "group_id": grupo.id if grupo else None,
+            "group_name": grupo.name if grupo else None,
+            "teacher_id": profe.id if profe else None,
+            "teacher_name": profe.full_name if profe else None,
+            "is_paused": bool(st.is_paused) if st else False,
+            # Para mostrarlo ordenado en el selector
+            "display": (
+                f"{u.full_name} — {nivel.code}"
+                + (f" · {grupo.name}" if grupo else " · sin grupo")
+                + (f" · {profe.full_name}" if profe else "")
+            ),
+        })
+    return {"items": out, "count": len(out)}
+
+
+@router.post("/sessions/{session_id}/substitute-teacher")
+async def substitute_teacher(
+    session_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.39 — Poner un profesor sustituto en UNA clase.
+
+    ANTES solo se podía cambiar el profesor de toda la serie. Si uno no podía
+    venir un día concreto, había que editar la clase a mano o cancelarla.
+
+    💰 SOBRE EL PAGO: cobra QUIEN DA LA CLASE, con SU tarifa.
+    El sistema paga según quién registró la asistencia, así que al cambiar el
+    profesor de la clase, el sustituto queda como responsable y cobra su
+    propia tarifa. La serie NO se toca: la próxima semana vuelve el titular.
+
+    AVISA DE CHOQUES: si el sustituto ya tiene clase a esa hora, lo dice antes.
+    """
+    s = await db.get(ClassSession, session_id)
+    if not s:
+        raise HTTPException(404, "Clase no encontrada")
+    if s.status == SessionStatus.cancelled:
+        raise HTTPException(400, "Esa clase está cancelada")
+
+    fin = s.ends_at_utc
+    if fin and fin.tzinfo is None:
+        fin = fin.replace(tzinfo=tz.utc)
+    if fin and fin < datetime.now(tz.utc):
+        raise HTTPException(400, "Esa clase ya pasó")
+
+    nuevo_id = (body.get("teacher_id") or "").strip()
+    if not nuevo_id:
+        raise HTTPException(400, "Indica qué profesor la va a dar")
+    if nuevo_id == s.teacher_id:
+        raise HTTPException(400, "Ese ya es el profesor de la clase")
+
+    nuevo = await db.get(User, nuevo_id)
+    if not nuevo or nuevo.role != UserRole.teacher:
+        raise HTTPException(404, "Profesor no encontrado")
+
+    # ¿El sustituto está libre a esa hora?
+    ini = s.starts_at_utc
+    if ini and ini.tzinfo is None:
+        ini = ini.replace(tzinfo=tz.utc)
+    ocupado = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.teacher_id == nuevo_id,
+            ClassSession.id != session_id,
+            ClassSession.status != SessionStatus.cancelled,
+            ClassSession.starts_at_utc < fin,
+            ClassSession.ends_at_utc > ini,
+        ).limit(1)
+    )).scalar_one_or_none()
+
+    if ocupado and not body.get("confirm_overlap"):
+        raise HTTPException(409, {
+            "necesita_confirmacion": True,
+            "mensaje": (
+                f"{nuevo.full_name} ya tiene '{ocupado.title}' a esa misma hora. "
+                "¿Lo asignas igual?"
+            ),
+        })
+
+    anterior = await db.get(User, s.teacher_id) if s.teacher_id else None
+    s.teacher_id = nuevo_id
+
+    # Avisar a los tres lados
+    try:
+        from app.services.push_service import notify_user
+        from zoneinfo import ZoneInfo as _ZI
+        cuando = (ini.astimezone(_ZI("America/Santo_Domingo")).strftime("%d/%m a las %I:%M %p").lstrip("0")
+                  if ini else "")
+
+        db.add(Notification(
+            user_id=nuevo_id, type=NotificationType.info,
+            title="👨‍🏫 Te asignaron una clase como sustituto",
+            body=f"'{s.title}' — {cuando}.", link="/dashboard/teacher",
+        ))
+        await notify_user(db, nuevo_id, "👨‍🏫 Te asignaron una clase como sustituto",
+                          f"'{s.title}' — {cuando}.", "/dashboard/teacher", f"sust:{s.id}")
+
+        if anterior:
+            db.add(Notification(
+                user_id=anterior.id, type=NotificationType.info,
+                title="Tu clase la dará un sustituto",
+                body=f"'{s.title}' del {cuando} la dará {nuevo.full_name}.",
+                link="/dashboard/teacher",
+            ))
+
+        # A los estudiantes que les toca esa clase
+        for uid in await _destinatarios_de_clase(db, s):
+            cuerpo = f"'{s.title}' del {cuando} la dará {nuevo.full_name}."
+            db.add(Notification(
+                user_id=uid, type=NotificationType.info,
+                title="👨‍🏫 Cambio de profesor en tu próxima clase",
+                body=cuerpo, link="/dashboard/student",
+            ))
+            await notify_user(db, uid, "👨‍🏫 Cambio de profesor en tu próxima clase",
+                              cuerpo, "/dashboard/student", f"sust:{s.id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "substitute_teacher", "sessions",
+                     target_id=session_id,
+                     details=f"{anterior.full_name if anterior else '?'} → {nuevo.full_name}")
+    await db.commit()
+    return {
+        "ok": True,
+        "teacher_name": nuevo.full_name,
+        "had_conflict": bool(ocupado),
+        # Se aclara para que quede constancia de la regla
+        "nota": "El sustituto cobra su propia tarifa al registrar la asistencia.",
+    }
+
+
+@router.get("/sessions/{session_id}/available-teachers")
+async def available_teachers_for_session(
+    session_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Qué profesores están LIBRES a la hora de esta clase.
+
+    Para elegir sustituto sin cruzar horarios ni tener que revisar a mano.
+    """
+    s = await db.get(ClassSession, session_id)
+    if not s:
+        raise HTTPException(404, "Clase no encontrada")
+
+    ini, fin = s.starts_at_utc, s.ends_at_utc
+    if ini and ini.tzinfo is None:
+        ini = ini.replace(tzinfo=tz.utc)
+    if fin and fin.tzinfo is None:
+        fin = fin.replace(tzinfo=tz.utc)
+
+    profes = (await db.execute(
+        select(User, Teacher)
+        .join(Teacher, Teacher.user_id == User.id)
+        .where(User.role == UserRole.teacher, User.is_active.is_(True))
+        .order_by(User.full_name)
+    )).all()
+
+    out = []
+    for u, t in profes:
+        if u.id == s.teacher_id:
+            continue  # es el titular
+        choque = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.teacher_id == u.id,
+                ClassSession.id != session_id,
+                ClassSession.status != SessionStatus.cancelled,
+                ClassSession.starts_at_utc < fin,
+                ClassSession.ends_at_utc > ini,
+            ).limit(1)
+        )).scalar_one_or_none()
+        out.append({
+            "teacher_id": u.id, "name": u.full_name,
+            "available": choque is None,
+            "conflict": choque.title if choque else None,
+            # Su tarifa, que es la que cobrará
+            "rate_group": float(t.rate_group or 0),
+            "rate_private": float(t.rate_private or 0),
+        })
+
+    out.sort(key=lambda x: (not x["available"], x["name"]))
+    return {"items": out}

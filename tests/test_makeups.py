@@ -187,6 +187,58 @@ async def main():
         mc = await c.get(f"/admin/students/{est}/missed-classes", headers=AH)
         check("Se pueden consultar sus clases perdidas", mc.status_code == 200)
 
+        # ---------- V3.9.39: selector solo con inscritos ----------
+        apt = await c.get("/admin/students-for-makeup", headers=AH)
+        check("El selector de reposición responde", apt.status_code == 200)
+        items_apt = apt.json().get("items", [])
+        check("Solo trae estudiantes con inscripción activa",
+              all(x.get("enrollment_id") for x in items_apt))
+        check("Trae nivel, grupo y profesor de cada uno",
+              all("level_code" in x and "display" in x for x in items_apt))
+        noperm2 = await c.get("/admin/students-for-makeup", headers=SH)
+        check("Un estudiante NO ve ese listado", noperm2.status_code in (401, 403))
+
+        # ---------- V3.9.39: profesor sustituto ----------
+        otros2 = [p for p in profes["items"]
+                  if p["email"] in SEED_TEACHERS and p["id"] != profe["id"]]
+        if otros2:
+            futura = (await c.post("/admin/sessions", headers=AH, json={
+                "title": "Test clase sustituto",
+                "starts_at_utc": (now + datetime.timedelta(days=1)).isoformat(),
+                "ends_at_utc": (now + datetime.timedelta(days=1, hours=1)).isoformat(),
+                "modality": "online", "teacher_id": profe["id"],
+                "course_id": cid, "level_id": lvl["id"],
+            })).json()["id"]
+
+            disp = await c.get(f"/admin/sessions/{futura}/available-teachers", headers=AH)
+            check("Se ve qué profesores están libres", disp.status_code == 200)
+            check("Cada uno trae su tarifa",
+                  all("rate_group" in x for x in disp.json().get("items", [])))
+
+            sub = await c.post(f"/admin/sessions/{futura}/substitute-teacher",
+                               headers=AH, json={"teacher_id": otros2[0]["id"],
+                                                 "confirm_overlap": True})
+            check("Se puede poner un sustituto en una clase", sub.status_code == 200)
+
+            mismo = await c.post(f"/admin/sessions/{futura}/substitute-teacher",
+                                 headers=AH, json={"teacher_id": otros2[0]["id"]})
+            check("No deja poner al que ya está", mismo.status_code == 400)
+
+            vieja = (await c.post("/admin/sessions", headers=AH, json={
+                "title": "Test clase pasada sust",
+                "starts_at_utc": (now - datetime.timedelta(days=2)).isoformat(),
+                "ends_at_utc": (now - datetime.timedelta(days=2, hours=-1)).isoformat(),
+                "modality": "online", "teacher_id": profe["id"],
+                "course_id": cid, "level_id": lvl["id"],
+            })).json()["id"]
+            pas = await c.post(f"/admin/sessions/{vieja}/substitute-teacher",
+                               headers=AH, json={"teacher_id": otros2[0]["id"]})
+            check("No deja sustituir en una clase que ya pasó", pas.status_code == 400)
+
+            nop2 = await c.post(f"/admin/sessions/{futura}/substitute-teacher",
+                                headers=SH, json={"teacher_id": profe["id"]})
+            check("Un estudiante NO puede poner sustitutos", nop2.status_code in (401, 403))
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 
