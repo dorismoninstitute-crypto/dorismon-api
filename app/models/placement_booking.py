@@ -826,8 +826,11 @@ class MakeupRequest(Base):
     __tablename__ = "makeup_requests"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id"), index=True)
-    # La clase que se perdió
-    original_session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"))
+    # La clase que se perdió. V3.9.37: es OPCIONAL, porque el admin puede
+    # agendar una reposición sin una clase concreta detrás (una clase que se
+    # le debe al estudiante, algo que nunca se proyectó, etc).
+    original_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("class_sessions.id"), nullable=True)
     # pending | approved | rejected | scheduled
     status: Mapped[str] = mapped_column(String, default="pending")
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -838,6 +841,12 @@ class MakeupRequest(Base):
     # La clase de reposición, una vez agendada
     makeup_session_id: Mapped[str | None] = mapped_column(ForeignKey("class_sessions.id"), nullable=True)
     admin_note: Mapped[str | None] = mapped_column(String, nullable=True)
+    # V3.9.37 — "student" si la pidió el estudiante, "admin" si la agendó
+    # directamente el instituto sin que nadie la solicitara.
+    created_by: Mapped[str] = mapped_column(String, default="student", server_default="student")
+    # ¿Esta clase avanza el temario del curso, o es solo recuperación?
+    # Si repone contenido ya visto, NO debería contar otra vez.
+    counts_for_progress: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

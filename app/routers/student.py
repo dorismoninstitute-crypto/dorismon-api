@@ -1400,9 +1400,12 @@ async def my_makeup_requests(
     """Las reposiciones que pidió este estudiante y en qué van."""
     from app.models import MakeupRequest
 
+    # V3.9.37: la clase original es opcional (el instituto puede agendar una
+    # reposición sin una clase concreta detrás), así que el join va opcional.
+    # Antes, con join obligatorio, esas reposiciones no le aparecían.
     filas = (await db.execute(
         select(MakeupRequest, ClassSession)
-        .join(ClassSession, MakeupRequest.original_session_id == ClassSession.id)
+        .outerjoin(ClassSession, MakeupRequest.original_session_id == ClassSession.id)
         .where(MakeupRequest.student_id == user.user_id)
         .order_by(MakeupRequest.created_at.desc())
     )).all()
@@ -1419,8 +1422,10 @@ async def my_makeup_requests(
         nueva = await db.get(ClassSession, r.makeup_session_id) if r.makeup_session_id else None
         out.append({
             "id": r.id,
-            "original_title": orig.title,
-            "original_date": orig.starts_at_utc.isoformat() if orig.starts_at_utc else None,
+            "original_title": orig.title if orig else "Clase de reposición",
+            "original_date": (orig.starts_at_utc.isoformat()
+                              if (orig and orig.starts_at_utc) else None),
+            "created_by": getattr(r, "created_by", "student"),
             "status": r.status,
             "status_label": ESTADOS.get(r.status, r.status),
             "reason": r.reason,

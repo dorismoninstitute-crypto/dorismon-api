@@ -181,6 +181,13 @@ async def init_db():
         # Las clases que ya existen quedan en "meet" (su enlace de siempre),
         # así nada cambia para las clases ya agendadas.
         # V3.9.27: la tabla video_presence la crea sola Base.metadata.create_all
+        v3937_migrations = [
+            "ALTER TABLE makeup_requests ADD COLUMN IF NOT EXISTS created_by VARCHAR DEFAULT 'student'",
+            "ALTER TABLE makeup_requests ADD COLUMN IF NOT EXISTS counts_for_progress BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE makeup_requests ALTER COLUMN original_session_id DROP NOT NULL",
+        ]
+        migrations.extend(v3937_migrations)
+
         v3933_migrations = [
             "ALTER TABLE assignments ADD COLUMN IF NOT EXISTS kind VARCHAR DEFAULT 'written'",
             "ALTER TABLE assignments ADD COLUMN IF NOT EXISTS media_url VARCHAR",

@@ -143,6 +143,50 @@ async def main():
         nop = await c.get("/admin/makeup-requests", headers=SH)
         check("Un estudiante NO ve el panel de reposiciones", nop.status_code in (401, 403))
 
+        # ---------- V3.9.37: el admin agenda sin que la pidan ----------
+        d1 = await c.post("/admin/makeup-requests/direct", headers=AH, json={
+            "student_id": est, "teacher_id": profe["id"],
+            "starts_at_utc": (now + datetime.timedelta(days=5)).isoformat(),
+            "duration_min": 60, "counts_for_progress": False,
+            "reason": "Clase pendiente",
+        })
+        check("El admin agenda una reposición sin clase original", d1.status_code == 201)
+        check("Por defecto NO cuenta para el temario",
+              d1.status_code == 201 and d1.json().get("counts_for_progress") is False)
+
+        d2 = await c.post("/admin/makeup-requests/direct", headers=AH, json={
+            "student_id": est, "teacher_id": profe["id"],
+            "starts_at_utc": (now + datetime.timedelta(days=6)).isoformat(),
+            "counts_for_progress": True, "title": "Test clase extra",
+        })
+        check("Se puede marcar que SÍ cuenta para el temario",
+              d2.status_code == 201 and d2.json().get("counts_for_progress") is True)
+
+        mias2 = (await c.get("/student/makeup-requests", headers=SH)).json()
+        check("El estudiante ve también las que agendó el instituto",
+              len(mias2.get("items", [])) >= 2)
+
+        lst2 = (await c.get("/admin/makeup-requests?status=all", headers=AH)).json()
+        check("El admin ve quién originó cada reposición",
+              any(x.get("created_by") == "admin" for x in lst2.get("items", [])))
+
+        sin_est = await c.post("/admin/makeup-requests/direct", headers=AH,
+                               json={"student_id": ""})
+        check("Sin estudiante, rechaza", sin_est.status_code == 400)
+
+        pasado2 = await c.post("/admin/makeup-requests/direct", headers=AH, json={
+            "student_id": est,
+            "starts_at_utc": (now - datetime.timedelta(days=1)).isoformat(),
+        })
+        check("Fecha en el pasado, rechaza", pasado2.status_code == 400)
+
+        noperm = await c.post("/admin/makeup-requests/direct", headers=SH,
+                              json={"student_id": est})
+        check("Un estudiante NO puede agendar reposiciones", noperm.status_code in (401, 403))
+
+        mc = await c.get(f"/admin/students/{est}/missed-classes", headers=AH)
+        check("Se pueden consultar sus clases perdidas", mc.status_code == 200)
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 

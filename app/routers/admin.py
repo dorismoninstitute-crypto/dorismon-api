@@ -6476,10 +6476,12 @@ async def list_makeups(
     """Las solicitudes de reposición de clases perdidas."""
     from app.models import MakeupRequest
 
+    # V3.9.37: la clase original es opcional (el admin puede reponer algo que
+    # nunca se proyectó), así que el join tiene que ser opcional.
     q = (
         select(MakeupRequest, User, ClassSession)
         .join(User, MakeupRequest.student_id == User.id)
-        .join(ClassSession, MakeupRequest.original_session_id == ClassSession.id)
+        .outerjoin(ClassSession, MakeupRequest.original_session_id == ClassSession.id)
         .order_by(MakeupRequest.created_at.desc())
     )
     if status and status != "all":
@@ -6488,16 +6490,25 @@ async def list_makeups(
     filas = (await db.execute(q)).all()
     out = []
     for r, u, orig in filas:
-        profe = await db.get(User, orig.teacher_id) if orig.teacher_id else None
+        profe = await db.get(User, orig.teacher_id) if (orig and orig.teacher_id) else None
         nueva = await db.get(ClassSession, r.makeup_session_id) if r.makeup_session_id else None
         out.append({
             "id": r.id,
             "student_id": u.id, "student_name": u.full_name, "student_email": u.email,
-            "original_session_id": orig.id,
-            "original_title": orig.title,
-            "original_date": orig.starts_at_utc.isoformat() if orig.starts_at_utc else None,
-            "course_id": orig.course_id, "level_id": orig.level_id,
-            "teacher_id": orig.teacher_id, "teacher_name": profe.full_name if profe else None,
+            "original_session_id": orig.id if orig else None,
+            "original_title": orig.title if orig else "Sin clase original",
+            "original_date": (orig.starts_at_utc.isoformat()
+                              if (orig and orig.starts_at_utc) else None),
+            "course_id": orig.course_id if orig else None,
+            "level_id": orig.level_id if orig else None,
+            "teacher_id": orig.teacher_id if orig else None,
+            "teacher_name": profe.full_name if profe else None,
+            # V3.9.37 — quién la originó y si suma al temario
+            "created_by": getattr(r, "created_by", "student"),
+            "created_by_label": ("La agendó el instituto"
+                                 if getattr(r, "created_by", "student") == "admin"
+                                 else "La pidió el estudiante"),
+            "counts_for_progress": bool(getattr(r, "counts_for_progress", False)),
             "status": r.status, "reason": r.reason,
             "missed_by": r.missed_by,
             "missed_by_label": "El profesor faltó" if r.missed_by == "teacher" else "El estudiante faltó",
@@ -6718,3 +6729,193 @@ async def students_without_schedule(
         })
 
     return {"items": sin_nada, "count": len(sin_nada)}
+
+
+@router.post("/makeup-requests/direct", status_code=201)
+async def create_makeup_direct(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.37 — El admin agenda una reposición directamente.
+
+    PARA QUÉ: no siempre el estudiante la pide. A veces le debes una clase,
+    hubo un problema, o simplemente quieres dársela. Antes había que esperar
+    a que la solicitara.
+
+    La clase original es OPCIONAL: se puede reponer algo que ni siquiera se
+    llegó a proyectar.
+
+    Como siempre: se crea una clase SUELTA. La serie no se toca.
+    """
+    from app.models import MakeupRequest
+
+    student_id = (body.get("student_id") or "").strip()
+    if not student_id:
+        raise HTTPException(400, "Indica a qué estudiante")
+
+    u = await db.get(User, student_id)
+    if not u:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    starts = body.get("starts_at_utc")
+    if not starts:
+        raise HTTPException(400, "Indica la fecha y hora de la clase")
+    try:
+        ini = datetime.fromisoformat(starts.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(400, "La fecha no tiene un formato válido")
+    if ini <= datetime.now(tz.utc):
+        raise HTTPException(400, "La reposición debe ser en el futuro")
+
+    dur = body.get("duration_min", 60)
+    try:
+        dur = max(15, min(240, int(dur)))
+    except (TypeError, ValueError):
+        dur = 60
+
+    # Si indica una clase original, se toman sus datos; si no, los de su
+    # inscripción activa.
+    orig = None
+    if body.get("original_session_id"):
+        orig = await db.get(ClassSession, body["original_session_id"])
+
+    enr = (await db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == student_id,
+            Enrollment.is_active.is_(True),
+        ).limit(1)
+    )).scalar_one_or_none()
+
+    course_id = (orig.course_id if orig else None) or (enr.course_id if enr else None)
+    level_id = (orig.level_id if orig else None) or (enr.level_id if enr else None)
+    if not course_id or not level_id:
+        raise HTTPException(
+            400,
+            "Ese estudiante no tiene una inscripción activa. Inscríbelo primero.",
+        )
+
+    teacher_id = (body.get("teacher_id") or "").strip() or \
+        (orig.teacher_id if orig else None) or (enr.teacher_id if enr else None)
+    if not teacher_id:
+        raise HTTPException(400, "Indica qué profesor la va a dar")
+
+    cuenta = bool(body.get("counts_for_progress", False))
+    titulo = (body.get("title") or "").strip() or (
+        f"🔄 Reposición — {orig.title}" if orig else "🔄 Clase de reposición"
+    )
+
+    nueva = ClassSession(
+        title=titulo[:150],
+        description=(body.get("description") or "").strip() or "Clase de recuperación",
+        course_id=course_id, level_id=level_id,
+        teacher_id=teacher_id,
+        student_id=student_id,     # es SUYA, no del grupo
+        starts_at_utc=ini,
+        ends_at_utc=ini + timedelta(minutes=dur),
+        modality=Modality(body.get("modality") or (orig.modality.value if orig else "online")),
+        meeting_url=body.get("meeting_url") or (orig.meeting_url if orig else None),
+        video_provider=("dorismon" if body.get("video_provider") == "dorismon" else "meet"),
+        capacity=1,
+        counts_for_progress=cuenta,
+        status=SessionStatus.scheduled,
+    )
+    db.add(nueva)
+    await db.flush()
+
+    # Queda registrada como reposición, para llevar la cuenta
+    req = MakeupRequest(
+        student_id=student_id,
+        original_session_id=orig.id if orig else None,
+        status="scheduled",
+        reason=(body.get("reason") or "Agendada por el instituto")[:500],
+        missed_by=("teacher" if body.get("missed_by") == "teacher" else "student"),
+        makeup_session_id=nueva.id,
+        admin_note=(body.get("note") or "")[:250] or None,
+        created_by="admin",
+        counts_for_progress=cuenta,
+        resolved_at=datetime.now(tz.utc),
+    )
+    db.add(req)
+
+    # Si faltó el profesor, la ausencia no cuenta contra el estudiante
+    if orig and req.missed_by == "teacher":
+        try:
+            att = (await db.execute(
+                select(SessionAttendance).where(
+                    SessionAttendance.session_id == orig.id,
+                    SessionAttendance.student_id == student_id,
+                )
+            )).scalar_one_or_none()
+            if att and att.state == AttendanceState.absent:
+                att.state = AttendanceState.excused
+                att.notes = ((att.notes or "") + " · Falta del profesor, se repuso").strip()
+        except Exception:
+            pass
+
+    # Avisar al estudiante y al profesor
+    try:
+        from app.services.push_service import notify_user
+        from zoneinfo import ZoneInfo as _ZI
+        local = ini.astimezone(_ZI("America/Santo_Domingo"))
+        cuando = local.strftime("%d/%m a las %I:%M %p").lstrip("0")
+        cuerpo = f"Tienes una clase de reposición el {cuando}."
+        db.add(Notification(
+            user_id=student_id, type=NotificationType.info,
+            title="🔄 Clase de reposición agendada", body=cuerpo,
+            link="/dashboard/student",
+        ))
+        await notify_user(db, student_id, "🔄 Clase de reposición agendada",
+                          cuerpo, "/dashboard/student", f"makeup:{req.id}")
+        db.add(Notification(
+            user_id=teacher_id, type=NotificationType.info,
+            title="🔄 Clase de reposición asignada",
+            body=f"Con {u.full_name} el {cuando}.", link="/dashboard/teacher",
+        ))
+        await notify_user(db, teacher_id, "🔄 Clase de reposición asignada",
+                          f"Con {u.full_name} el {cuando}.",
+                          "/dashboard/teacher", f"makeup:{req.id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "create_makeup_direct", "sessions",
+                     target_id=nueva.id, details=f"estudiante={student_id}")
+    await db.commit()
+    return {
+        "ok": True, "id": req.id, "session_id": nueva.id,
+        "counts_for_progress": cuenta,
+    }
+
+
+@router.get("/students/{student_id}/missed-classes")
+async def student_missed_classes(
+    student_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Las clases a las que faltó este estudiante, para elegir cuál reponer."""
+    ahora = datetime.now(tz.utc)
+    desde = ahora - timedelta(days=90)
+    filas = (await db.execute(
+        select(SessionAttendance, ClassSession)
+        .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+        .where(
+            SessionAttendance.student_id == student_id,
+            SessionAttendance.state == AttendanceState.absent,
+            ClassSession.starts_at_utc >= desde,
+        ).order_by(ClassSession.starts_at_utc.desc()).limit(20)
+    )).all()
+
+    from app.models import MakeupRequest
+    ya = {x for (x,) in (await db.execute(
+        select(MakeupRequest.original_session_id).where(
+            MakeupRequest.student_id == student_id,
+            MakeupRequest.original_session_id.is_not(None),
+        )
+    )).all()}
+
+    return {"items": [{
+        "session_id": s.id, "title": s.title,
+        "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+        "already_requested": s.id in ya,
+    } for a, s in filas]}
