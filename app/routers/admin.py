@@ -7156,3 +7156,225 @@ async def available_teachers_for_session(
 
     out.sort(key=lambda x: (not x["available"], x["name"]))
     return {"items": out}
+
+
+# ============================================================================
+# V3.9.40 — ASISTENCIA VISTA DESDE EL ADMIN
+# ============================================================================
+
+@router.get("/attendance-overview")
+async def attendance_overview(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    days: int = 14,
+):
+    """V3.9.40 — Quién asistió, quién no, y qué profesores no pasaron lista.
+
+    ANTES el admin solo veía la asistencia entrando estudiante por estudiante.
+    No había forma de ver el panorama, ni de saber qué clases quedaron sin
+    lista (que son las que NO se le pagan al profesor).
+    """
+    ahora = datetime.now(tz.utc)
+    desde = ahora - timedelta(days=max(1, min(90, days)))
+
+    sesiones = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.starts_at_utc >= desde,
+            ClassSession.starts_at_utc <= ahora,
+            ClassSession.status != SessionStatus.cancelled,
+        ).order_by(ClassSession.starts_at_utc.desc())
+    )).scalars().all()
+
+    ids = [s.id for s in sesiones]
+    registros: dict[str, list] = {}
+    if ids:
+        filas = (await db.execute(
+            select(SessionAttendance, User)
+            .join(User, SessionAttendance.student_id == User.id)
+            .where(SessionAttendance.session_id.in_(ids))
+        )).all()
+        for a, u in filas:
+            registros.setdefault(a.session_id, []).append((a, u))
+
+    clases = []
+    sin_lista_por_profe: dict[str, dict] = {}
+    total_presentes = total_ausentes = 0
+
+    for s in sesiones:
+        profe = await db.get(User, s.teacher_id) if s.teacher_id else None
+        marcas = registros.get(s.id, [])
+        con_estado = [(a, u) for a, u in marcas if a.state]
+
+        presentes = sum(1 for a, _ in con_estado if a.state == AttendanceState.present)
+        ausentes = sum(1 for a, _ in con_estado if a.state == AttendanceState.absent)
+        justificados = sum(1 for a, _ in con_estado if a.state == AttendanceState.excused)
+        total_presentes += presentes
+        total_ausentes += ausentes
+
+        tiene_lista = len(con_estado) > 0
+        if not tiene_lista and s.teacher_id:
+            d = sin_lista_por_profe.setdefault(s.teacher_id, {
+                "teacher_id": s.teacher_id,
+                "teacher_name": profe.full_name if profe else "—",
+                "teacher_email": profe.email if profe else None,
+                "count": 0, "classes": [],
+            })
+            d["count"] += 1
+            d["classes"].append({
+                "id": s.id, "title": s.title,
+                "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+            })
+
+        clases.append({
+            "id": s.id, "title": s.title,
+            "starts_at_utc": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+            "teacher_id": s.teacher_id,
+            "teacher_name": profe.full_name if profe else None,
+            "has_attendance": tiene_lista,
+            "present": presentes, "absent": ausentes, "excused": justificados,
+            "total": len(con_estado),
+            "students": [{
+                "student_id": u.id, "name": u.full_name,
+                "state": a.state.value if a.state else None,
+            } for a, u in con_estado],
+            # Lo que importa para el pago
+            "billable": tiene_lista,
+        })
+
+    sin_lista = sorted(sin_lista_por_profe.values(), key=lambda x: -x["count"])
+    total_sin = sum(x["count"] for x in sin_lista)
+
+    return {
+        "days": days,
+        "classes": clases,
+        "totals": {
+            "classes": len(clases),
+            "with_attendance": len(clases) - total_sin,
+            "without_attendance": total_sin,
+            "present": total_presentes,
+            "absent": total_ausentes,
+            "attendance_rate": (
+                round(total_presentes * 100 / (total_presentes + total_ausentes), 1)
+                if (total_presentes + total_ausentes) else None
+            ),
+        },
+        "teachers_missing_attendance": sin_lista,
+    }
+
+
+@router.post("/remind-attendance")
+async def remind_attendance(
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.40 — Recordarle a un profesor que pase la lista.
+
+    Le llega por correo, en la campana y al teléfono. Con el detalle de qué
+    clases le faltan, para que no tenga que buscarlas.
+
+    Si no se indica teacher_id, se le avisa a TODOS los que tienen clases sin
+    lista en los últimos días.
+    """
+    from app.services.push_service import notify_user
+    from app.services.email_service import send_email
+    from zoneinfo import ZoneInfo as _ZI
+
+    dias = body.get("days", 14)
+    try:
+        dias = max(1, min(90, int(dias)))
+    except (TypeError, ValueError):
+        dias = 14
+
+    ahora = datetime.now(tz.utc)
+    desde = ahora - timedelta(days=dias)
+    solo = (body.get("teacher_id") or "").strip() or None
+
+    q = select(ClassSession).where(
+        ClassSession.starts_at_utc >= desde,
+        ClassSession.starts_at_utc <= ahora,
+        ClassSession.status != SessionStatus.cancelled,
+    )
+    if solo:
+        q = q.where(ClassSession.teacher_id == solo)
+    sesiones = (await db.execute(q)).scalars().all()
+
+    ids = [s.id for s in sesiones]
+    con_lista = set()
+    if ids:
+        rows = (await db.execute(
+            select(SessionAttendance.session_id).where(
+                SessionAttendance.session_id.in_(ids),
+                SessionAttendance.state.is_not(None),
+            ).distinct()
+        )).all()
+        con_lista = {x for (x,) in rows}
+
+    pendientes: dict[str, list] = {}
+    for s in sesiones:
+        if s.id in con_lista or not s.teacher_id:
+            continue
+        pendientes.setdefault(s.teacher_id, []).append(s)
+
+    if not pendientes:
+        return {"ok": True, "notified": 0, "mensaje": "No hay clases sin lista pendientes."}
+
+    avisados = 0
+    for teacher_id, lista in pendientes.items():
+        profe = await db.get(User, teacher_id)
+        if not profe:
+            continue
+        n = len(lista)
+        titulo = "📋 Tienes clases sin pasar lista"
+        cuerpo = (
+            f"Tienes {n} clase{'s' if n != 1 else ''} sin asistencia registrada. "
+            "Sin la lista, esas clases no cuentan para tu pago."
+        )
+
+        db.add(Notification(
+            user_id=teacher_id, type=NotificationType.reminder,
+            title=titulo, body=cuerpo, link="/dashboard/teacher",
+        ))
+        try:
+            await notify_user(db, teacher_id, titulo, cuerpo,
+                              "/dashboard/teacher", "asistencia")
+        except Exception:
+            pass
+
+        # Correo con el detalle, para que no tenga que buscarlas
+        try:
+            if profe.email:
+                filas_html = ""
+                for s in lista[:15]:
+                    st = s.starts_at_utc
+                    if st and st.tzinfo is None:
+                        st = st.replace(tzinfo=tz.utc)
+                    cuando = (st.astimezone(_ZI("America/Santo_Domingo"))
+                              .strftime("%d/%m a las %I:%M %p").lstrip("0") if st else "")
+                    filas_html += f"<li>{s.title} — {cuando}</li>"
+                await send_email(
+                    to=profe.email,
+                    subject=f"Tienes {n} clase{'s' if n != 1 else ''} sin pasar lista",
+                    html=(
+                        f"<p>Hola {profe.full_name},</p>"
+                        f"<p>Notamos que estas clases quedaron <strong>sin asistencia "
+                        f"registrada</strong>:</p><ul>{filas_html}</ul>"
+                        f"<p><strong>Importante:</strong> sin la lista, esas clases no "
+                        f"cuentan para tu pago del mes.</p>"
+                        f"<p>Entra a la plataforma y pásala en un minuto: en tu panel "
+                        f"aparecen bajo <em>“Clases sin asistencia”</em>.</p>"
+                        f"<p>— Dorismon Language Institute</p>"
+                    ),
+                )
+        except Exception:
+            pass
+
+        avisados += 1
+
+    await log_action(db, admin.user_id, "remind_attendance", "teachers",
+                     details=f"{avisados} profesores")
+    await db.commit()
+    return {
+        "ok": True, "notified": avisados,
+        "mensaje": f"Se le avisó a {avisados} profesor{'es' if avisados != 1 else ''}.",
+    }
