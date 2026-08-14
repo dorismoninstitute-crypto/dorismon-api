@@ -26,6 +26,51 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 # === DASHBOARD ===
+
+
+async def _destinatarios_de_clase(db, s) -> set[str]:
+    """V3.9.38 — A QUIÉNES les corresponde esta clase.
+
+    UNA SOLA fuente de verdad para todos los avisos (correo, campana,
+    teléfono). Antes cada lugar hacía su propia consulta por nivel, y por eso
+    a Marioli le llegó el correo de una clase de otro grupo.
+
+    Usa el mismo criterio que el estudiante para ver sus clases:
+      - Clase privada o de prueba → solo su estudiante
+      - Evento abierto → los registrados
+      - Clase de una serie → SOLO los inscritos en ESE grupo
+      - Clase suelta sin serie → los del nivel que no están en ningún grupo
+    """
+    if s.student_id:
+        return {s.student_id}
+
+    if s.is_open_event:
+        rows = (await db.execute(
+            select(EventRegistration.student_id).where(
+                EventRegistration.session_id == s.id,
+                EventRegistration.cancelled_at.is_(None),
+            )
+        )).all()
+        return {x for (x,) in rows}
+
+    condiciones = [
+        Enrollment.course_id == s.course_id,
+        Enrollment.level_id == s.level_id,
+        Enrollment.is_active.is_(True),
+    ]
+    if s.series_id:
+        # Es de un grupo: solo a los de ese grupo
+        condiciones.append(Enrollment.series_id == s.series_id)
+    else:
+        # Clase suelta del nivel: solo a quienes no están en ningún grupo
+        # (los que sí están tienen su propio horario y no les toca esta)
+        condiciones.append(Enrollment.series_id.is_(None))
+
+    rows = (await db.execute(
+        select(Enrollment.student_id).where(*condiciones)
+    )).all()
+    return {x for (x,) in rows}
+
 @router.get("/dashboard")
 async def admin_dashboard(
     admin: Annotated[CurrentUser, Depends(require_admin)],
@@ -676,19 +721,8 @@ async def _avisar_clase_nueva(db, s, es_serie: bool = False):
         local = st.astimezone(_ZI("America/Santo_Domingo")) if st else None
         cuando = local.strftime("%d/%m a las %I:%M %p").lstrip("0") if local else ""
 
-        # ¿A quién le toca esta clase?
-        destinatarios: set[str] = set()
-        if s.student_id:
-            destinatarios.add(s.student_id)
-        elif not s.is_open_event:
-            rows = (await db.execute(
-                select(Enrollment.student_id).where(
-                    Enrollment.course_id == s.course_id,
-                    Enrollment.level_id == s.level_id,
-                    Enrollment.is_active.is_(True),
-                )
-            )).all()
-            destinatarios |= {x for (x,) in rows}
+        # V3.9.38 — Misma fuente de verdad: respeta el grupo
+        destinatarios = await _destinatarios_de_clase(db, s)
 
         titulo = "📅 Serie de clases programada" if es_serie else "📅 Tienes una clase nueva"
         cuerpo = f"'{s.title}' — {cuando}"
@@ -4868,18 +4902,14 @@ async def send_class_reminders(
                     classroom_info += f" ({br.address})"
 
         # Buscar estudiantes inscritos
-        student_ids: set[str] = set()
-        if s.student_id:
-            student_ids.add(s.student_id)
-        else:
-            active_enrollments = (await db.execute(
-                select(Enrollment.student_id).where(
-                    Enrollment.course_id == s.course_id,
-                    Enrollment.level_id == s.level_id,
-                    Enrollment.is_active.is_(True),
-                )
-            )).scalars().all()
-            student_ids.update(active_enrollments)
+        # V3.9.38 FIX — Antes se avisaba a TODOS los inscritos del nivel, sin
+        # mirar el grupo. Por eso a Marioli le llegó el correo de una clase de
+        # otro grupo. Ahora se respeta el mismo criterio que usa el estudiante
+        # para ver sus clases: su grupo, o su clase propia.
+        # V3.9.38 — Una sola fuente de verdad: respeta el GRUPO del estudiante.
+        # Antes se avisaba a todos los del nivel y por eso llegaban correos
+        # de clases de otros grupos.
+        student_ids = await _destinatarios_de_clase(db, s)
 
         for sid in student_ids:
             stu = await db.get(User, sid)
@@ -5035,27 +5065,8 @@ async def send_class_reminders(
                 if _st else ""
             )
 
-            # ¿Quiénes deben recibirlo?
-            destinatarios: set[str] = set()
-            if s.student_id:
-                destinatarios.add(s.student_id)  # privada o de prueba
-            elif s.is_open_event:
-                regs = (await db.execute(
-                    select(EventRegistration.student_id).where(
-                        EventRegistration.session_id == s.id,
-                        EventRegistration.cancelled_at.is_(None),
-                    )
-                )).all()
-                destinatarios |= {x for (x,) in regs}
-            else:
-                enr = (await db.execute(
-                    select(Enrollment.student_id).where(
-                        Enrollment.course_id == s.course_id,
-                        Enrollment.level_id == s.level_id,
-                        Enrollment.is_active.is_(True),
-                    )
-                )).all()
-                destinatarios |= {x for (x,) in enr}
+            # V3.9.38 — Misma fuente de verdad: respeta el grupo
+            destinatarios = await _destinatarios_de_clase(db, s)
 
             cuerpo = f"'{s.title}' empieza a las {hora_txt}. ¡Prepárate!"
             for uid in destinatarios:
