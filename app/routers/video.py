@@ -3,7 +3,7 @@ from typing import Annotated
 from datetime import datetime, timedelta, timezone as tz
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -15,7 +15,7 @@ from app.models import (
 from app.services.livekit_service import (
     livekit_ready, livekit_url, build_token, room_name,
     mute_participant, remove_participant, list_participants,
-    MINUTOS_ANTES, MINUTOS_DESPUES,
+    MINUTOS_ANTES, MINUTOS_DESPUES, MINUTOS_GRACIA_FINAL,
 )
 
 # Mínimo de permanencia para sugerir "presente" en la asistencia
@@ -71,30 +71,18 @@ async def join_class_video(
 
     # ¿Puede entrar este estudiante?
     if not is_moderator:
-        allowed = False
-        if s.student_id and s.student_id == user.user_id:
-            allowed = True  # su clase privada o de prueba
-        elif s.is_open_event:
-            reg = (await db.execute(
-                select(EventRegistration).where(
-                    EventRegistration.session_id == session_id,
-                    EventRegistration.student_id == user.user_id,
-                    EventRegistration.cancelled_at.is_(None),
-                )
-            )).scalar_one_or_none()
-            allowed = reg is not None
-        else:
-            enr = (await db.execute(
-                select(Enrollment).where(
-                    Enrollment.student_id == user.user_id,
-                    Enrollment.course_id == s.course_id,
-                    Enrollment.level_id == s.level_id,
-                    Enrollment.is_active.is_(True),
-                )
-            )).scalar_one_or_none()
-            allowed = enr is not None
+        # V3.9.43 — UNA SOLA REGLA para todo. Antes este archivo tenía su
+        # propia copia de la lógica (por eso el video dejaba entrar a quien no
+        # debía, y el evento bloqueaba a quien no se había anotado).
+        from app.services.audience import puede_acceder_a_clase
+        allowed = await puede_acceder_a_clase(db, user.user_id, s)
+
         if not allowed:
-            raise HTTPException(403, "Esta clase no es tuya")
+            raise HTTPException(
+                403,
+                "Esta clase no es de tu grupo. Si crees que es un error, "
+                "escríbenos y lo revisamos.",
+            )
 
     # Ventana de entrada
     now = datetime.now(tz.utc)
@@ -105,13 +93,49 @@ async def join_class_video(
     if ends and ends.tzinfo is None:
         ends = ends.replace(tzinfo=tz.utc)
 
+    # V3.9.43 — Se puede entrar desde 30 min antes y DURANTE TODA LA CLASE.
+    # Antes se cerraba 20 minutos después del inicio y quien llegaba tarde
+    # quedaba afuera. Llegar tarde no debe significar perder la clase.
     if starts and now < starts - timedelta(minutes=MINUTOS_ANTES):
+        faltan = int((starts - now).total_seconds() // 60)
         raise HTTPException(
             400,
-            f"La sala abre {MINUTOS_ANTES} minutos antes de la clase.",
+            f"La sala abre {MINUTOS_ANTES} minutos antes. "
+            f"Faltan {faltan} minutos para tu clase.",
         )
-    if ends and now > ends + timedelta(minutes=MINUTOS_DESPUES):
+    if ends and now > ends + timedelta(minutes=MINUTOS_GRACIA_FINAL):
         raise HTTPException(400, "Esta clase ya terminó.")
+
+    # Si llega tarde, entra igual — solo se deja constancia
+    llega_tarde = bool(starts and now > starts + timedelta(minutes=10))
+
+    # V3.9.43 — AUTO-REGISTRO EN EVENTOS: si es un evento abierto y no se
+    # había anotado, se anota al entrar (si hay cupo). Antes quedaba afuera
+    # aunque llegara a tiempo y hubiera lugar.
+    if s.is_open_event and not is_teacher:
+        ya = (await db.execute(
+            select(EventRegistration).where(
+                EventRegistration.session_id == session_id,
+                EventRegistration.student_id == user.user_id,
+                EventRegistration.cancelled_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if not ya:
+            inscritos = (await db.execute(
+                select(func.count()).select_from(EventRegistration).where(
+                    EventRegistration.session_id == session_id,
+                    EventRegistration.cancelled_at.is_(None),
+                )
+            )).scalar() or 0
+            cupo = s.capacity or 0
+            if cupo and inscritos >= cupo:
+                raise HTTPException(
+                    400,
+                    f"Este evento ya está lleno ({inscritos} de {cupo} lugares). "
+                    "Escríbenos por si se libera un cupo.",
+                )
+            db.add(EventRegistration(session_id=session_id, student_id=user.user_id))
+            await db.commit()
 
     # V3.9.27: dejar constancia de que esta persona entró a la clase.
     # Sirve para sugerir la asistencia después (el profesor confirma).
@@ -137,6 +161,7 @@ async def join_class_video(
         is_moderator=is_moderator,
     )
     return {
+        "late": llega_tarde,
         "token": token,
         "url": livekit_url(),
         "room": room_name(session_id),

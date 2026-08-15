@@ -107,6 +107,41 @@ async def main():
         check("Sin sesión no se accede",
               (await c.get("/admin/attendance-overview")).status_code in (401, 403))
 
+        # ---------- V3.9.41: publicar / despublicar quizzes ----------
+        ia = await c.post("/ai/quiz/create", headers=TH, json={
+            "level_id": lvl["id"],
+            "quiz": {"title": "Test Quiz Publicar", "description": "x",
+                     "questions": [{"text": "I ___ to school",
+                                    "options": ["go", "goes", "going", "gone"],
+                                    "correct_index": 0, "explanation": "x"}]},
+        })
+        check("La IA crea el quiz sin publicar", ia.status_code == 200)
+        if ia.status_code == 200:
+            qid = ia.json().get("quiz_id")
+            check("Queda en borrador al crearse", ia.json().get("published") is False)
+
+            qz = (await c.get("/student/quizzes", headers=SH)).json()
+            lst = qz.get("items", qz) if isinstance(qz, dict) else qz
+            check("Sin publicar, el estudiante NO lo ve",
+                  not any(x.get("id") == qid for x in lst))
+
+            pub = await c.post(f"/teacher/quizzes/{qid}/publish", headers=TH)
+            check("Se puede publicar", pub.status_code == 200)
+            check("Al publicar se avisa a los estudiantes",
+                  pub.json().get("notified", 0) >= 1)
+
+            qz2 = (await c.get("/student/quizzes", headers=SH)).json()
+            lst2 = qz2.get("items", qz2) if isinstance(qz2, dict) else qz2
+            check("Publicado, el estudiante SÍ lo ve",
+                  any(x.get("id") == qid for x in lst2))
+
+            unpub = await c.post(f"/teacher/quizzes/{qid}/unpublish", headers=TH)
+            check("Se puede despublicar", unpub.status_code == 200)
+            qz3 = (await c.get("/student/quizzes", headers=SH)).json()
+            lst3 = qz3.get("items", qz3) if isinstance(qz3, dict) else qz3
+            check("Despublicado, deja de verlo",
+                  not any(x.get("id") == qid for x in lst3))
+
     print(f"{passed}/{total} tests pasaron")
     return 0 if passed == total else 1
 

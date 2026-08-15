@@ -126,20 +126,17 @@ async def student_dashboard(
         _mis_grupos = [e.series_id for e, c, l in enrollments_rows if getattr(e, "series_id", None)]
         # V3.9.34: sus profesores asignados
         _mis_profes = [e.teacher_id for e, c, l in enrollments_rows if getattr(e, "teacher_id", None)]
+        # V3.9.44 — Se usa el FILTRO CENTRAL de audiencia. Antes este listado
+        # tenía su propia condición y por eso las clases sueltas con
+        # destinatarios no le aparecían a quien sí estaba asignado.
+        from app.services.audience import (
+            contexto_academico as _ctx_fn,
+            filtro_clases_del_estudiante as _filtro_clases,
+        )
+        _ctx_clases = await _ctx_fn(db, user.user_id)
         next_sessions_stmt = next_sessions_stmt.where(
             or_(
-                # Grupales del nivel correcto (no privadas)
-                # V3.9.33: si está en grupos, solo ve las clases de SUS grupos
-                # V3.9.34 FIX: si no tiene grupo, además del nivel debe coincidir
-                # el PROFESOR. Antes le aparecían clases de otros estudiantes del
-                # mismo nivel pero con otro profesor.
-                # V3.9.36 — REGLA ESTRICTA: solo las clases de SU grupo.
-                # Sin grupo no hay clases grupales suyas; verá únicamente sus
-                # privadas (que entran por la otra rama del or_).
-                (
-                    (ClassSession.series_id.in_(_mis_grupos)) if _mis_grupos
-                    else false()
-                ) & (ClassSession.student_id.is_(None)),
+                _filtro_clases(_ctx_clases, ClassSession, user.user_id),
                 # Privadas para este estudiante
                 ClassSession.student_id == user.user_id,
             )
@@ -445,6 +442,9 @@ async def my_assignments(
     has_access = await student_has_feature(db, user.user_id, "assignments")
     if not has_access:
         return {"items": [], "blocked_by_plan": True, "feature_key": "assignments"}
+    # V3.9.43: su contexto académico (nivel + grupo + profesor)
+    from app.services.audience import contexto_academico, filtro_actividades_del_estudiante as _filtro_actividades
+    _ctx_tareas = await contexto_academico(db, user.user_id)
     enrollments = (await db.execute(
         select(Enrollment.level_id).where(
             Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
@@ -453,7 +453,8 @@ async def my_assignments(
     if not enrollments:
         return {"items": [], "blocked_by_plan": False}
     items = (await db.execute(
-        select(Assignment).where(Assignment.level_id.in_(enrollments))
+        # V3.9.43 — Filtro por audiencia (profesor + nivel), no solo nivel
+        select(Assignment).where(_filtro_actividades(_ctx_tareas, Assignment))
         .order_by(Assignment.due_at.asc().nullsfirst()).limit(40)
     )).scalars().all()
     out = []
@@ -494,6 +495,10 @@ async def submit_assignment(
     a = await db.get(Assignment, assignment_id)
     if not a:
         raise HTTPException(404, "Tarea no encontrada")
+    # V3.9.43 SEGURIDAD — No se puede entregar la tarea de otro conociendo el ID
+    from app.services.audience import puede_acceder_a_tarea
+    if not await puede_acceder_a_tarea(db, user.user_id, a):
+        raise HTTPException(404, "Tarea no encontrada")
     sub = (await db.execute(
         select(AssignmentSubmission).where(
             AssignmentSubmission.assignment_id == assignment_id,
@@ -524,6 +529,9 @@ async def my_quizzes(
     has_access = await student_has_feature(db, user.user_id, "quizzes")
     if not has_access:
         return {"items": [], "blocked_by_plan": True, "feature_key": "quizzes"}
+    # V3.9.43: mismo contexto para los quizzes
+    from app.services.audience import contexto_academico, filtro_actividades_del_estudiante as _filtro_actividades
+    _ctx_quizzes = await contexto_academico(db, user.user_id)
     enrollments = (await db.execute(
         select(Enrollment.level_id).where(
             Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True),
@@ -532,7 +540,12 @@ async def my_quizzes(
     if not enrollments:
         return {"items": [], "blocked_by_plan": False}
     items = (await db.execute(
-        select(Quiz).where(Quiz.level_id.in_(enrollments), Quiz.is_published.is_(True))
+        # V3.9.43 — Filtro por AUDIENCIA, no solo por nivel. Antes una
+        # estudiante veía los quizzes de un profesor que no era el suyo.
+        select(Quiz).where(
+            _filtro_actividades(_ctx_quizzes, Quiz),
+            Quiz.is_published.is_(True),
+        )
         .order_by(Quiz.created_at.desc()).limit(40)
     )).scalars().all()
     out = []
@@ -569,6 +582,12 @@ async def get_quiz(
     quiz = await db.get(Quiz, quiz_id)
     if not quiz or not quiz.is_published:
         raise HTTPException(404, "Quiz no encontrado")
+    # V3.9.43 SEGURIDAD — Antes bastaba con conocer el ID: un estudiante podía
+    # abrir el quiz de otro profesor. Se devuelve 404 (no 403) para no revelar
+    # que el recurso existe.
+    from app.services.audience import puede_acceder_a_quiz
+    if not await puede_acceder_a_quiz(db, user.user_id, quiz):
+        raise HTTPException(404, "Quiz no encontrado")
     questions = (await db.execute(
         select(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id).order_by(QuizQuestion.order_index)
     )).scalars().all()
@@ -594,6 +613,50 @@ async def submit_quiz(
     quiz = await db.get(Quiz, quiz_id)
     if not quiz:
         raise HTTPException(404, "Quiz no encontrado")
+
+    # V3.9.43 SEGURIDAD — No se puede responder un quiz ajeno conociendo el ID
+    from app.services.audience import puede_acceder_a_quiz
+    if not await puede_acceder_a_quiz(db, user.user_id, quiz):
+        raise HTTPException(404, "Quiz no encontrado")
+
+    # V3.9.43 — max_attempts SE APLICA DE VERDAD. Antes el límite existía en el
+    # modelo pero nunca se comprobaba: se podían hacer intentos infinitos.
+    usados = (await db.execute(
+        select(func.count()).select_from(QuizAttempt).where(
+            QuizAttempt.quiz_id == quiz_id,
+            QuizAttempt.student_id == user.user_id,
+            QuizAttempt.submitted_at.is_not(None),
+        )
+    )).scalar() or 0
+
+    permitidos = int(quiz.max_attempts or 3)
+
+    # Intentos extra concedidos a este estudiante en particular (excepción
+    # individual: NO se toca el max_attempts global del quiz)
+    try:
+        from app.models import QuizAttemptGrant
+        extras = (await db.execute(
+            select(func.coalesce(func.sum(QuizAttemptGrant.extra_attempts), 0)).where(
+                QuizAttemptGrant.quiz_id == quiz_id,
+                QuizAttemptGrant.student_id == user.user_id,
+                QuizAttemptGrant.revoked.is_(False),
+            )
+        )).scalar() or 0
+        permitidos += int(extras)
+    except Exception:
+        pass
+
+    if usados >= permitidos:
+        raise HTTPException(400, {
+            "mensaje": (
+                f"Ya usaste tus {permitidos} intentos en este quiz. "
+                "Habla con tu profesor si necesitas otra oportunidad."
+            ),
+            "attempts_used": usados,
+            "attempts_allowed": permitidos,
+            "needs_reinforcement": True,
+        })
+
     answers = body.get("answers", [])
     if not isinstance(answers, list):
         raise HTTPException(400, "answers debe ser una lista")
@@ -1243,6 +1306,10 @@ async def upload_assignment_file(
 
     a = await db.get(Assignment, assignment_id)
     if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+    # V3.9.43 SEGURIDAD — No se puede entregar la tarea de otro conociendo el ID
+    from app.services.audience import puede_acceder_a_tarea
+    if not await puede_acceder_a_tarea(db, user.user_id, a):
         raise HTTPException(404, "Tarea no encontrada")
 
     tipo = (file.content_type or "").lower()

@@ -334,6 +334,15 @@ class ClassSession(Base):
     reminder_24h_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # V3.9.32: aviso de "tu clase empieza en 30 minutos" (para prepararse)
     reminder_30m_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # V3.9.43 — Histórico del profesor. Regla de Luis: sustituir NO debe
+    # destruir el pasado. teacher_id sigue siendo "quien la da" (y quien
+    # cobra), pero se guarda quién estaba programado originalmente.
+    scheduled_teacher_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # Motivo si la clase se canceló (p.ej. "cancelled_by_teacher")
+    cancel_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    # V3.9.43 — Alerta de profesor que no inició la clase. NO cancela nada:
+    # solo deja constancia para que Dirección decida.
+    teacher_absent_alert_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancellation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancelled_by_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -400,6 +409,9 @@ class Quiz(Base):
     title: Mapped[str] = mapped_column(String)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     level_id: Mapped[int | None] = mapped_column(ForeignKey("levels.id"), nullable=True)
+    # V3.9.45 — A qué grupo va este quiz (mismo criterio que Assignment).
+    # NULL = a todos los del profesor en ese nivel.
+    series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id"), nullable=True)
     passing_score: Mapped[float] = mapped_column(Numeric(5, 2), default=60.0)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     is_published: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -466,6 +478,17 @@ class Assignment(Base):
     max_score: Mapped[float] = mapped_column(Numeric(5, 2), default=100.0)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     allow_file_upload: Mapped[bool] = mapped_column(Boolean, default=True)
+    # V3.9.45 — A qué GRUPO va esta tarea.
+    #
+    # EL HUECO QUE CIERRA: antes la audiencia era teacher_id + level_id. Eso
+    # separaba a dos profesores distintos, pero NO a dos grupos del MISMO
+    # profesor: si Carlos daba B1 mañana y B1 noche, una tarea para uno le
+    # llegaba a los dos.
+    #
+    # NULL = para todos los estudiantes de ese profesor en ese nivel (así se
+    # comportan las tareas que ya existen: compatibilidad total).
+    series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id"), nullable=True)
+
     # V3.9.33 — Tipo de tarea y su contenido
     kind: Mapped[AssignmentKind] = mapped_column(default=AssignmentKind.written,
                                                  server_default="written")
@@ -851,7 +874,73 @@ class MakeupRequest(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class SessionAudience(Base):
+    """V3.9.43 — A quién va dirigida una clase SUELTA.
+
+    EL PROBLEMA QUE RESUELVE: una clase sin serie no pertenece a ningún grupo.
+    Con la regla estricta (solo ves lo de tu grupo), esas clases quedaban
+    invisibles para TODOS. Se creaba una clase y nadie la veía.
+
+    Ahora al crear una clase suelta se puede decir a quién va: a un grupo, a
+    unos estudiantes concretos, o dejarlo abierto a los del profesor en ese
+    nivel.
+    """
+    __tablename__ = "session_audience"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id", ondelete="CASCADE"), index=True)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class QuizAttemptGrant(Base):
+    """V3.9.43 — Intento adicional concedido a UN estudiante.
+
+    Regla de Luis: no se toca el max_attempts global del quiz para darle un
+    intento a una sola persona. Se concede una excepción individual, y queda
+    registrado quién la autorizó y por qué.
+    """
+    __tablename__ = "quiz_attempt_grants"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id", ondelete="CASCADE"), index=True)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"), index=True)
+    extra_attempts: Mapped[int] = mapped_column(Integer, default=1)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    granted_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 Index("ix_sessions_starts", ClassSession.starts_at_utc)
+Index("ix_session_audience", SessionAudience.session_id, SessionAudience.student_id)
+
+
+class ActivityAudience(Base):
+    """V3.9.45 — Audiencia ampliada de una tarea o un quiz.
+
+    PARA QUÉ: `series_id` en la actividad cubre el caso normal (una actividad
+    para UN grupo). Esta tabla existe para lo que viene después sin tener que
+    rehacer nada:
+
+      - la misma tarea para VARIOS grupos → varias filas con series_id
+      - una tarea para estudiantes CONCRETOS → filas con student_id
+
+    Si una actividad tiene filas aquí, mandan estas. Si no tiene, se aplica
+    su `series_id`; y si tampoco, va a todos los del profesor en ese nivel
+    (que es como se comportan las actividades que ya existen).
+    """
+    __tablename__ = "activity_audience"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    # "assignment" o "quiz"
+    activity_type: Mapped[str] = mapped_column(String, index=True)
+    activity_id: Mapped[int] = mapped_column(Integer, index=True)
+    # Uno de los dos: el grupo entero, o un estudiante concreto
+    series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id"), nullable=True)
+    student_id: Mapped[str | None] = mapped_column(ForeignKey("students.user_id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+Index("ix_activity_audience", ActivityAudience.activity_type, ActivityAudience.activity_id)
 Index("ix_makeup_student", MakeupRequest.student_id, MakeupRequest.status)
 Index("ix_alert_actions_key", AlertAction.alert_key)
 Index("ix_video_presence_session_user", VideoPresence.session_id, VideoPresence.user_id)

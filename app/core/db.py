@@ -181,6 +181,25 @@ async def init_db():
         # Las clases que ya existen quedan en "meet" (su enlace de siempre),
         # así nada cambia para las clases ya agendadas.
         # V3.9.27: la tabla video_presence la crea sola Base.metadata.create_all
+        # V3.9.45 — Audiencia por GRUPO en tareas y quizzes.
+        # ADITIVA: las filas existentes quedan con series_id NULL y se
+        # comportan exactamente igual que antes (todos los del profesor en
+        # ese nivel). Ninguna tarea ni quiz existente cambia de audiencia.
+        v3945_migrations = [
+            "ALTER TABLE assignments ADD COLUMN IF NOT EXISTS series_id VARCHAR",
+            "ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS series_id VARCHAR",
+        ]
+        migrations.extend(v3945_migrations)
+
+        v3943_migrations = [
+            "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS scheduled_teacher_id VARCHAR",
+            "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS cancel_reason VARCHAR",
+            "ALTER TABLE class_sessions ADD COLUMN IF NOT EXISTS teacher_absent_alert_at TIMESTAMPTZ",
+            # Las clases que ya existen conservan su profesor como el programado
+            "UPDATE class_sessions SET scheduled_teacher_id = teacher_id WHERE scheduled_teacher_id IS NULL",
+        ]
+        migrations.extend(v3943_migrations)
+
         v3937_migrations = [
             "ALTER TABLE makeup_requests ADD COLUMN IF NOT EXISTS created_by VARCHAR DEFAULT 'student'",
             "ALTER TABLE makeup_requests ADD COLUMN IF NOT EXISTS counts_for_progress BOOLEAN DEFAULT FALSE",

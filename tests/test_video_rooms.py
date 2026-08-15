@@ -80,6 +80,19 @@ async def main():
             "ends_at_utc": (now + datetime.timedelta(minutes=50)).isoformat(),
         }
 
+        # V3.9.43: con la regla de audiencia, una clase "de nivel" ya no
+        # alcanza: tiene que ser de SU profesor (o de su grupo). Se le asigna
+        # ese profesor para que la clase sea suya de verdad.
+        _enr = (await c.get("/admin/enrollments", headers=AH)).json()
+        _ei = _enr.get("items", _enr) if isinstance(_enr, dict) else _enr
+        _mia = [e for e in _ei
+                if e.get("student_id") == mu["items"][0]["id"] and e.get("is_active")]
+        if _mia:
+            await c.patch(f"/admin/enrollments/{_mia[0]['id']}", headers=AH,
+                          json={"teacher_id": profe["id"]})
+            await c.post(f"/admin/enrollments/{_mia[0]['id']}/assign-group",
+                         headers=AH, json={"series_id": ""})
+
         mia = (await c.post("/admin/sessions", headers=AH, json={
             "title": "Test video propio", "modality": "online",
             "teacher_id": profe["id"], "course_id": cid, "level_id": mi_nivel["id"],
@@ -114,6 +127,8 @@ async def main():
             "title": "Test clase futura", "modality": "online",
             "teacher_id": profe["id"], "course_id": cid, "level_id": mi_nivel["id"],
             "video_provider": "dorismon",
+            # V3.9.43: la sala abre 30 min antes (era 15). 5 horas sigue
+            # siendo "mucho antes", así que la prueba sigue siendo válida.
             "starts_at_utc": (now + datetime.timedelta(hours=5)).isoformat(),
             "ends_at_utc": (now + datetime.timedelta(hours=6)).isoformat(),
         })).json()["id"]

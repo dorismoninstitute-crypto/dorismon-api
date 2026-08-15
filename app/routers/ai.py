@@ -124,6 +124,7 @@ async def crear_quiz_directo(
         description=str(datos.get("description") or "")[:400],
         level_id=int(level_id),
         teacher_id=teacher_id,
+        series_id=(body.get("series_id") or None),  # V3.9.45
         is_published=False,  # el profesor lo revisa antes de publicarlo
     )
     db.add(q)

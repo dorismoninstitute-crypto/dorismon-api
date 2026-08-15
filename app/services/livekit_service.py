@@ -27,8 +27,20 @@ import jwt
 log = logging.getLogger(__name__)
 
 # Cuánto antes de la clase se puede entrar, y cuánto después sigue abierta.
-MINUTOS_ANTES = 15
-MINUTOS_DESPUES = 20
+# V3.9.43 — Ventana de entrada a la sala.
+#
+# ANTES: 15 min antes / 20 min después del INICIO. Pasado eso, puerta cerrada.
+# Eso dejó afuera a estudiantes que llegaron tarde y costó dos matrículas.
+#
+# AHORA: se puede entrar desde 30 min antes y DURANTE TODA LA CLASE, más un
+# margen al final por si se extiende. Llegar tarde no es motivo para quedarse
+# afuera: es preferible entrar tarde que perder la clase.
+MINUTOS_ANTES = 30
+# Margen DESPUÉS DE QUE TERMINA la clase (no del inicio)
+MINUTOS_GRACIA_FINAL = 15
+
+# Se conserva el nombre viejo por compatibilidad con código existente
+MINUTOS_DESPUES = MINUTOS_GRACIA_FINAL
 
 
 def livekit_ready() -> bool:

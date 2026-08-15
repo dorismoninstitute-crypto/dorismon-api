@@ -700,6 +700,7 @@ async def list_assignments(
             "max_score": float(a.max_score),
             "due_at": a.due_at.isoformat() if a.due_at else None,
             "kind": (a.kind.value if a.kind else "written"),  # V3.9.33
+            "series_id": getattr(a, "series_id", None),  # V3.9.45
             "media_url": a.media_url,
             "blanks": _leer_blanks(a.blanks_json),
             "level_id": a.level_id,
@@ -724,6 +725,9 @@ async def create_assignment(
         lesson_id=body.get("lesson_id"),
         max_score=body.get("max_score", 100.0),
         due_at=datetime.fromisoformat(body["due_at"].replace("Z", "+00:00")) if body.get("due_at") else None,
+        # V3.9.45 — A qué grupo va. Si no se indica, va a todos los del
+        # profesor en ese nivel (como se comportaba antes).
+        series_id=(body.get("series_id") or None),
         # V3.9.33 — Tipo de tarea (escrita, audio, escuchar, completar...)
         kind=_tipo_tarea(body.get("kind")),
         media_url=(body.get("media_url") or "").strip() or None,
@@ -859,6 +863,8 @@ async def create_quiz(
     q = Quiz(
         title=body["title"], description=body.get("description"),
         teacher_id=teacher.user_id, level_id=body.get("level_id"),
+        # V3.9.45 — A qué grupo va este quiz
+        series_id=(body.get("series_id") or None),
         passing_score=body.get("passing_score", 60.0),
         max_attempts=body.get("max_attempts", 3),
     )

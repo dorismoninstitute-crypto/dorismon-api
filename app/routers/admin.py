@@ -29,47 +29,15 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 async def _destinatarios_de_clase(db, s) -> set[str]:
-    """V3.9.38 — A QUIÉNES les corresponde esta clase.
+    """V3.9.43 — Delega en el servicio central de audiencia.
 
-    UNA SOLA fuente de verdad para todos los avisos (correo, campana,
-    teléfono). Antes cada lugar hacía su propia consulta por nivel, y por eso
-    a Marioli le llegó el correo de una clase de otro grupo.
-
-    Usa el mismo criterio que el estudiante para ver sus clases:
-      - Clase privada o de prueba → solo su estudiante
-      - Evento abierto → los registrados
-      - Clase de una serie → SOLO los inscritos en ESE grupo
-      - Clase suelta sin serie → los del nivel que no están en ningún grupo
+    Antes esta función tenía su propia copia de la regla. Ahora hay UNA sola
+    fuente de verdad (app/services/audience.py) que usan los avisos, los
+    listados y el acceso al video. Así no vuelven a divergir.
     """
-    if s.student_id:
-        return {s.student_id}
+    from app.services.audience import destinatarios_de_clase
+    return await destinatarios_de_clase(db, s)
 
-    if s.is_open_event:
-        rows = (await db.execute(
-            select(EventRegistration.student_id).where(
-                EventRegistration.session_id == s.id,
-                EventRegistration.cancelled_at.is_(None),
-            )
-        )).all()
-        return {x for (x,) in rows}
-
-    condiciones = [
-        Enrollment.course_id == s.course_id,
-        Enrollment.level_id == s.level_id,
-        Enrollment.is_active.is_(True),
-    ]
-    if s.series_id:
-        # Es de un grupo: solo a los de ese grupo
-        condiciones.append(Enrollment.series_id == s.series_id)
-    else:
-        # Clase suelta del nivel: solo a quienes no están en ningún grupo
-        # (los que sí están tienen su propio horario y no les toca esta)
-        condiciones.append(Enrollment.series_id.is_(None))
-
-    rows = (await db.execute(
-        select(Enrollment.student_id).where(*condiciones)
-    )).all()
-    return {x for (x,) in rows}
 
 @router.get("/dashboard")
 async def admin_dashboard(
@@ -776,6 +744,10 @@ async def create_session(
         video_provider=("dorismon" if body.get("video_provider") == "dorismon" else "meet"),  # V3.9.26
         module_id=body.get("module_id"),  # V1.5
         is_open_event=body.get("is_open_event", False),
+        # V3.9.43 — Una clase suelta puede pertenecer a un grupo. Antes no se
+        # podía indicar, así que la clase quedaba sin dueño y NADIE la veía.
+        series_id=body.get("series_id") or None,
+        scheduled_teacher_id=body.get("teacher_id"),
     )
     db.add(s)
     await db.flush()
@@ -795,9 +767,20 @@ async def create_session(
         ))
 
     await log_action(db, admin.user_id, "create_session", "admin", target_id=s.id)
+    await db.flush()
+
+    # V3.9.43 — Destinatarios explícitos de una clase suelta.
+    # Si se indica una lista de estudiantes, SOLO ellos la verán. Resuelve el
+    # caso de la clase que se creaba y no le aparecía a nadie.
+    destinatarios = body.get("student_ids") or []
+    if destinatarios and not s.series_id and not s.student_id:
+        from app.models import SessionAudience
+        for sid in destinatarios[:60]:
+            db.add(SessionAudience(session_id=s.id, student_id=sid))
+
     await db.commit()
     await _avisar_clase_nueva(db, s)  # V3.9.32
-    return {"id": s.id}
+    return {"id": s.id, "audience": len(destinatarios) or None}
 
 
 @router.post("/events", status_code=201)
@@ -827,8 +810,16 @@ async def create_open_event(
             raise HTTPException(400, f"{f} requerido")
 
     modality = Modality(body["modality"])
-    if modality in (Modality.online, Modality.hibrida) and not body.get("meeting_url"):
-        raise HTTPException(400, "Un evento online o híbrido necesita el link (meeting_url)")
+    # V3.9.43 — Si el evento usa el video de Dorismon, NO hace falta un link
+    # externo: la sala se genera sola. Antes se exigía igual y no se podía
+    # crear un evento con video propio.
+    _usa_video_propio = body.get("video_provider") == "dorismon"
+    if (modality in (Modality.online, Modality.hibrida)
+            and not body.get("meeting_url") and not _usa_video_propio):
+        raise HTTPException(
+            400,
+            "Un evento online necesita un link, o elige el video de Dorismon.",
+        )
     if modality in (Modality.presencial, Modality.hibrida) and not body.get("branch_id"):
         raise HTTPException(400, "Un evento presencial o híbrido necesita la sede (branch_id)")
 
@@ -3132,6 +3123,7 @@ async def create_class_series(
             module_id=mod_id,
             series_id=series.id,
             video_provider=_vp,  # V3.9.32
+            scheduled_teacher_id=body.get("teacher_id"),  # V3.9.44: histórico
         )
         db.add(session)
         created_classes += 1
@@ -5100,8 +5092,56 @@ async def send_class_reminders(
     except Exception:
         pass
 
+    # V3.9.43 — Detectar clases donde el profesor no entró (solo alerta)
+    alertas_profe = 0
+    try:
+        from app.models import VideoPresence
+        _lim = now - timedelta(minutes=MINUTOS_PARA_ALERTA_PROFESOR)
+        _ses = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.starts_at_utc <= _lim,
+                ClassSession.ends_at_utc >= now,
+                ClassSession.status == SessionStatus.scheduled,
+                ClassSession.teacher_absent_alert_at.is_(None),
+            )
+        )).scalars().all()
+        for _s in _ses:
+            if not _s.teacher_id:
+                continue
+            _entro = (await db.execute(
+                select(VideoPresence).where(
+                    VideoPresence.session_id == _s.id,
+                    VideoPresence.user_id == _s.teacher_id,
+                )
+            )).scalar_one_or_none()
+            if _entro:
+                continue
+            _profe = await db.get(User, _s.teacher_id)
+            _cuerpo = (f"'{_s.title}' ya empezó y "
+                       f"{_profe.full_name if _profe else 'el profesor'} no ha entrado.")
+            for _a in (await db.execute(
+                select(User).where(User.role == UserRole.super_admin)
+            )).scalars().all():
+                db.add(Notification(
+                    user_id=_a.id, type=NotificationType.reminder,
+                    title="🚨 URGENTE: clase sin iniciar", body=_cuerpo,
+                    link="/dashboard/admin/sessions",
+                ))
+            db.add(Notification(
+                user_id=_s.teacher_id, type=NotificationType.reminder,
+                title="⏰ Tu clase ya empezó",
+                body=f"'{_s.title}' ya empezó. Entra cuanto antes.",
+                link="/dashboard/teacher",
+            ))
+            _s.teacher_absent_alert_at = now
+            alertas_profe += 1
+        await db.commit()
+    except Exception:
+        pass
+
     return {
         "ok": True,
+        "teacher_absent_alerts": alertas_profe,
         "sessions_processed": sessions_processed,
         "emails_sent": total_emails_sent,
         "task_reminders": {"assignments": tasks_processed, "notified": task_notifs},
@@ -7378,3 +7418,362 @@ async def remind_attendance(
         "ok": True, "notified": avisados,
         "mensaje": f"Se le avisó a {avisados} profesor{'es' if avisados != 1 else ''}.",
     }
+
+
+# ============================================================================
+# V3.9.43 — P0: PROFESOR AUSENTE Y REPOSICIÓN GRUPAL
+# ============================================================================
+
+# Minutos tras el inicio sin que el profesor entre, antes de avisar a Dirección
+MINUTOS_PARA_ALERTA_PROFESOR = 7
+
+
+@router.post("/detect-teacher-absent")
+async def detect_teacher_absent(
+    db: AsyncSession = Depends(get_db),
+    x_cron_secret: str | None = Header(None),
+):
+    """V3.9.43 — Detecta clases empezadas donde el profesor NO entró.
+
+    REGLA DE LUIS: esto NO cancela nada. Solo genera la alerta para que
+    Dirección decida (esperar, contactar, sustituto, o reprogramar). Una
+    alerta nunca debe convertirse sola en una cancelación irreversible.
+
+    Lo llama el mismo cron que los recordatorios.
+    """
+    # V3.9.45 SEGURIDAD — Misma política que send-class-reminders: si el
+    # secreto NO está configurado, se DENIEGA. Antes, con el env vacío, este
+    # endpoint quedaba abierto a cualquiera.
+    import os as _os
+    expected = _os.getenv("REMINDER_CRON_SECRET", "")
+    if not expected or x_cron_secret != expected:
+        raise HTTPException(401, "Invalid cron secret")
+
+    from app.models import VideoPresence
+
+    ahora = datetime.now(tz.utc)
+    limite = ahora - timedelta(minutes=MINUTOS_PARA_ALERTA_PROFESOR)
+
+    # Clases que ya empezaron, no terminaron, y aún no se avisó
+    sesiones = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.starts_at_utc <= limite,
+            ClassSession.ends_at_utc >= ahora,
+            ClassSession.status == SessionStatus.scheduled,
+            ClassSession.teacher_absent_alert_at.is_(None),
+        )
+    )).scalars().all()
+
+    alertas = 0
+    for s in sesiones:
+        if not s.teacher_id:
+            continue
+
+        # ¿Entró el profesor al video?
+        entro = (await db.execute(
+            select(VideoPresence).where(
+                VideoPresence.session_id == s.id,
+                VideoPresence.user_id == s.teacher_id,
+            )
+        )).scalar_one_or_none()
+        if entro:
+            continue
+
+        # ¿Hay estudiantes esperando? Es lo que hace urgente el aviso
+        esperando = (await db.execute(
+            select(func.count()).select_from(VideoPresence).where(
+                VideoPresence.session_id == s.id,
+                VideoPresence.user_id != s.teacher_id,
+            )
+        )).scalar() or 0
+
+        profe = await db.get(User, s.teacher_id)
+        minutos = int((ahora - (s.starts_at_utc.replace(tzinfo=tz.utc)
+                                if s.starts_at_utc.tzinfo is None else s.starts_at_utc)
+                       ).total_seconds() // 60)
+
+        cuerpo = (
+            f"'{s.title}' empezó hace {minutos} min y "
+            f"{profe.full_name if profe else 'el profesor'} no ha entrado."
+            + (f" Hay {esperando} estudiante(s) esperando." if esperando else "")
+        )
+
+        admins = (await db.execute(
+            select(User).where(User.role == UserRole.super_admin)
+        )).scalars().all()
+        for a in admins:
+            db.add(Notification(
+                user_id=a.id, type=NotificationType.reminder,
+                title="🚨 URGENTE: clase sin iniciar", body=cuerpo,
+                link="/dashboard/admin/sessions",
+            ))
+            try:
+                from app.services.push_service import notify_user
+                await notify_user(db, a.id, "🚨 URGENTE: clase sin iniciar",
+                                  cuerpo, "/dashboard/admin/sessions", f"ausente:{s.id}")
+            except Exception:
+                pass
+
+        # Recordarle al profesor, por si se le pasó la hora
+        db.add(Notification(
+            user_id=s.teacher_id, type=NotificationType.reminder,
+            title="⏰ Tu clase ya empezó",
+            body=f"'{s.title}' empezó hace {minutos} minutos. Entra cuanto antes.",
+            link="/dashboard/teacher",
+        ))
+        try:
+            from app.services.push_service import notify_user
+            await notify_user(db, s.teacher_id, "⏰ Tu clase ya empezó",
+                              f"'{s.title}' empezó hace {minutos} min.",
+                              "/dashboard/teacher", f"tarde:{s.id}")
+        except Exception:
+            pass
+
+        s.teacher_absent_alert_at = ahora
+        alertas += 1
+
+    await db.commit()
+    return {"ok": True, "alerts": alertas, "checked": len(sesiones)}
+
+
+@router.post("/sessions/{session_id}/cancel-by-teacher")
+async def cancel_by_teacher(
+    session_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.43 — Cancelar una clase porque el profesor no pudo darla, y
+    generar la reposición para TODO EL GRUPO.
+
+    REGLA DE LUIS: si la culpa es del instituto, los estudiantes NO deben
+    pedir la reposición uno por uno. Dirección la programa para todos.
+
+    La clase original queda cancelada (no cuenta como completada) y la
+    reposición la reemplaza académicamente: el contenido se cuenta UNA vez.
+    """
+    from app.models import MakeupRequest
+    from app.services.audience import destinatarios_de_clase
+
+    s = await db.get(ClassSession, session_id)
+    if not s:
+        raise HTTPException(404, "Clase no encontrada")
+    if s.status == SessionStatus.cancelled:
+        raise HTTPException(400, "Esa clase ya está cancelada")
+
+    motivo = (body.get("reason") or "El profesor no pudo impartir la clase").strip()
+
+    # Cancelar la original, dejando constancia del motivo
+    s.status = SessionStatus.cancelled
+    s.cancel_reason = "cancelled_by_teacher"
+
+    afectados = await destinatarios_de_clase(db, s)
+
+    # Si mandan fecha, se agenda la reposición grupal de una vez
+    nueva_id = None
+    nueva_cuando = None
+    if body.get("makeup_starts_at_utc"):
+        try:
+            ini = datetime.fromisoformat(
+                body["makeup_starts_at_utc"].replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(400, "La fecha de reposición no es válida")
+        if ini <= datetime.now(tz.utc):
+            raise HTTPException(400, "La reposición debe ser en el futuro")
+
+        dur = 60
+        if s.starts_at_utc and s.ends_at_utc:
+            dur = max(15, int((s.ends_at_utc - s.starts_at_utc).total_seconds() // 60))
+
+        nueva = ClassSession(
+            title=f"🔄 Reposición — {s.title}",
+            description=f"Repone la clase del {s.starts_at_utc.strftime('%d/%m') if s.starts_at_utc else ''} (el profesor no pudo darla).",
+            course_id=s.course_id, level_id=s.level_id,
+            teacher_id=body.get("teacher_id") or s.teacher_id,
+            scheduled_teacher_id=body.get("teacher_id") or s.teacher_id,
+            series_id=s.series_id,   # sigue siendo del MISMO grupo
+            starts_at_utc=ini,
+            ends_at_utc=ini + timedelta(minutes=dur),
+            modality=s.modality,
+            meeting_url=s.meeting_url,
+            video_provider=getattr(s, "video_provider", "meet"),
+            capacity=s.capacity,
+            # La original no ocurrió: esta la reemplaza académicamente
+            counts_for_progress=True,
+            status=SessionStatus.scheduled,
+        )
+        db.add(nueva)
+        await db.flush()
+        nueva_id = nueva.id
+
+        from zoneinfo import ZoneInfo as _ZI
+        nueva_cuando = ini.astimezone(_ZI("America/Santo_Domingo")).strftime(
+            "%A %d/%m a las %I:%M %p").lstrip("0")
+
+        # Constancia por estudiante, para que los reportes cuadren
+        for uid in afectados:
+            db.add(MakeupRequest(
+                student_id=uid,
+                original_session_id=s.id,
+                status="scheduled",
+                reason=motivo[:500],
+                missed_by="teacher",
+                makeup_session_id=nueva.id,
+                created_by="admin",
+                counts_for_progress=True,
+                resolved_at=datetime.now(tz.utc),
+            ))
+
+    # Avisar a todos los afectados
+    try:
+        from app.services.push_service import notify_user
+        if nueva_cuando:
+            titulo = "🔄 Tu clase fue reprogramada"
+            cuerpo = (f"La clase '{s.title}' se repone el {nueva_cuando}. "
+                      "No perdiste esta clase ni cuenta como ausencia.")
+        else:
+            titulo = "⚠️ Clase cancelada"
+            cuerpo = (f"'{s.title}' fue cancelada. Te avisaremos la nueva fecha. "
+                      "No cuenta como ausencia tuya.")
+
+        for uid in afectados:
+            db.add(Notification(
+                user_id=uid, type=NotificationType.class_cancelled,
+                title=titulo, body=cuerpo, link="/dashboard/student",
+            ))
+            await notify_user(db, uid, titulo, cuerpo,
+                              "/dashboard/student", f"cancel:{s.id}")
+
+        if s.teacher_id:
+            db.add(Notification(
+                user_id=s.teacher_id, type=NotificationType.info,
+                title="Clase cancelada",
+                body=f"'{s.title}' quedó cancelada. {motivo}",
+                link="/dashboard/teacher",
+            ))
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "cancel_by_teacher", "sessions",
+                     target_id=session_id, details=motivo)
+    await db.commit()
+    return {
+        "ok": True,
+        "students_affected": len(afectados),
+        "makeup_session_id": nueva_id,
+        "makeup_when": nueva_cuando,
+        "mensaje": (
+            f"Clase cancelada. {len(afectados)} estudiante(s) avisados"
+            + (f" · reposición el {nueva_cuando}" if nueva_cuando else
+               " · falta programar la reposición")
+        ),
+    }
+
+
+# ============================================================================
+# V3.9.44 — INTENTO EXTRA DE QUIZ (excepción individual)
+# ============================================================================
+
+@router.post("/quizzes/{quiz_id}/grant-attempt", status_code=201)
+async def grant_quiz_attempt(
+    quiz_id: int,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Concede intentos extra a UN estudiante en un quiz.
+
+    REGLA DE LUIS: no se toca el `max_attempts` global del quiz para darle
+    una oportunidad a una sola persona. Se registra una excepción individual
+    con quién la autorizó y por qué.
+    """
+    from app.models import QuizAttemptGrant, Quiz
+
+    q = await db.get(Quiz, quiz_id)
+    if not q:
+        raise HTTPException(404, "Quiz no encontrado")
+
+    student_id = (body.get("student_id") or "").strip()
+    if not student_id:
+        raise HTTPException(400, "Indica a qué estudiante")
+    u = await db.get(User, student_id)
+    if not u:
+        raise HTTPException(404, "Estudiante no encontrado")
+
+    extras = body.get("extra_attempts", 1)
+    try:
+        extras = max(1, min(5, int(extras)))
+    except (TypeError, ValueError):
+        extras = 1
+
+    motivo = (body.get("reason") or "").strip()
+    if not motivo:
+        raise HTTPException(400, "Explica por qué se concede el intento extra")
+
+    g = QuizAttemptGrant(
+        quiz_id=quiz_id, student_id=student_id,
+        extra_attempts=extras, reason=motivo[:250],
+        granted_by=admin.user_id,
+    )
+    db.add(g)
+
+    try:
+        from app.services.push_service import notify_user
+        cuerpo = f"Puedes volver a intentar '{q.title}'. {motivo}"
+        db.add(Notification(
+            user_id=student_id, type=NotificationType.info,
+            title="🔄 Intento adicional concedido", body=cuerpo,
+            link="/dashboard/student/quizzes",
+        ))
+        await notify_user(db, student_id, "🔄 Intento adicional concedido",
+                          cuerpo, "/dashboard/student/quizzes", f"grant:{quiz_id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "grant_quiz_attempt", "quizzes",
+                     target_id=str(quiz_id), details=f"{student_id}: +{extras} · {motivo}")
+    await db.commit()
+    return {"ok": True, "id": g.id, "extra_attempts": extras}
+
+
+@router.get("/quizzes/{quiz_id}/grants")
+async def list_quiz_grants(
+    quiz_id: int,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Las excepciones concedidas en este quiz, para auditarlas."""
+    from app.models import QuizAttemptGrant
+
+    filas = (await db.execute(
+        select(QuizAttemptGrant, User)
+        .join(User, QuizAttemptGrant.student_id == User.id)
+        .where(QuizAttemptGrant.quiz_id == quiz_id)
+        .order_by(QuizAttemptGrant.created_at.desc())
+    )).all()
+    return {"items": [{
+        "id": g.id, "student_id": u.id, "student_name": u.full_name,
+        "extra_attempts": g.extra_attempts, "reason": g.reason,
+        "revoked": g.revoked,
+        "created_at": g.created_at.isoformat() if g.created_at else None,
+    } for g, u in filas]}
+
+
+@router.post("/quiz-grants/{grant_id}/revoke")
+async def revoke_quiz_grant(
+    grant_id: str,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Revocar un intento extra que aún no se usó."""
+    from app.models import QuizAttemptGrant
+
+    g = await db.get(QuizAttemptGrant, grant_id)
+    if not g:
+        raise HTTPException(404, "Concesión no encontrada")
+    if g.used:
+        raise HTTPException(400, "Ese intento ya se usó, no se puede revocar")
+    g.revoked = True
+    await log_action(db, admin.user_id, "revoke_quiz_grant", "quizzes", target_id=grant_id)
+    await db.commit()
+    return {"ok": True}
