@@ -185,6 +185,18 @@ async def init_db():
         # ADITIVA: las filas existentes quedan con series_id NULL y se
         # comportan exactamente igual que antes (todos los del profesor en
         # ese nivel). Ninguna tarea ni quiz existente cambia de audiencia.
+        # V3.9.46 P1 — Audiencia de materiales.
+        # ADITIVA Y CONSERVADORA: todos los materiales existentes quedan como
+        # "institutional", que es como se comportaban. No se les inventa una
+        # audiencia que nadie definió.
+        v3946_migrations = [
+            "ALTER TABLE materials ADD COLUMN IF NOT EXISTS audience_kind VARCHAR DEFAULT 'institutional'",
+            "ALTER TABLE materials ADD COLUMN IF NOT EXISTS series_id VARCHAR",
+            "ALTER TABLE materials ADD COLUMN IF NOT EXISTS student_id VARCHAR",
+            "UPDATE materials SET audience_kind = 'institutional' WHERE audience_kind IS NULL",
+        ]
+        migrations.extend(v3946_migrations)
+
         v3945_migrations = [
             "ALTER TABLE assignments ADD COLUMN IF NOT EXISTS series_id VARCHAR",
             "ALTER TABLE quizzes ADD COLUMN IF NOT EXISTS series_id VARCHAR",

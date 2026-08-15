@@ -75,14 +75,15 @@ async def _avisar_quiz_publicado(db, q, preguntas: int) -> int:
     if not q.level_id:
         return 0
 
+    # V3.9.46 P1 — Misma audiencia que el quiz. Antes se avisaba a todo el
+    # nivel: si el quiz era para el grupo de la mañana, el de la noche
+    # también recibía correo y notificación de un quiz que ni siquiera podía
+    # abrir.
+    from app.services.audience import destinatarios_de_actividad
+    _ids = await destinatarios_de_actividad(db, q)
     filas = (await db.execute(
-        select(Enrollment.student_id, User.email, User.full_name)
-        .join(User, Enrollment.student_id == User.id)
-        .where(
-            Enrollment.level_id == q.level_id,
-            Enrollment.is_active.is_(True),
-        ).distinct()
-    )).all()
+        select(User.id, User.email, User.full_name).where(User.id.in_(_ids))
+    )).all() if _ids else []
 
     titulo = "📝 Nuevo quiz disponible"
     cuerpo = f"'{q.title}' — {preguntas} preguntas. ¡Ponte a prueba!"
@@ -391,16 +392,24 @@ async def get_attendance(
         assigned_user = await db.get(User, session.student_id)
         rows = [(None, assigned_user)] if assigned_user else []
     else:
-        students_q = (
-            select(Enrollment, User)
-            .join(User, Enrollment.student_id == User.id)
-            .where(
-                Enrollment.course_id == session.course_id,
-                Enrollment.level_id == session.level_id,
-                Enrollment.is_active.is_(True),
+        # V3.9.46 P1 — El roster para pasar lista usa la MISMA audiencia que
+        # la clase. Antes traía a TODOS los del nivel: en una clase del grupo
+        # de la mañana le aparecían también los de la noche, y el profesor
+        # podía marcar asistencia a quien no estuvo invitado.
+        from app.services.audience import destinatarios_de_clase
+        _ids = await destinatarios_de_clase(db, session)
+        if _ids:
+            students_q = (
+                select(Enrollment, User)
+                .join(User, Enrollment.student_id == User.id)
+                .where(
+                    Enrollment.student_id.in_(_ids),
+                    Enrollment.is_active.is_(True),
+                )
             )
-        )
-        rows = (await db.execute(students_q)).all()
+            rows = (await db.execute(students_q)).all()
+        else:
+            rows = []
     # V3.0: avisos de ausencia para esta clase
     from app.models import AbsenceNotice
     absence_map = {}
@@ -717,6 +726,12 @@ async def create_assignment(
 ):
     if not body.get("title"):
         raise HTTPException(400, "title requerido")
+    # V3.9.47 SEGURIDAD — El series_id que llega NO se acepta a ciegas: se
+    # comprueba que ese grupo sea de este profesor. Antes bastaba con conocer
+    # el ID de un grupo ajeno para dirigirle contenido.
+    from app.services.teacher_permissions import exigir_grupo_propio
+    await exigir_grupo_propio(db, teacher.user_id, body.get("series_id"))
+
     a = Assignment(
         title=body["title"], description=body.get("description"),
         instructions=body.get("instructions"),
@@ -736,13 +751,12 @@ async def create_assignment(
     db.add(a)
     await db.flush()
 
-    # Crear notificaciones a estudiantes del nivel
+    # V3.9.46 P1 — Los avisos usan la MISMA audiencia que el recurso. Antes
+    # se avisaba a todos los inscritos del nivel: si la tarea era para el
+    # grupo de la mañana, el de la noche también recibía el aviso.
     if a.level_id:
-        students = (await db.execute(
-            select(Enrollment.student_id).where(
-                Enrollment.level_id == a.level_id, Enrollment.is_active.is_(True),
-            )
-        )).scalars().all()
+        from app.services.audience import destinatarios_de_actividad
+        students = await destinatarios_de_actividad(db, a)
         for sid in students:
             db.add(Notification(
                 user_id=sid, type=NotificationType.new_assignment,
@@ -860,6 +874,10 @@ async def create_quiz(
     """body = {title, description, level_id, passing_score, questions: [{type, statement, options, correct_answer, points}]}"""
     if not body.get("title"):
         raise HTTPException(400, "title requerido")
+    # V3.9.47 SEGURIDAD — mismo control para los quizzes
+    from app.services.teacher_permissions import exigir_grupo_propio
+    await exigir_grupo_propio(db, teacher.user_id, body.get("series_id"))
+
     q = Quiz(
         title=body["title"], description=body.get("description"),
         teacher_id=teacher.user_id, level_id=body.get("level_id"),
@@ -901,7 +919,19 @@ async def list_materials(
     teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Material).order_by(Material.created_at.desc()).limit(200)
+    # V3.9.47 SEGURIDAD — Antes el listado traía TODOS los materiales: un
+    # profesor veía el material privado que otro había subido para un
+    # estudiante suyo, con su URL incluida.
+    from app.services.teacher_permissions import (
+        es_admin, grupos_del_profesor, filtro_materiales_del_profesor,
+    )
+    if await es_admin(db, teacher.user_id):
+        stmt = select(Material)
+    else:
+        _grupos = await grupos_del_profesor(db, teacher.user_id)
+        stmt = select(Material).where(
+            filtro_materiales_del_profesor(Material, teacher.user_id, _grupos)
+        )
     items = (await db.execute(stmt)).scalars().all()
     return [{
         "id": m.id, "title": m.title, "description": m.description,
@@ -920,6 +950,17 @@ async def upload_material(
 ):
     if not body.get("title") or not body.get("url") or not body.get("type"):
         raise HTTPException(400, "title, url y type son requeridos")
+    # V3.9.47 SEGURIDAD — tres controles antes de guardar:
+    #   · el grupo debe ser suyo
+    #   · el estudiante debe ser suyo (material individual)
+    #   · "institucional" es contenido oficial: solo el admin
+    from app.services.teacher_permissions import (
+        exigir_grupo_propio, exigir_estudiante_propio, resolver_audiencia_material,
+    )
+    await exigir_grupo_propio(db, teacher.user_id, body.get("series_id"))
+    await exigir_estudiante_propio(db, teacher.user_id, body.get("student_id"))
+    _aud = await resolver_audiencia_material(db, teacher.user_id, body)
+
     m = Material(
         title=body["title"], description=body.get("description"),
         type=MaterialType(body["type"]), url=body["url"],
@@ -927,6 +968,14 @@ async def upload_material(
         module_id=body.get("module_id"), lesson_id=body.get("lesson_id"),
         uploaded_by=teacher.user_id,
         is_public=body.get("is_public", True),
+        # V3.9.46 P1 — A quién va este material.
+        #   "teacher" (por defecto del profesor): a sus estudiantes, o solo a
+        #             un grupo si se indica series_id
+        #   "student": a un estudiante concreto (feedback, refuerzo)
+        #   "institutional": material de Dorismon para todo el nivel/curso
+        audience_kind=_aud["audience_kind"],
+        series_id=_aud["series_id"],
+        student_id=_aud["student_id"],
     )
     db.add(m)
     await log_action(db, teacher.user_id, "upload_material", "teacher", target_id=str(m.id))
@@ -962,6 +1011,11 @@ async def add_observation(
 ):
     if not body.get("content"):
         raise HTTPException(400, "content requerido")
+    # V3.9.47 SEGURIDAD — Antes cualquier profesor podía dejar una
+    # observación sobre un estudiante que no era suyo.
+    from app.services.teacher_permissions import exigir_estudiante_propio
+    await exigir_estudiante_propio(db, teacher.user_id, student_id)
+
     o = Observation(
         student_id=student_id, teacher_id=teacher.user_id,
         content=body["content"], is_private=body.get("is_private", True),
@@ -1228,16 +1282,13 @@ async def cancel_my_session(
     if s.student_id:
         student_ids.add(s.student_id)
 
-    # 3. Si la clase es grupal: estudiantes con enrollment activo en ese course+level
+    # 3. Si la clase es grupal: los de SU audiencia.
+    # V3.9.46 P1 — Antes se avisaba a todos los del curso+nivel: al cancelar
+    # una clase del grupo de la mañana, el de la noche también recibía el
+    # aviso de una cancelación que no le afectaba.
     if not s.student_id:  # clase grupal
-        active_enrollments = (await db.execute(
-            select(Enrollment.student_id).where(
-                Enrollment.course_id == s.course_id,
-                Enrollment.level_id == s.level_id,
-                Enrollment.is_active.is_(True),
-            )
-        )).scalars().all()
-        for sid in active_enrollments:
+        from app.services.audience import destinatarios_de_clase
+        for sid in await destinatarios_de_clase(db, s):
             student_ids.add(sid)
 
     # Crear notificaciones in-app
@@ -1347,6 +1398,10 @@ async def publish_quiz(
     q = await db.get(Quiz, quiz_id)
     if not q:
         raise HTTPException(404, "Quiz no encontrado")
+    # V3.9.47 SEGURIDAD — Antes cualquier profesor podía publicar o
+    # despublicar el quiz de otro con solo conocer el ID.
+    from app.services.teacher_permissions import exigir_actividad_propia
+    await exigir_actividad_propia(db, teacher.user_id, q, "quiz")
 
     preguntas = (await db.execute(
         select(func.count()).select_from(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id)
@@ -1376,6 +1431,80 @@ async def unpublish_quiz(
     q = await db.get(Quiz, quiz_id)
     if not q:
         raise HTTPException(404, "Quiz no encontrado")
+    # V3.9.47 SEGURIDAD — igual que publicar
+    from app.services.teacher_permissions import exigir_actividad_propia
+    await exigir_actividad_propia(db, teacher.user_id, q, "quiz")
     q.is_published = False
     await db.commit()
     return {"ok": True, "published": False}
+
+
+@router.get("/my-groups")
+async def my_groups(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.48 — Los grupos de los que este profesor es RESPONSABLE.
+
+    POR QUÉ EXISTE: el selector de audiencia del panel llamaba a
+    `/admin/groups`, que exige rol de admin. El profesor recibía 403, el
+    componente lo convertía en lista vacía, y le decía "No hay grupos" aunque
+    sí los tuviera.
+
+    Devuelve SOLO sus grupos. Un profesor nunca necesita ver los de otros.
+
+    ⚠️ Sustituir una sesión NO hace aparecer aquí el grupo del titular: eso
+    se autoriza por sesión, no por grupo.
+    """
+    from app.services.teacher_permissions import es_admin, grupos_del_profesor
+    from app.models import ClassSeries
+
+    ahora = datetime.now(tz.utc)
+
+    if await es_admin(db, teacher.user_id):
+        series = (await db.execute(
+            select(ClassSeries).where(ClassSeries.is_active.is_(True))
+            .order_by(ClassSeries.created_at.desc())
+        )).scalars().all()
+    else:
+        mios = await grupos_del_profesor(db, teacher.user_id)
+        if not mios:
+            return {"items": []}
+        series = (await db.execute(
+            select(ClassSeries).where(
+                ClassSeries.id.in_(mios),
+                ClassSeries.is_active.is_(True),
+            ).order_by(ClassSeries.created_at.desc())
+        )).scalars().all()
+
+    out = []
+    for s in series:
+        inscritos = (await db.execute(
+            select(func.count()).select_from(Enrollment).where(
+                Enrollment.series_id == s.id,
+                Enrollment.is_active.is_(True),
+            )
+        )).scalar() or 0
+        futuras = (await db.execute(
+            select(func.count()).select_from(ClassSession).where(
+                ClassSession.series_id == s.id,
+                ClassSession.starts_at_utc >= ahora,
+                ClassSession.status != SessionStatus.cancelled,
+            )
+        )).scalar() or 0
+        nivel = await db.get(Level, s.level_id) if s.level_id else None
+
+        out.append({
+            "id": s.id,
+            "name": s.name,
+            "level_id": s.level_id,
+            "level_code": nivel.code if nivel else None,
+            "course_id": s.course_id,
+            "days_of_week": s.days_of_week,
+            "start_time_hhmm": s.start_time_hhmm,
+            "modality": s.modality.value if s.modality else None,
+            "students": inscritos,
+            "capacity": s.capacity or 6,
+            "upcoming_classes": futuras,
+        })
+    return {"items": out}

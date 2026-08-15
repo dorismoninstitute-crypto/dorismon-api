@@ -164,11 +164,16 @@ async def student_dashboard(
         })
 
     # Tareas pendientes
+    # V3.9.46 P1 — Las tareas pendientes del panel también por audiencia.
+    # Antes se contaban las de todo el nivel: el número no coincidía con lo
+    # que el estudiante veía al entrar a Tareas.
+    from app.services.audience import (
+        contexto_academico as _ctx_dash,
+        filtro_actividades_del_estudiante as _filtro_dash,
+    )
+    _ctx_d = await _ctx_dash(db, user.user_id)
     pending_assignments_q = (
-        select(Assignment).where(
-            (Assignment.level_id.in_([l.id for _, _, l in enrollments_rows])
-             if enrollments_rows else False)
-        )
+        select(Assignment).where(_filtro_dash(_ctx_d, Assignment))
     ) if enrollments_rows else None
     pending_assignments = 0
     next_assignment = None
@@ -193,8 +198,12 @@ async def student_dashboard(
     pending_quizzes = 0
     if enrollments_rows:
         level_ids = [l.id for _, _, l in enrollments_rows]
+        # V3.9.46 P1 — Mismo criterio que la sección de Quizzes
         quizzes = (await db.execute(
-            select(Quiz).where(Quiz.level_id.in_(level_ids), Quiz.is_published.is_(True)).limit(20)
+            select(Quiz).where(
+                _filtro_dash(_ctx_d, Quiz),
+                Quiz.is_published.is_(True),
+            ).limit(20)
         )).scalars().all()
         for q in quizzes:
             attempts = (await db.execute(
@@ -722,16 +731,23 @@ async def my_calendar(
     )).scalars().all()
 
     events = []
-    # V3.0.2: clases del estudiante = grupales de su nivel + privadas suyas (incluye clase de prueba)
-    # Antes solo mostraba grupales si había inscripción; ahora también las privadas con student_id.
+    # V3.9.46 P1 — El calendario usa la MISMA fuente central de audiencia que
+    # el resto. Antes se filtraba solo por nivel, así que a un estudiante le
+    # aparecían en el calendario clases y tareas de otro profesor u otro
+    # grupo — aunque no pudiera abrirlas. El calendario debe mostrar
+    # exactamente lo que sí puede acceder.
+    from app.services.audience import (
+        contexto_academico as _ctx_fn,
+        filtro_clases_del_estudiante as _filtro_clases,
+        filtro_actividades_del_estudiante as _filtro_act,
+    )
+    _ctx_cal = await _ctx_fn(db, user.user_id)
+
     session_filter = ClassSession.student_id == user.user_id  # privadas (incluye trial)
     if enrollments:
         session_filter = or_(
             ClassSession.student_id == user.user_id,
-            and_(
-                ClassSession.level_id.in_(enrollments),
-                ClassSession.student_id.is_(None),
-            ),
+            _filtro_clases(_ctx_cal, ClassSession, user.user_id),
         )
     sessions = (await db.execute(
         select(ClassSession).where(
@@ -750,9 +766,10 @@ async def my_calendar(
             "location": await _build_location(db, s),  # V3.0.3
         })
     if enrollments:
+        # V3.9.46 P1 — Tareas por audiencia, no solo por nivel
         assignments = (await db.execute(
             select(Assignment).where(
-                Assignment.level_id.in_(enrollments),
+                _filtro_act(_ctx_cal, Assignment),
                 Assignment.due_at >= now,
                 Assignment.due_at < horizon,
             )
@@ -762,6 +779,52 @@ async def my_calendar(
                 "type": "assignment", "id": a.id, "title": a.title,
                 "starts_at": a.due_at.isoformat() if a.due_at else None,
             })
+
+        # V3.9.46 P1 — Los QUIZZES también van al calendario, con su misma
+        # audiencia. Antes no aparecían: el estudiante tenía que acordarse de
+        # entrar a la sección de quizzes para enterarse.
+        quizzes_cal = (await db.execute(
+            select(Quiz).where(
+                _filtro_act(_ctx_cal, Quiz),
+                Quiz.is_published.is_(True),
+                Quiz.due_at.is_not(None),
+                Quiz.due_at >= now,
+                Quiz.due_at < horizon,
+            )
+        )).scalars().all() if hasattr(Quiz, "due_at") else []
+        for q in quizzes_cal:
+            events.append({
+                "type": "quiz", "id": q.id, "title": q.title,
+                "starts_at": q.due_at.isoformat() if q.due_at else None,
+            })
+
+    # V3.9.46 P1 — Los EVENTOS a los que se inscribió. Antes no aparecían en
+    # el calendario aunque se hubiera anotado, así que tenía que volver a
+    # buscarlos a mano.
+    from app.models import EventRegistration
+    inscritos = (await db.execute(
+        select(ClassSession)
+        .join(EventRegistration, EventRegistration.session_id == ClassSession.id)
+        .where(
+            EventRegistration.student_id == user.user_id,
+            EventRegistration.cancelled_at.is_(None),
+            ClassSession.ends_at_utc >= now,
+            ClassSession.starts_at_utc < horizon,
+            ClassSession.status == "scheduled",
+        )
+    )).scalars().all()
+    _ya = {e["id"] for e in events}
+    for s in inscritos:
+        if s.id in _ya:
+            continue
+        events.append({
+            "type": "event", "id": s.id, "title": s.title,
+            "starts_at": s.starts_at_utc.isoformat() if s.starts_at_utc else None,
+            "modality": s.modality.value if s.modality else None,
+            "meeting_url": s.meeting_url,
+            "registered": True,
+        })
+
     events.sort(key=lambda e: e["starts_at"] or "")
     return events
 
@@ -886,7 +949,15 @@ async def my_library(
     type: str | None = None,
 ):
     """Biblioteca filtrable."""
-    stmt = select(Material).where(Material.is_public.is_(True))
+    # V3.9.46 P1 — Los materiales respetan su audiencia. Antes bastaba con
+    # is_public, así que un estudiante veía el material que un profesor había
+    # subido para otro grupo.
+    from app.services.audience import (
+        contexto_academico as _ctx_m,
+        filtro_materiales_del_estudiante as _filtro_mat,
+    )
+    _ctx_mat = await _ctx_m(db, user.user_id)
+    stmt = select(Material).where(_filtro_mat(_ctx_mat, Material, user.user_id))
     if course_id:
         stmt = stmt.where(Material.course_id == course_id)
     if level_id:
@@ -1156,21 +1227,11 @@ async def notify_absence(
     if starts < now:
         raise HTTPException(400, "Esta clase ya pasó, no puedes avisar ausencia")
 
-    # Verificar que el estudiante pertenece a esta clase
-    # (grupal de su nivel o privada para él)
-    belongs = False
-    if session.student_id == user.user_id:
-        belongs = True
-    else:
-        enr = (await db.execute(
-            select(Enrollment).where(
-                Enrollment.student_id == user.user_id,
-                Enrollment.level_id == session.level_id,
-                Enrollment.is_active.is_(True),
-            )
-        )).scalar_one_or_none()
-        if enr:
-            belongs = True
+    # V3.9.46 P1 — Se usa la misma regla de audiencia que para ver la clase.
+    # Antes bastaba con estar en el mismo nivel: se podía avisar ausencia de
+    # una clase de otro grupo.
+    from app.services.audience import puede_acceder_a_clase
+    belongs = await puede_acceder_a_clase(db, user.user_id, session)
     if not belongs:
         raise HTTPException(403, "Esta clase no está en tu plan")
 

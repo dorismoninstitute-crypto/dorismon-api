@@ -390,3 +390,85 @@ def filtro_actividades_del_estudiante(ctx: dict, Modelo):
         )
 
     return and_(base, or_(de_su_grupo, sin_grupo))
+
+
+# ============================================================================
+# V3.9.46 P1 — MATERIALES
+# ============================================================================
+
+def filtro_materiales_del_estudiante(ctx: dict, Material, student_id: str):
+    """Qué materiales puede ver este estudiante.
+
+    Tres tipos de audiencia:
+
+      INSTITUCIONAL → de Dorismon, para todos / un curso / un nivel.
+                      Es como se comportaban TODOS los materiales antes, y es
+                      lo que quedan siendo los existentes.
+      DEL PROFESOR  → si tiene `series_id`, solo ese grupo; si no, todos los
+                      estudiantes de ese profesor.
+      INDIVIDUAL    → solo el estudiante indicado (feedback, refuerzo).
+    """
+    from sqlalchemy import and_, or_, false
+
+    opciones = []
+
+    # 1. Institucional: público y del curso/nivel del estudiante (o general)
+    inst = [Material.is_public.is_(True)]
+    if ctx["level_ids"]:
+        inst.append(or_(
+            Material.level_id.is_(None),
+            Material.level_id.in_(ctx["level_ids"]),
+        ))
+    else:
+        inst.append(Material.level_id.is_(None))
+    opciones.append(and_(
+        or_(Material.audience_kind == "institutional",
+            Material.audience_kind.is_(None)),  # históricos
+        *inst,
+    ))
+
+    # 2. Del profesor: de su grupo, o de su profesor sin grupo definido
+    if ctx["series_ids"]:
+        opciones.append(and_(
+            Material.audience_kind == "teacher",
+            Material.series_id.in_(ctx["series_ids"]),
+        ))
+    if ctx["teacher_ids"]:
+        opciones.append(and_(
+            Material.audience_kind == "teacher",
+            Material.series_id.is_(None),
+            Material.uploaded_by.in_(ctx["teacher_ids"]),
+        ))
+
+    # 3. Individual: solo suyo
+    opciones.append(and_(
+        Material.audience_kind == "student",
+        Material.student_id == student_id,
+    ))
+
+    return or_(*opciones) if opciones else false()
+
+
+async def puede_acceder_a_material(db: AsyncSession, student_id: str, material) -> bool:
+    """¿Puede este estudiante abrir este material?
+
+    Se usa al descargar por ID: no basta con que no aparezca en el listado.
+    """
+    tipo = getattr(material, "audience_kind", None) or "institutional"
+    ctx = await contexto_academico(db, student_id)
+
+    if tipo == "student":
+        return material.student_id == student_id
+
+    if tipo == "teacher":
+        grupo = getattr(material, "series_id", None)
+        if grupo:
+            return grupo in ctx["series_ids"]
+        return material.uploaded_by in ctx["teacher_ids"]
+
+    # Institucional (incluye los históricos)
+    if not material.is_public:
+        return False
+    if material.level_id and material.level_id not in ctx["level_ids"]:
+        return False
+    return True

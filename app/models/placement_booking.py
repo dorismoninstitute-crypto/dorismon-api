@@ -526,6 +526,23 @@ class Material(Base):
     lesson_id: Mapped[int | None] = mapped_column(ForeignKey("lessons.id"), nullable=True)
     uploaded_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # V3.9.46 P1 — AUDIENCIA DEL MATERIAL.
+    #
+    # Los tres casos que pediste:
+    #   INSTITUCIONAL → audience_kind="institutional" (curso/nivel/módulo/lección)
+    #   DEL PROFESOR  → audience_kind="teacher", con series_id si es de un grupo
+    #   INDIVIDUAL    → audience_kind="student", con student_id
+    #
+    # ⚠️ COMPATIBILIDAD: los materiales que YA EXISTEN quedan como
+    # "institutional", que es exactamente como se comportaban (is_public +
+    # filtro por nivel). NO se les inventa una audiencia que nadie definió.
+    audience_kind: Mapped[str] = mapped_column(
+        String, default="institutional", server_default="institutional")
+    # Para material de un grupo concreto
+    series_id: Mapped[str | None] = mapped_column(ForeignKey("class_series.id"), nullable=True)
+    # Para material dirigido a un solo estudiante (feedback, refuerzo)
+    student_id: Mapped[str | None] = mapped_column(ForeignKey("students.user_id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
