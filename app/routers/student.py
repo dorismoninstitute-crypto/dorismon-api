@@ -426,12 +426,31 @@ async def my_courses(
                 Lesson.is_published.is_(True),
             )
         )).scalar() or 0
-        completed = (await db.execute(
-            select(func.count()).select_from(LessonProgress).where(
-                LessonProgress.student_id == user.user_id,
-                LessonProgress.is_completed.is_(True),
-            )
-        )).scalar() or 0
+        # V3.9.56 — Solo las lecciones DE ESTE NIVEL y DE ESTA MATRÍCULA.
+        #
+        # Antes contaba TODAS las lecciones completadas del estudiante, de
+        # cualquier curso: quien llevaba inglés y español veía en inglés un
+        # progreso inflado con lo que había hecho en español. Y quien repetía
+        # un nivel arrancaba con el contador lleno.
+        completed = 0
+        if mod_ids:
+            _ids_lec = [x for (x,) in (await db.execute(
+                select(Lesson.id).where(
+                    Lesson.module_id.in_(mod_ids),
+                    Lesson.is_published.is_(True),
+                )
+            )).all()]
+            if _ids_lec:
+                completed = (await db.execute(
+                    select(func.count()).select_from(LessonProgress).where(
+                        LessonProgress.student_id == user.user_id,
+                        LessonProgress.lesson_id.in_(_ids_lec),
+                        LessonProgress.is_completed.is_(True),
+                        # V3.9.57 — Solo de esta matrícula: el legacy no
+                        # infla el progreso de una matrícula nueva.
+                        LessonProgress.enrollment_id == e.id,
+                    )
+                )).scalar() or 0
         out.append({
             "enrollment_id": e.id, "course_id": c.id, "course_name": c.name,
             "course_color": c.color, "course_description": c.description,
@@ -1714,3 +1733,70 @@ async def save_assignment_draft(
 
     await db.commit()
     return {"ok": True, "started_at": sub.started_at.isoformat() if sub.started_at else None}
+
+
+@router.get("/my-progress")
+async def my_academic_progress(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.53 P3 — Qué le falta al estudiante para terminar su nivel.
+
+    No un porcentaje suelto: requisito por requisito, con lo que se pide y lo
+    que lleva. "Te falta subir 12 puntos en quizzes" se entiende; "63%" no.
+
+    Devuelve TODAS sus matrículas: si lleva inglés y español, ve las dos por
+    separado.
+    """
+    from app.services.progression import elegibilidad_de_enrollment
+    from app.models import Enrollment, Level, Course, Certificate
+
+    matriculas = (await db.execute(
+        select(Enrollment, Level, Course)
+        .join(Level, Enrollment.level_id == Level.id)
+        .join(Course, Enrollment.course_id == Course.id)
+        .where(Enrollment.student_id == user.user_id)
+        .order_by(Enrollment.enrolled_at.desc())
+    )).all()
+
+    activas, historial = [], []
+    for e, nivel, curso in matriculas:
+        estado = getattr(e, "academic_status", "active") or "active"
+
+        cert = (await db.execute(
+            select(Certificate).where(
+                Certificate.student_id == user.user_id,
+                # V3.9.57 — El certificado pertenece a ESTA matrícula
+                Certificate.enrollment_id == e.id,
+                Certificate.revoked.is_(False),
+            ).limit(1)
+        )).scalar_one_or_none()
+
+        base = {
+            "enrollment_id": e.id,
+            "course_name": curso.name,
+            "level_code": nivel.code, "level_name": nivel.name,
+            "academic_status": estado,
+            "certificate_code": cert.code if cert else None,
+        }
+
+        if estado == "completed":
+            historial.append({
+                **base,
+                "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+                "final_score": float(e.final_score) if e.final_score is not None else None,
+                "final_result": e.final_result,
+            })
+        else:
+            elegib = await elegibilidad_de_enrollment(db, e)
+            activas.append({
+                **base,
+                "eligible": elegib["eligible"],
+                "requirements": elegib["requirements"],
+                "pending": elegib["pending"],
+                "met_count": elegib["met_count"],
+                "total_count": elegib["total_count"],
+                "skills": elegib["metrics"]["skills"],
+            })
+
+    return {"active": activas, "history": historial}

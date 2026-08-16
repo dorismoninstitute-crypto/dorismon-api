@@ -192,6 +192,59 @@ async def init_db():
         # V3.9.49 P2 — Seguimiento de tareas.
         # ADITIVA: las entregas existentes quedan con NULL, que significa
         # "no consta que la viera". No se inventa historial que no ocurrió.
+        # ── V3.9.53 P3 — Progresión académica ──
+        # TODO ADITIVO. Las matrículas existentes quedan con
+        # academic_status='active', que es exactamente lo que son hoy.
+        # Los campos viejos Student.speaking_score etc. NO se tocan.
+        # ── V3.9.55 — Progreso de lecciones por matrícula ──
+        # ADITIVA. Los registros existentes quedan con enrollment_id NULL y
+        # se siguen contando como progreso del estudiante, igual que antes.
+        # No se les asigna matrícula a la fuerza: no se puede saber de cuál
+        # eran si el estudiante repitió el nivel.
+        # ══ V3.9.56 — PROGRESO POR MATRÍCULA ══
+        #
+        # Estas migraciones son CRÍTICAS: sin ellas un estudiante que repite
+        # un nivel heredaría el progreso anterior. Por eso van con control de
+        # errores explícito más abajo (`criticas`), no en silencio.
+        v3956_migrations = [
+            "ALTER TABLE module_progress ADD COLUMN IF NOT EXISTS enrollment_id VARCHAR",
+            # La unicidad pasa a ser por matrícula. Se elimina la vieja solo
+            # si existe; los registros legacy (enrollment_id NULL) quedan
+            # protegidos por el índice parcial siguiente.
+            "ALTER TABLE lesson_progress DROP CONSTRAINT IF EXISTS lesson_progress_student_id_lesson_id_key",
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_lesson_progress_enrollment
+               ON lesson_progress(enrollment_id, lesson_id)
+               WHERE enrollment_id IS NOT NULL""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_lesson_progress_legacy
+               ON lesson_progress(student_id, lesson_id)
+               WHERE enrollment_id IS NULL""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_module_progress_enrollment
+               ON module_progress(enrollment_id, module_id)
+               WHERE enrollment_id IS NOT NULL""",
+        ]
+        migrations.extend(v3956_migrations)
+
+        v3955_migrations = [
+            "ALTER TABLE lesson_progress ADD COLUMN IF NOT EXISTS enrollment_id VARCHAR",
+        ]
+        migrations.extend(v3955_migrations)
+
+        v3953_migrations = [
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS academic_status VARCHAR DEFAULT 'active'",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS approved_by VARCHAR",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS final_result VARCHAR",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS final_score NUMERIC(5,2)",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS completion_snapshot TEXT",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMPTZ",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS withdrawn_reason VARCHAR",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS withdrawn_by VARCHAR",
+            "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS previous_enrollment_id VARCHAR",
+            "ALTER TABLE certificates ADD COLUMN IF NOT EXISTS enrollment_id VARCHAR",
+            "UPDATE enrollments SET academic_status = 'active' WHERE academic_status IS NULL",
+        ]
+        migrations.extend(v3953_migrations)
+
         v3949_migrations = [
             "ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS viewed_at TIMESTAMPTZ",
             "ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
@@ -254,11 +307,246 @@ async def init_db():
         ]
         migrations.extend(v3926_migrations)
 
-        for m in migrations:
+        # ⚠️ V3.9.57 — ESTE BLOQUE VA AL FINAL A PROPÓSITO.
+        #
+        # Las migraciones se aplican en el orden de esta lista, y los bloques
+        # se van añadiendo del más nuevo al más viejo. Los índices sobre
+        # `enrollment_id` necesitan que la columna YA exista, y esa la añade
+        # v3.9.56 más abajo en el archivo. Estando arriba, se ejecutaban
+        # primero y fallaban con "no such column".
+
+        # ══ V3.9.57 — Eliminar de VERDAD las constraints viejas ══
+        #
+        # En v3.9.56 se creaban los índices modernos, pero la constraint
+        # antigua seguía existiendo y bloqueaba igual. Y su nombre se daba por
+        # supuesto: si PostgreSQL lo generó distinto, el DROP no hacía nada.
+        #
+        # Este bloque BUSCA las constraints reales que impiden dos filas del
+        # mismo módulo/lección para dos matrículas, y las elimina por su
+        # nombre real. Sin adivinar.
+        v3957_migrations = [
+            """
+            DO $$
+            DECLARE r RECORD;
+            BEGIN
+              -- LessonProgress: cualquier unicidad sobre (student_id, lesson_id)
+              FOR r IN
+                SELECT c.conname
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                WHERE t.relname = 'lesson_progress'
+                  AND c.contype = 'u'
+                  AND (SELECT array_agg(a.attname ORDER BY a.attname)
+                       FROM unnest(c.conkey) k
+                       JOIN pg_attribute a
+                         ON a.attrelid = c.conrelid AND a.attnum = k)
+                      = ARRAY['lesson_id','student_id']
+              LOOP
+                EXECUTE format('ALTER TABLE lesson_progress DROP CONSTRAINT %I',
+                               r.conname);
+              END LOOP;
+
+              -- ModuleProgress: cualquier unicidad sobre (student_id, module_id)
+              FOR r IN
+                SELECT c.conname
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                WHERE t.relname = 'module_progress'
+                  AND c.contype = 'u'
+                  AND (SELECT array_agg(a.attname ORDER BY a.attname)
+                       FROM unnest(c.conkey) k
+                       JOIN pg_attribute a
+                         ON a.attrelid = c.conrelid AND a.attnum = k)
+                      = ARRAY['module_id','student_id']
+              LOOP
+                EXECUTE format('ALTER TABLE module_progress DROP CONSTRAINT %I',
+                               r.conname);
+              END LOOP;
+
+              -- Y los índices únicos equivalentes que no sean constraint
+              FOR r IN
+                SELECT i.relname AS iname
+                FROM pg_index x
+                JOIN pg_class i ON i.oid = x.indexrelid
+                JOIN pg_class t ON t.oid = x.indrelid
+                WHERE t.relname IN ('lesson_progress','module_progress')
+                  AND x.indisunique
+                  AND x.indpred IS NULL
+                  AND i.relname NOT LIKE 'uq_%_enrollment'
+                  AND i.relname NOT LIKE '%_pkey'
+              LOOP
+                EXECUTE format('DROP INDEX IF EXISTS %I', r.iname);
+              END LOOP;
+            END $$;
+            """,
+            # Unicidad moderna: por matrícula
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_module_progress_enrollment
+               ON module_progress(enrollment_id, module_id)
+               WHERE enrollment_id IS NOT NULL""",
+            # Y los legacy siguen únicos entre sí
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_module_progress_legacy
+               ON module_progress(student_id, module_id)
+               WHERE enrollment_id IS NULL""",
+        ]
+        migrations.extend(v3957_migrations)
+
+        # ══ V3.9.56 — LAS MIGRACIONES YA NO FALLAN EN SILENCIO ══
+        #
+        # Antes cualquier error se tragaba con `except: pass`. Eso está bien
+        # para un `ADD COLUMN IF NOT EXISTS` que ya se aplicó, pero significaba
+        # que producción podía arrancar con el esquema incompleto y nadie se
+        # enteraba hasta que algo fallaba en uso real.
+        #
+        # Ahora:
+        #   · todo error se registra en el log, con la sentencia
+        #   · las migraciones CRÍTICAS (las que sostienen el aislamiento por
+        #     matrícula) detienen el arranque si no se aplican
+        #
+        # SQLite no soporta parte de esta sintaxis (índices parciales sí,
+        # DROP CONSTRAINT no), así que en desarrollo se avisa sin romper.
+        import logging as _logging
+        import re as _re
+        _log = _logging.getLogger("dorismon.migrations")
+
+        # ── V3.9.57 — Compatibilidad con SQLite ──
+        #
+        # SQLite no entiende `ADD COLUMN IF NOT EXISTS`. Antes esas
+        # migraciones se omitían con un aviso, así que en desarrollo el
+        # esquema quedaba incompleto y el escenario de UPGRADE no se podía
+        # verificar: solo se probaba con bases nuevas.
+        #
+        # Ahora, en SQLite se comprueba si la columna existe y se ejecuta el
+        # ALTER sin el IF NOT EXISTS. En PostgreSQL no cambia nada.
+        _es_postgres = conn.engine.dialect.name == "postgresql"
+
+        async def _columna_existe(tabla: str, columna: str) -> bool:
             try:
-                await conn.execute(sa_text(m))
+                filas = await conn.exec_driver_sql(f"PRAGMA table_info({tabla})")
+                return any(r[1] == columna for r in filas.fetchall())
             except Exception:
-                pass  # ignorar si la columna ya existe o no es soportado por SQLite
+                return True  # ante la duda, no se toca
+
+        _re_add = _re.compile(
+            r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+)(.*)",
+            _re.IGNORECASE | _re.DOTALL)
+
+        # Sin estas, un estudiante que repite nivel heredaría su progreso
+        # V3.9.57 — Las SEIS operaciones que sostienen la semántica por
+        # matrícula. Si falta cualquiera, repetir un nivel se rompe: o se
+        # hereda el progreso anterior, o el insert falla. Mejor no arrancar.
+        _criticas = (
+            "module_progress ADD COLUMN IF NOT EXISTS enrollment_id",
+            "lesson_progress ADD COLUMN IF NOT EXISTS enrollment_id",
+            "enrollments ADD COLUMN IF NOT EXISTS academic_status",
+            # Quitar las unicidades viejas (bloque DO $$)
+            "DROP CONSTRAINT %I",
+            # Crear las modernas
+            "uq_lesson_progress_enrollment",
+            "uq_module_progress_enrollment",
+        )
+        _fallos_criticos = []
+
+        for m in migrations:
+            _sql = m
+            # En SQLite: traducir el ADD COLUMN IF NOT EXISTS
+            if not _es_postgres:
+                _mm = _re_add.match(" ".join(m.split()))
+                if _mm:
+                    _tabla, _col, _resto = _mm.groups()
+                    if await _columna_existe(_tabla, _col):
+                        continue  # ya está: nada que hacer
+                    _sql = f"ALTER TABLE {_tabla} ADD COLUMN {_col}{_resto}"
+
+            try:
+                await conn.execute(sa_text(_sql))
+            except Exception as exc:
+                _resumen = " ".join(m.split())[:120]
+                _texto = str(exc).lower()
+                # Estos son esperables e inofensivos: ya estaba aplicado
+                _ya_estaba = any(x in _texto for x in (
+                    "already exists", "duplicate", "ya existe"))
+                if _ya_estaba:
+                    continue
+
+                _critica = any(c in " ".join(m.split()) for c in _criticas)
+                if _critica and _es_postgres:
+                    _log.error("MIGRACIÓN CRÍTICA FALLÓ: %s → %s", _resumen, exc)
+                    _fallos_criticos.append(_resumen)
+                else:
+                    # En SQLite (desarrollo) muchas sentencias no aplican
+                    _log.warning("Migración omitida: %s → %s", _resumen, exc)
+
+        # ── V3.9.57 — SQLite: recrear las tablas sin la constraint vieja ──
+        #
+        # SQLite no soporta DROP CONSTRAINT: la única forma de quitar un
+        # UNIQUE de tabla es recrearla. Sin esto, una base de desarrollo
+        # migrada mantiene el bloqueo y no se puede probar el escenario de
+        # upgrade — que es justo donde vive el riesgo real.
+        #
+        # Se copia todo el contenido: no se pierde ni un registro.
+        if not _es_postgres:
+            for _tabla, _cols, _uniq in (
+                ("lesson_progress",
+                 "id, student_id, lesson_id, enrollment_id, is_completed, "
+                 "progress_pct, last_viewed_at, completed_at",
+                 "student_id, lesson_id"),
+                ("module_progress",
+                 "id, student_id, module_id, enrollment_id, status, "
+                 "attended_count, quiz_passed, completed_at",
+                 "student_id, module_id"),
+            ):
+                try:
+                    _r = await conn.exec_driver_sql(
+                        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                        (_tabla,))
+                    _ddl = (_r.fetchone() or [""])[0] or ""
+                    # ¿Conserva la unicidad vieja?
+                    _norm = " ".join(_ddl.split()).upper()
+                    if f"UNIQUE ({_uniq.upper()})" not in _norm:
+                        continue
+
+                    _log.warning(
+                        "Recreando %s para quitar la unicidad antigua (%s)",
+                        _tabla, _uniq)
+                    _nuevo = _ddl.replace(
+                        f"UNIQUE ({_uniq})", "").replace(
+                        f"UNIQUE({_uniq})", "")
+                    _nuevo = _nuevo.replace(f"CREATE TABLE {_tabla}",
+                                            f"CREATE TABLE {_tabla}__nuevo")
+                    # Limpieza: al quitar el UNIQUE queda una coma colgante
+                    # antes del paréntesis de cierre.
+                    _nuevo = " ".join(_nuevo.split())
+                    _nuevo = _re.sub(r",\s*,", ",", _nuevo)
+                    _nuevo = _re.sub(r"\(\s*,", "(", _nuevo)
+                    _nuevo = _re.sub(r",\s*\)", ")", _nuevo)
+
+                    await conn.exec_driver_sql(_nuevo)
+                    await conn.exec_driver_sql(
+                        f"INSERT INTO {_tabla}__nuevo ({_cols}) "
+                        f"SELECT {_cols} FROM {_tabla}")
+                    await conn.exec_driver_sql(f"DROP TABLE {_tabla}")
+                    await conn.exec_driver_sql(
+                        f"ALTER TABLE {_tabla}__nuevo RENAME TO {_tabla}")
+                    # Los índices modernos se recrean tras el rename
+                    await conn.exec_driver_sql(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{_tabla}_enrollment "
+                        f"ON {_tabla}(enrollment_id, "
+                        f"{'lesson_id' if 'lesson' in _tabla else 'module_id'}) "
+                        f"WHERE enrollment_id IS NOT NULL")
+                    await conn.exec_driver_sql(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{_tabla}_legacy "
+                        f"ON {_tabla}({_uniq}) WHERE enrollment_id IS NULL")
+                except Exception as exc:
+                    _log.error("No se pudo recrear %s: %s", _tabla, exc)
+                    _fallos_criticos.append(f"recrear {_tabla}: {exc}")
+
+        if _fallos_criticos:
+            # Mejor no arrancar que arrancar con el esquema a medias: con el
+            # aislamiento por matrícula roto, los datos académicos se mezclan.
+            raise RuntimeError(
+                "No se pudieron aplicar migraciones críticas: "
+                + " | ".join(_fallos_criticos)
+            )
 
     # V2.9: Llenar feature_keys en PlanFeature de planes ya existentes
     # Esto se ejecuta en cada arranque pero es idempotente (no duplica)

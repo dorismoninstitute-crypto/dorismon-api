@@ -249,11 +249,37 @@ class LessonProgress(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
     lesson_id: Mapped[int] = mapped_column(ForeignKey("lessons.id", ondelete="CASCADE"))
+
+    # ── V3.9.55 — A QUÉ MATRÍCULA pertenece este progreso ──
+    #
+    # EL PROBLEMA: `LessonProgress` era por estudiante, sin distinguir
+    # matrícula. Si alguien REPITE un nivel, el progreso de la vez anterior
+    # contaría para la nueva matrícula: repetiría con los módulos ya "hechos"
+    # sin haber vuelto a estudiar nada.
+    #
+    # NULL = registros anteriores a esta versión. No se les inventa matrícula
+    # (ver el informe de migración): se siguen contando como progreso del
+    # estudiante, que es como se comportaban.
+    enrollment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("enrollments.id"), nullable=True, index=True)
+
     is_completed: Mapped[bool] = mapped_column(Boolean, default=False)
     progress_pct: Mapped[int] = mapped_column(Integer, default=0)
     last_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    __table_args__ = (UniqueConstraint("student_id", "lesson_id"),)
+    # ── V3.9.56 — La unicidad es POR MATRÍCULA ──
+    #
+    # Antes era UNIQUE(student_id, lesson_id): si Juan repetía B1, no podía
+    # existir un segundo registro de la misma lección. La matrícula nueva
+    # heredaba el progreso de la anterior, o directamente fallaba al insertar.
+    #
+    # Los registros legacy tienen enrollment_id NULL y siguen siendo únicos
+    # entre sí por (student_id, lesson_id) gracias al índice parcial de más
+    # abajo, así que no se rompe nada de lo que ya existe.
+    __table_args__ = (
+        UniqueConstraint("enrollment_id", "lesson_id",
+                         name="uq_lesson_progress_enrollment"),
+    )
 
 
 class Enrollment(Base):
@@ -277,6 +303,37 @@ class Enrollment(Base):
     # V2.3: Modalidad de inscripción (online/presencial/hibrida)
     modality: Mapped[Modality] = mapped_column(default=Modality.online)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # ── V3.9.53 P3 — ESTADO ACADÉMICO DE ESTA MATRÍCULA ──
+    #
+    # Es distinto de `is_active`, que dice si la matrícula está vigente.
+    # Aquí va en qué punto académico está: ACTIVE mientras cursa,
+    # COMPLETION_REVIEW cuando cumple requisitos y espera revisión,
+    # COMPLETED solo cuando Dirección lo aprueba.
+    #
+    # AT_RISK no vive aquí a propósito: un estudiante en riesgo SIGUE activo,
+    # se calcula al vuelo desde tracking.py y no es un estado del expediente.
+    academic_status: Mapped[str] = mapped_column(
+        String, default="active", server_default="active")
+
+    # Cuando Dirección aprueba la finalización
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    final_result: Mapped[str | None] = mapped_column(String, nullable=True)
+    final_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+
+    # FOTO de los datos con los que se tomó la decisión.
+    # Dentro de dos años hay que poder responder "¿por qué se aprobó a Juan?"
+    # sin depender de datos que pudieron cambiar después.
+    completion_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Retiro (el histórico nunca se borra)
+    withdrawn_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    withdrawn_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    withdrawn_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    # De qué matrícula viene (B1 → B2), para reconstruir la trayectoria
+    previous_enrollment_id: Mapped[str | None] = mapped_column(String, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     final_grade: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
@@ -589,6 +646,11 @@ class Certificate(Base):
     # el registro de que existió y fue anulado (eso es lo correcto).
     revoked_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # V3.9.53 P3 — A qué matrícula pertenece este certificado.
+    # Sin esto, un estudiante que repite un nivel tendría dos certificados
+    # sin forma de saber a cuál curso corresponde cada uno.
+    enrollment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("enrollments.id"), nullable=True, index=True)
 
 
 class Plan(Base):
@@ -963,6 +1025,85 @@ class ActivityAudience(Base):
 
 
 Index("ix_activity_audience", ActivityAudience.activity_type, ActivityAudience.activity_id)
+
+
+class SkillAssessment(Base):
+    """V3.9.53 P3 — Evaluación de una habilidad, POR MATRÍCULA.
+
+    POR QUÉ NO SE REUSAN `Student.speaking_score` Y COMPAÑÍA:
+    esos campos son del estudiante GLOBAL, así que al evaluarlo en B2 se
+    perdería su nota de B1. Un expediente académico no puede sobrescribirse.
+
+    Los campos viejos NO se borran: quedan como legacy (ver el informe de
+    migración). Lo nuevo se guarda aquí, con su historia completa.
+
+    Escala 0–100 siempre. Nada de estrellas ni porcentajes arbitrarios.
+    """
+    __tablename__ = "skill_assessments"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    enrollment_id: Mapped[str] = mapped_column(
+        ForeignKey("enrollments.id", ondelete="CASCADE"), index=True)
+    student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id"), index=True)
+    # speaking | listening | reading | writing | grammar | vocabulary
+    skill: Mapped[str] = mapped_column(String, index=True)
+    score: Mapped[float] = mapped_column(Numeric(5, 2))
+    # continuous | final_exam | teacher_assessment
+    source: Mapped[str] = mapped_column(String, default="teacher_assessment")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evaluated_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CompletionReview(Base):
+    """V3.9.53 P3 — Recomendación del profesor sobre terminar un nivel.
+
+    El sistema CALCULA la elegibilidad, el profesor RECOMIENDA y Dirección
+    APRUEBA. Esta tabla guarda el paso del medio, con su comentario y autor.
+
+    Se conservan todas: si un estudiante pasa por refuerzo y vuelve a
+    revisión, queda el rastro de las dos recomendaciones.
+    """
+    __tablename__ = "completion_reviews"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    enrollment_id: Mapped[str] = mapped_column(
+        ForeignKey("enrollments.id", ondelete="CASCADE"), index=True)
+    teacher_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    # recommend_promotion | requires_reinforcement | requires_reevaluation
+    recommendation: Mapped[str] = mapped_column(String)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Qué había que reforzar, si aplica
+    reinforcement_area: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Foto de las métricas al recomendar
+    metrics_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AcademicException(Base):
+    """V3.9.53 P3 — Excepción académica aprobada por Dirección.
+
+    Ejemplo: asistencia 78% cuando se piden 80%, pero todo lo demás
+    excelente. Dirección puede aprobar igual.
+
+    ⚠️ NUNCA se cambia el umbral para ese alumno. Se registra la excepción
+    con quién la aprobó, por qué, y las métricas de ese momento. Así el
+    requisito sigue siendo el mismo para todos y la decisión queda explicada.
+    """
+    __tablename__ = "academic_exceptions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    enrollment_id: Mapped[str] = mapped_column(
+        ForeignKey("enrollments.id", ondelete="CASCADE"), index=True)
+    # Qué requisito no se cumplía: attendance | assignments | quizzes | skills
+    requirement: Mapped[str] = mapped_column(String)
+    required_value: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    actual_value: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    reason: Mapped[str] = mapped_column(Text)
+    approved_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    metrics_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+Index("ix_skill_enrollment", SkillAssessment.enrollment_id, SkillAssessment.skill)
+Index("ix_review_enrollment", CompletionReview.enrollment_id)
 Index("ix_makeup_student", MakeupRequest.student_id, MakeupRequest.status)
 Index("ix_alert_actions_key", AlertAction.alert_key)
 Index("ix_video_presence_session_user", VideoPresence.session_id, VideoPresence.user_id)
@@ -1054,11 +1195,37 @@ class ModuleProgress(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
     module_id: Mapped[int] = mapped_column(ForeignKey("modules.id", ondelete="CASCADE"))
+
+    # ── V3.9.56 — A QUÉ MATRÍCULA pertenece ──
+    #
+    # Sin esto, "B1 #1 completado" hacía que "B1 #2" apareciera completado sin
+    # haber estudiado nada. Un estudiante que repite empieza de cero.
+    #
+    # ⚠️ ESTA TABLA ES CACHÉ, no la fuente de verdad. El estado académico
+    # definitivo lo calcula `estado_de_modulo()` por matrícula, con evidencia
+    # real. Aquí solo se guarda el resultado para no recalcular en cada
+    # pantalla.
+    enrollment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("enrollments.id"), nullable=True, index=True)
+
     status: Mapped[str] = mapped_column(String, default="locked")  # locked, in_progress, completed
     attended_count: Mapped[int] = mapped_column(Integer, default=0)
     quiz_passed: Mapped[bool] = mapped_column(Boolean, default=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    __table_args__ = (UniqueConstraint("student_id", "module_id"),)
+
+    # ── V3.9.57 — La unicidad es POR MATRÍCULA ──
+    #
+    # Seguía siendo UNIQUE(student_id, module_id): si Juan repetía B1, no
+    # podían existir dos filas del mismo módulo para sus dos matrículas.
+    # El índice moderno que se creó en v3.9.56 no servía de nada mientras
+    # esta constraint siguiera viva.
+    #
+    # Los registros legacy (enrollment_id NULL) quedan protegidos por un
+    # índice parcial aparte, así que no se rompe nada existente.
+    __table_args__ = (
+        UniqueConstraint("enrollment_id", "module_id",
+                         name="uq_module_progress_enrollment"),
+    )
 
 
 class PlanFeature(Base):

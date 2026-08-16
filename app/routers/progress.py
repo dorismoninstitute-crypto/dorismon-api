@@ -42,10 +42,17 @@ async def my_course_progress(
         select(Module).where(Module.level_id == enr.level_id).order_by(Module.order_index)
     )).scalars().all()
 
-    # Obtener progreso del estudiante
+    # V3.9.56 — El progreso de módulos es DE SU MATRÍCULA. Antes se traía
+    # todo el del estudiante: quien repetía el nivel veía los módulos ya
+    # completados de la vez anterior, sin haber vuelto a estudiar.
     progress_map = {}
     progress = (await db.execute(
-        select(ModuleProgress).where(ModuleProgress.student_id == user.user_id)
+        select(ModuleProgress).where(
+            ModuleProgress.student_id == user.user_id,
+            # V3.9.57 — Solo de SU matrícula. El legacy NULL no puede hacer
+            # que una matrícula nueva aparezca con módulos ya completados.
+            ModuleProgress.enrollment_id == (enr.id if enr else None),
+        )
     )).scalars().all()
     for p in progress:
         progress_map[p.module_id] = p
@@ -235,35 +242,77 @@ async def recompute_progress(
         )).scalar() or 0
 
         # Buscar progreso existente
+        # V3.9.56 — El progreso del módulo es de UNA matrícula. Si repite el
+        # nivel, la nueva empieza en cero en vez de heredar la anterior.
+        _enr_mp = (await db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == user.user_id,
+                Enrollment.level_id == m.level_id,
+                Enrollment.is_active.is_(True),
+            ).order_by(Enrollment.enrolled_at.desc()).limit(1)
+        )).scalar_one_or_none()
+
         mp = (await db.execute(
             select(ModuleProgress).where(
                 ModuleProgress.student_id == user.user_id,
                 ModuleProgress.module_id == m.id,
-            )
+                # V3.9.57 — Solo de esta matrícula
+                ModuleProgress.enrollment_id == (_enr_mp.id if _enr_mp else None),
+            ).limit(1)
         )).scalar_one_or_none()
 
         if not mp:
             mp = ModuleProgress(
                 student_id=user.user_id, module_id=m.id,
                 status="locked", attended_count=0, quiz_passed=False,
+                enrollment_id=_enr_mp.id if _enr_mp else None,
             )
             db.add(mp)
 
+        # V3.9.57 — NO se adopta el legacy. Antes, al tocar un registro sin
+        # matrícula se le asignaba la actual: eso convertía datos ambiguos de
+        # un curso anterior en evidencia de la matrícula nueva. El legacy
+        # queda intacto y, si hace falta, se crea uno propio.
         mp.attended_count = attended
 
-        # Lógica: completado si asistió al menos 1 vez al módulo (puede mejorarse)
-        if attended >= 1:
-            if mp.status == "locked":
-                mp.status = "in_progress"
+        # ── V3.9.54 — ELIMINADA la regla "1 asistencia = módulo completado" ──
+        #
+        # Antes bastaba con asistir una vez para marcarlo COMPLETED, y eso
+        # inflaba la elegibilidad del nivel: alguien que fue a una sola clase
+        # aparecía con el módulo terminado.
+        #
+        # Ahora el estado lo decide `estado_de_modulo()` en progression.py,
+        # que mira asistencia, tareas y quizzes DEL MÓDULO. Aquí solo se
+        # registra que empezó.
+        from app.services.progression import estado_de_modulo
 
-        # Si hay quiz del módulo y aprobó, marcar quiz_passed
-        # (módulos no tienen quizzes directamente, los quizzes son por level)
-        # Lógica simplificada: completado = asistió + (no hay quiz pendiente o aprobó)
+        if attended >= 1 and mp.status in (None, "locked"):
+            mp.status = "in_progress"
 
-        if attended >= 1:
-            mp.status = "completed"
-            if not mp.completed_at:
-                mp.completed_at = datetime.now(tz.utc)
+        # El estado real, con evidencia
+        try:
+            _enr = (await db.execute(
+                select(Enrollment).where(
+                    Enrollment.student_id == user.user_id,
+                    Enrollment.level_id == m.level_id,
+                    Enrollment.is_active.is_(True),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if _enr:
+                _est = await estado_de_modulo(db, _enr, m)
+                if _est["status"] == "completed":
+                    mp.status = "completed"
+                    if not mp.completed_at:
+                        mp.completed_at = datetime.now(tz.utc)
+                elif mp.status == "completed":
+                    # Dejó de cumplir (p. ej. se corrigió una asistencia):
+                    # el estado vuelve atrás en vez de quedar mintiendo.
+                    mp.status = "in_progress"
+                    mp.completed_at = None
+        except Exception:
+            # Si el cálculo falla, se conserva lo que había: nunca se marca
+            # completado sin evidencia.
+            pass
 
     await db.commit()
     return {"ok": True}

@@ -45,14 +45,30 @@ async def main():
               bool((r.json().get("detail") or {}).get("mensaje")))
 
         # 2. Confirmando a propósito, sí se emite
-        r2 = await c.post("/admin/certificates", headers=AH, json={**base, "confirmar_incompleto": True})
+        # V3.9.54 — Ya no basta el booleano: saltarse el flujo de finalización
+        # exige un motivo, y queda en el registro de auditoría.
+        sin_motivo = await c.post("/admin/certificates", headers=AH,
+                                  json={**base, "confirmar_incompleto": True})
+        check("Sin motivo, no deja saltarse el flujo", sin_motivo.status_code == 400)
+
+        r2 = await c.post("/admin/certificates", headers=AH, json={
+            **base, "confirmar_incompleto": True,
+            "exception_reason": "Caso administrativo aprobado por Dirección"})
         check("Confirmando a propósito, se emite", r2.status_code == 201)
         cert_id = r2.json().get("id")
         code = r2.json().get("code")
 
-        # 3. Avisa si ya tiene certificado de ese nivel
+        # 3. V3.9.57 — La duplicidad se comprueba por MATRÍCULA, no por nivel.
+        #
+        # Antes se bloqueaba cualquier segundo certificado del mismo nivel, lo
+        # que impedía certificar a quien repetía el nivel legítimamente. Ahora
+        # lo que se bloquea es un segundo certificado de la MISMA matrícula,
+        # que es la semántica de P3 (Certificate pertenece a Enrollment).
         r3 = await c.post("/admin/certificates", headers=AH, json=base)
-        check("Avisa si ya existe un certificado de ese nivel", r3.status_code == 409)
+        check("No deja dos certificados activos de la misma matrícula",
+              r3.status_code == 400)
+        check("Y dice cuál es el que ya existe",
+              r3.status_code == 400 and code in str(r3.json()))
 
         # 4. El estudiante lo ve con los datos para imprimirlo
         antes = (await c.get("/student/certificates", headers=SH)).json()

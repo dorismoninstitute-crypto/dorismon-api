@@ -1,7 +1,8 @@
 """Catálogo académico — cursos, niveles, módulos, lecciones (públicos para vistas)."""
+from datetime import datetime, timezone as tz
 from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, CurrentUser
@@ -77,11 +78,28 @@ async def get_lesson(
     level = await db.get(Level, module.level_id) if module else None
     course = await db.get(Course, level.course_id) if level else None
 
+    # V3.9.56 — El progreso mostrado es el de SU MATRÍCULA activa. Si repite
+    # el nivel, no ve marcada la lección que completó la vez anterior.
+    from app.models import Enrollment
+    _enr_l = None
+    if module:
+        _enr_l = (await db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == user.user_id,
+                Enrollment.level_id == module.level_id,
+                Enrollment.is_active.is_(True),
+            ).order_by(Enrollment.enrolled_at.desc()).limit(1)
+        )).scalar_one_or_none()
+
     progress = (await db.execute(
         select(LessonProgress).where(
             LessonProgress.student_id == user.user_id,
             LessonProgress.lesson_id == lesson_id,
-        )
+            # V3.9.57 — Solo el progreso de SU matrícula. Si repite el nivel,
+            # no ve marcada la lección que completó la vez anterior: esa
+            # pertenece a la matrícula pasada.
+            LessonProgress.enrollment_id == (_enr_l.id if _enr_l else None),
+        ).limit(1)
     )).scalar_one_or_none()
 
     materials = (await db.execute(
@@ -301,3 +319,92 @@ async def get_testimonials_public(db: AsyncSession = Depends(get_db)):
         "photo_url": optimized_url(t.photo_url, 200),
         "rating": t.rating,
     } for t in rows]}
+
+
+@router.post("/lessons/{lesson_id}/complete")
+async def complete_lesson(
+    lesson_id: int,
+    body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.55 — Marcar una lección como vista/completada.
+
+    POR QUÉ HACE FALTA: el estado del módulo ahora exige cobertura del
+    contenido, pero **no existía forma de registrar que se cubrió**. Un
+    requisito que no se puede cumplir desde ninguna pantalla es un requisito
+    imposible.
+
+    El progreso se guarda con la MATRÍCULA activa. Si el estudiante repite el
+    nivel, la matrícula nueva empieza sin heredar lo anterior.
+    """
+    from app.models import Enrollment
+
+    if user.role != "student":
+        raise HTTPException(403)
+
+    lesson = await db.get(Lesson, lesson_id)
+    if not lesson:
+        raise HTTPException(404, "Lección no encontrada")
+
+    module = await db.get(Module, lesson.module_id)
+    if not module:
+        raise HTTPException(404, "Lección sin módulo")
+
+    # La matrícula activa de ese nivel: el progreso pertenece a ella
+    enr = (await db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == user.user_id,
+            Enrollment.level_id == module.level_id,
+            Enrollment.is_active.is_(True),
+        ).order_by(Enrollment.enrolled_at.desc()).limit(1)
+    )).scalar_one_or_none()
+
+    if not enr:
+        raise HTTPException(403, "No estás inscrito en el nivel de esa lección")
+
+    ahora = datetime.now(tz.utc)
+    # V3.9.57 — Solo se busca el registro DE ESTA MATRÍCULA.
+    #
+    # Antes se aceptaba también el legacy NULL y luego se le asignaba la
+    # matrícula actual. Eso reescribía un registro de procedencia
+    # desconocida —quizá de la vez que cursó B1 el año pasado— y lo
+    # convertía en evidencia de la matrícula nueva.
+    #
+    # Ahora el legacy queda intacto y esta matrícula crea el suyo.
+    p = (await db.execute(
+        select(LessonProgress).where(
+            LessonProgress.student_id == user.user_id,
+            LessonProgress.lesson_id == lesson_id,
+            LessonProgress.enrollment_id == enr.id,
+        ).limit(1)
+    )).scalar_one_or_none()
+
+    completada = body.get("completed", True) is not False
+    pct = body.get("progress_pct")
+    try:
+        pct = max(0, min(100, int(pct))) if pct is not None else (100 if completada else 0)
+    except (TypeError, ValueError):
+        pct = 100 if completada else 0
+
+    if not p:
+        p = LessonProgress(
+            student_id=user.user_id, lesson_id=lesson_id,
+            enrollment_id=enr.id,
+            is_completed=completada, progress_pct=pct,
+            last_viewed_at=ahora,
+            completed_at=ahora if completada else None,
+        )
+        db.add(p)
+    else:
+        p.is_completed = completada
+        p.progress_pct = pct
+        p.last_viewed_at = ahora
+        if completada and not p.completed_at:
+            p.completed_at = ahora
+        elif not completada:
+            p.completed_at = None
+
+    await db.commit()
+    return {"ok": True, "lesson_id": lesson_id, "is_completed": completada,
+            "progress_pct": pct}

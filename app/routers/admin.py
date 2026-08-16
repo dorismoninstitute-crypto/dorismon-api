@@ -1332,45 +1332,139 @@ async def issue_cert(
     admin: Annotated[CurrentUser, Depends(require_admin)],
     db: AsyncSession = Depends(get_db),
 ):
+    """Emitir un certificado.
+
+    ⚠️ V3.9.57 — ORDEN CORRECTO. Antes parte de la validación corría ANTES de
+    resolver la matrícula, y luego se volvía a buscar "la más reciente". Con
+    un estudiante que repitió el nivel, el certificado podía validarse contra
+    una matrícula y colgarse de otra.
+
+    Ahora:
+      1. campos básicos
+      2. se RESUELVE la matrícula (explícita o única candidata)
+      3. todo lo demás se valida contra ESE objeto
+      4. se emite y se audita con esa misma matrícula
+    """
+    # ── 1. Campos básicos ──
     for f in ("student_id", "course_id", "level_id"):
         if not body.get(f):
-            raise HTTPException(400)
-    # V3.9.28 — Red de seguridad: avisar si el estudiante NO parece haber
-    # terminado el nivel. Se puede certificar igual (a veces hay razones),
-    # pero hay que confirmarlo a propósito, no por accidente.
-    if not body.get("confirmar_incompleto"):
-        enr = (await db.execute(
+            raise HTTPException(400, f"{f} es requerido")
+
+    # ── 2. RESOLVER LA MATRÍCULA, una sola vez ──
+    _pedido = (body.get("enrollment_id") or "").strip() or None
+
+    if _pedido:
+        enr = await db.get(Enrollment, _pedido)
+        if not enr:
+            raise HTTPException(404, "Matrícula no encontrada")
+    else:
+        _candidatas = (await db.execute(
             select(Enrollment).where(
                 Enrollment.student_id == body["student_id"],
                 Enrollment.course_id == body["course_id"],
                 Enrollment.level_id == body["level_id"],
-            )
-        )).scalar_one_or_none()
-        motivos = []
-        if not enr:
-            motivos.append("no está inscrito en ese nivel")
-        elif enr.is_active:
-            motivos.append("todavía está activo en ese nivel (no lo ha terminado)")
-        ya = (await db.execute(
-            select(Certificate).where(
-                Certificate.student_id == body["student_id"],
-                Certificate.level_id == body["level_id"],
-                Certificate.revoked.is_(False),
-            )
-        )).scalar_one_or_none()
-        if ya:
-            motivos.append(f"ya tiene un certificado de ese nivel ({ya.code})")
-        if motivos:
+            ).order_by(Enrollment.enrolled_at.desc())
+        )).scalars().all()
+
+        if not _candidatas:
+            raise HTTPException(400, {
+                "mensaje": ("Ese estudiante no tiene ninguna matrícula de ese "
+                            "curso y nivel."),
+            })
+        if len(_candidatas) > 1:
+            # Repitió el nivel: elegir por él sería adivinar
+            raise HTTPException(400, {
+                "necesita_enrollment_id": True,
+                "mensaje": (
+                    f"Ese estudiante tiene {len(_candidatas)} matrículas de ese "
+                    "nivel (repitió). Indica a cuál pertenece el certificado."
+                ),
+                "opciones": [{
+                    "enrollment_id": x.id,
+                    "academic_status": getattr(x, "academic_status", "active"),
+                    "enrolled_at": x.enrolled_at.isoformat() if x.enrolled_at else None,
+                    "completed_at": x.completed_at.isoformat() if x.completed_at else None,
+                } for x in _candidatas],
+            })
+        enr = _candidatas[0]
+
+    # ── 3. INTEGRIDAD: la matrícula debe coincidir con lo pedido ──
+    #
+    # Sin esto se podría mandar el enrollment de Spanish A2 con un cuerpo de
+    # English B1 y emitir un certificado incoherente.
+    if enr.student_id != body["student_id"]:
+        raise HTTPException(400, "Esa matrícula no es de ese estudiante")
+    if enr.course_id != body["course_id"]:
+        raise HTTPException(400, "Esa matrícula no es de ese curso")
+    if enr.level_id != body["level_id"]:
+        raise HTTPException(400, "Esa matrícula no es de ese nivel")
+
+    _estado_enr = getattr(enr, "academic_status", None) or "active"
+
+    # ── 4. Un certificado activo por MATRÍCULA ──
+    #
+    # La protección es por matrícula, no por nivel: si repitió B1 y la
+    # primera ya tiene certificado, la segunda puede tener el suyo. Es la
+    # semántica de P3 (Certificate pertenece a Enrollment).
+    _ya = (await db.execute(
+        select(Certificate).where(
+            Certificate.enrollment_id == enr.id,
+            Certificate.revoked.is_(False),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if _ya:
+        raise HTTPException(400, {
+            "mensaje": (f"Esa matrícula ya tiene el certificado {_ya.code} "
+                        "activo."),
+        })
+
+    # ── 5. Estado académico DE ESA MATRÍCULA ──
+    if _estado_enr != "completed":
+        if not body.get("confirmar_incompleto"):
+            from app.services.academic_config import ESTADOS_ACADEMICOS
             raise HTTPException(409, {
                 "necesita_confirmacion": True,
-                "motivos": motivos,
-                "mensaje": "Este estudiante " + " y ".join(motivos) + ".",
+                "academic_status": _estado_enr,
+                "enrollment_id": enr.id,
+                "mensaje": (
+                    "Esa matrícula todavía no tiene el nivel completado "
+                    f"(está como «{ESTADOS_ACADEMICOS.get(_estado_enr, _estado_enr)}»). "
+                    "Apruébala primero en Finalizaciones, o indica un motivo "
+                    "para emitir por excepción."
+                ),
             })
 
+        # Excepción: exige motivo y se audita CON ESTA matrícula
+        _motivo_exc = (body.get("exception_reason") or "").strip()
+        if not _motivo_exc:
+            raise HTTPException(400, {
+                "necesita_motivo": True,
+                "mensaje": ("Para emitir sin el nivel completado hace falta "
+                            "explicar por qué. Queda registrado."),
+            })
+        await log_action(
+            db, admin.user_id, "certificate_exception", "certificates",
+            target_id=enr.id,
+            details=(f"estado={_estado_enr} · nivel={body['level_id']} · "
+                     f"motivo={_motivo_exc[:200]}"),
+        )
+
+    # ── 6. Emitir ──
+    # Código único, como se generaba antes
+    code = token_urlsafe(8).replace("_", "").replace("-", "").upper()[:12]
+    while (await db.execute(
+        select(Certificate).where(Certificate.code == code)
+    )).scalar_one_or_none():
+        code = token_urlsafe(8).replace("_", "").replace("-", "").upper()[:12]
+
     c = Certificate(
-        code=_generate_code(),
-        student_id=body["student_id"], course_id=body["course_id"], level_id=body["level_id"],
-        hours=body.get("hours", 120), final_grade=body.get("final_grade"),
+        code=code,
+        student_id=body["student_id"],
+        course_id=body["course_id"],
+        level_id=body["level_id"],
+        enrollment_id=enr.id,
+        hours=body.get("hours", 120),
+        final_grade=body.get("final_grade"),
     )
     db.add(c)
     db.add(Notification(
@@ -2641,108 +2735,60 @@ async def auto_assign_teachers(
 
 # ============= V1.6.3 — DETECTOR CANDIDATOS A CERTIFICACIÓN =============
 @router.get("/certification-candidates")
-async def list_certification_candidates(
+async def certification_candidates(
     admin: Annotated[CurrentUser, Depends(require_admin)],
     db: AsyncSession = Depends(get_db),
 ):
-    """V1.6.3: Detecta estudiantes que cumplen criterios para certificar.
+    """Quién puede recibir certificado.
 
-    Criterios (combinación inteligente):
-    - Todos los módulos del nivel completados (ModuleProgress.status = 'completed')
-    - Asistencia promedio ≥ 70%
-    - No tiene certificado activo para ese curso+nivel
+    ⚠️ V3.9.54 — REESCRITO. Antes tenía su propio algoritmo (70% + módulos
+    con la regla vieja), así que existían DOS criterios distintos de
+    certificación y podían contradecirse.
+
+    Ahora hay uno solo: el certificado se emite a quien tiene el nivel
+    COMPLETADO por el flujo de P3 (profesor recomienda → Dirección aprueba).
     """
-    from app.models import ModuleProgress, Module
-    from sqlalchemy import and_
-
-    # Obtener todas las inscripciones activas
-    enrollments = (await db.execute(
-        select(Enrollment, User, Course, Level)
+    filas = (await db.execute(
+        select(Enrollment, User, Level, Course)
         .join(User, Enrollment.student_id == User.id)
-        .join(Course, Enrollment.course_id == Course.id)
         .join(Level, Enrollment.level_id == Level.id)
-        .where(Enrollment.is_active.is_(True))
+        .join(Course, Enrollment.course_id == Course.id)
+        .where(Enrollment.academic_status == "completed")
+        .order_by(Enrollment.completed_at.desc())
     )).all()
 
-    candidates = []
-    for e, u, c, l in enrollments:
-        # ¿Ya tiene certificado activo para este curso+nivel?
-        existing_cert = (await db.execute(
-            select(func.count()).select_from(Certificate).where(
-                Certificate.student_id == u.id,
-                Certificate.course_id == c.id,
-                Certificate.level_id == l.id,
+    out = []
+    for e, u, nivel, curso in filas:
+        ya = (await db.execute(
+            select(Certificate).where(
+                # V3.9.57 — Por MATRÍCULA, no por nivel: si repitió, cada
+                # matrícula tiene (o no) el suyo.
+                Certificate.enrollment_id == e.id,
                 Certificate.revoked.is_(False),
-            )
-        )).scalar() or 0
-        if existing_cert > 0:
-            continue
+            ).limit(1)
+        )).scalar_one_or_none()
 
-        # Total de módulos del nivel
-        total_modules = (await db.execute(
-            select(func.count()).select_from(Module).where(Module.level_id == l.id)
-        )).scalar() or 0
-        if total_modules == 0:
-            continue  # Sin módulos definidos, no podemos evaluar
-
-        # Módulos completados por el estudiante
-        completed_modules = (await db.execute(
-            select(func.count()).select_from(ModuleProgress)
-            .join(Module, ModuleProgress.module_id == Module.id)
-            .where(
-                ModuleProgress.student_id == u.id,
-                Module.level_id == l.id,
-                ModuleProgress.status == "completed",
-            )
-        )).scalar() or 0
-
-        # ¿Todos los módulos completados?
-        if completed_modules < total_modules:
-            continue
-
-        # Asistencia promedio del estudiante en clases de este nivel
-        att_rows = (await db.execute(
-            select(SessionAttendance.state)
-            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
-            .where(
-                SessionAttendance.student_id == u.id,
-                ClassSession.level_id == l.id,
-            )
-        )).all()
-        total_att = len(att_rows)
-        if total_att > 0:
-            present = sum(1 for (s,) in att_rows if s == AttendanceState.present)
-            attendance_pct = round((present / total_att) * 100, 1)
-        else:
-            attendance_pct = None
-
-        # Criterio: si tiene asistencia registrada, debe ser ≥ 70%
-        meets_attendance = attendance_pct is None or attendance_pct >= 70
-
-        if not meets_attendance:
-            continue
-
-        # Es candidato — incluirlo
-        candidates.append({
+        out.append({
             "enrollment_id": e.id,
-            "student_id": u.id,
-            "student_name": u.full_name,
-            "student_email": u.email,
-            "avatar_url": u.avatar_url,
-            "gender": u.gender,
-            "course_id": c.id,
-            "course_name": c.name,
-            "level_id": l.id,
-            "level_code": l.code,
-            "level_name": l.name,
-            "teacher_id": e.teacher_id,
-            "modules_completed": completed_modules,
-            "total_modules": total_modules,
-            "attendance_pct": attendance_pct,
-            "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            "student_id": u.id, "student_name": u.full_name,
+            "course_name": curso.name,
+            "level_id": nivel.id, "level_code": nivel.code, "level_name": nivel.name,
+            "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+            "final_score": float(e.final_score) if e.final_score is not None else None,
+            "final_result": e.final_result,
+            "already_has_certificate": bool(ya),
+            "certificate_code": ya.code if ya else None,
+            "hours": nivel.hours_required or 120,
         })
 
-    return candidates
+    pendientes = [x for x in out if not x["already_has_certificate"]]
+    return {
+        "items": out,
+        "count": len(out),
+        "pending_issue": len(pendientes),
+        "criterio": ("Solo aparecen matrículas con el nivel COMPLETADO y "
+                     "aprobado por Dirección."),
+    }
 
 
 @router.post("/certification-candidates/{enrollment_id}/issue")
@@ -2760,17 +2806,42 @@ async def issue_certification_quick(
     if not e:
         raise HTTPException(404, "Inscripción no encontrada")
 
-    # Verificar que no exista certificado activo
+    # ⚠️ V3.9.54 — UN SOLO CRITERIO DE CERTIFICACIÓN.
+    #
+    # Antes este endpoint tenía su propia regla (70% + ModuleProgress viejo).
+    # Coexistían dos caminos para certificar, y podían contradecirse.
+    #
+    # Ahora exige lo mismo que el resto: nivel COMPLETADO por el flujo de P3
+    # (el profesor recomienda, Dirección aprueba).
+    _estado_leg = getattr(e, "academic_status", None) or "active"
+    if _estado_leg != "completed":
+        from app.services.academic_config import ESTADOS_ACADEMICOS
+        raise HTTPException(400, {
+            "necesita_completar": True,
+            "academic_status": _estado_leg,
+            "mensaje": (
+                "Ese nivel todavía no está completado (está como "
+                f"«{ESTADOS_ACADEMICOS.get(_estado_leg, _estado_leg)}»). "
+                "Apruébalo primero en Finalizaciones."
+            ),
+        })
+
+    # V3.9.57 — La duplicidad se comprueba por MATRÍCULA, no por nivel.
+    #
+    # Antes bastaba con que existiera un certificado del nivel para bloquear:
+    # si Juan repitió B1, su segunda matrícula nunca podría certificarse
+    # aunque la completara legítimamente.
     existing = (await db.execute(
         select(Certificate).where(
-            Certificate.student_id == e.student_id,
-            Certificate.course_id == e.course_id,
-            Certificate.level_id == e.level_id,
+            Certificate.enrollment_id == e.id,
             Certificate.revoked.is_(False),
-        )
+        ).limit(1)
     )).scalar_one_or_none()
     if existing:
-        raise HTTPException(400, "Este estudiante ya tiene certificado activo para este nivel")
+        raise HTTPException(
+            400,
+            f"Esa matrícula ya tiene el certificado {existing.code} activo",
+        )
 
     # Generar código único
     code = token_urlsafe(8).replace("_", "").replace("-", "").upper()[:12]
@@ -2780,14 +2851,20 @@ async def issue_certification_quick(
     final_grade = body.get("final_grade", 80.0)
     hours_completed = body.get("hours_completed", 60)
 
+    # V3.9.54 — BUG PREEXISTENTE CORREGIDO.
+    #
+    # Esta ruta usaba `hours_completed` e `issued_by`, campos que Certificate
+    # no tiene: cualquier intento de emitir por aquí terminaba en error 500.
+    # La ruta legacy nunca llegó a funcionar. Ahora usa los campos reales y
+    # guarda la matrícula de origen.
     cert = Certificate(
         code=code,
         student_id=e.student_id,
         course_id=e.course_id,
         level_id=e.level_id,
+        enrollment_id=e.id,
         final_grade=final_grade,
-        hours_completed=hours_completed,
-        issued_by=admin.user_id,
+        hours=hours_completed,
     )
     db.add(cert)
 
@@ -7876,4 +7953,397 @@ async def academic_overview(
             "top": riesgo["items"][:5],
         },
         "reglas_riesgo": riesgo["reglas"],
+    }
+
+
+# ============================================================================
+# V3.9.53 P3 — APROBACIÓN DE NIVEL (Dirección)
+# ============================================================================
+
+@router.get("/completion-queue")
+async def completion_queue(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """La cola de estudiantes esperando aprobación de Dirección.
+
+    Trae las métricas completas para poder decidir sin abrir cada expediente.
+    """
+    from app.services.progression import elegibilidad_de_enrollment
+    from app.models import CompletionReview
+
+    filas = (await db.execute(
+        select(Enrollment, User, Level, Course)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .join(Course, Enrollment.course_id == Course.id)
+        .where(
+            Enrollment.is_active.is_(True),
+            Enrollment.academic_status.in_(
+                ["completion_review", "requires_reevaluation"]),
+        )
+    )).all()
+
+    items = []
+    for e, u, nivel, curso in filas:
+        elegib = await elegibilidad_de_enrollment(db, e)
+        rev = (await db.execute(
+            select(CompletionReview)
+            .where(CompletionReview.enrollment_id == e.id)
+            .order_by(CompletionReview.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        profe = await db.get(User, rev.teacher_id) if rev else None
+
+        items.append({
+            "enrollment_id": e.id,
+            "student_id": u.id, "student_name": u.full_name,
+            "course_name": curso.name,
+            "level_code": nivel.code, "level_name": nivel.name,
+            "academic_status": e.academic_status,
+            "eligible": elegib["eligible"],
+            "pending": elegib["pending"],
+            "requirements": elegib["requirements"],
+            "metrics": elegib["metrics"],
+            "teacher_name": profe.full_name if profe else None,
+            "recommendation": rev.recommendation if rev else None,
+            "recommendation_comment": rev.comment if rev else None,
+            "recommended_at": (rev.created_at.isoformat()
+                               if rev and rev.created_at else None),
+        })
+
+    # Los que ya cumplen todo, primero
+    items.sort(key=lambda x: (not x["eligible"], x["student_name"]))
+    return {"items": items, "count": len(items)}
+
+
+@router.post("/enrollments/{enrollment_id}/approve-completion")
+async def approve_completion(
+    enrollment_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Dirección aprueba oficialmente la finalización del nivel.
+
+    ⚠️ Es el ÚNICO punto donde una matrícula pasa a `completed`. Ni el
+    cálculo ni la recomendación del profesor lo hacen.
+
+    Guarda un SNAPSHOT de todo lo que se usó para decidir, para poder
+    responder dentro de dos años por qué se aprobó, aunque los datos cambien.
+    """
+    from app.services.progression import (
+        elegibilidad_de_enrollment, construir_snapshot,
+    )
+    from app.services.academic_config import puede_pasar_a
+    from app.models import CompletionReview, AcademicException
+
+    enr = await db.get(Enrollment, enrollment_id)
+    if not enr:
+        raise HTTPException(404, "Matrícula no encontrada")
+
+    estado = getattr(enr, "academic_status", "active") or "active"
+    if estado == "completed":
+        raise HTTPException(400, "Ese nivel ya está completado")
+
+    st = await db.get(Student, enr.student_id)
+    if st and st.is_paused:
+        raise HTTPException(
+            400,
+            "Ese estudiante está en pausa. Reactívalo antes de cerrar su nivel.",
+        )
+
+    elegib = await elegibilidad_de_enrollment(db, enr)
+    pendientes = [r for r in elegib["requirements"] if not r["met"]]
+
+    if pendientes and not body.get("approve_exception"):
+        raise HTTPException(400, {
+            "necesita_excepcion": True,
+            "mensaje": ("Todavía no cumple: "
+                        + ", ".join(r["label"] for r in pendientes)
+                        + ". Puedes aprobar por excepción indicando el motivo."),
+            "pending": [r["label"] for r in pendientes],
+        })
+
+    # Excepción: se registra, NO se baja el requisito
+    excepciones_creadas = []
+    if pendientes:
+        motivo = (body.get("exception_reason") or "").strip()
+        if not motivo:
+            raise HTTPException(400, "Explica por qué se aprueba la excepción")
+        for r in pendientes:
+            ex = AcademicException(
+                enrollment_id=enrollment_id,
+                requirement=r["key"],
+                required_value=r.get("required"),
+                actual_value=r.get("actual"),
+                reason=motivo[:1000],
+                approved_by=admin.user_id,
+                metrics_snapshot=construir_snapshot(elegib),
+            )
+            db.add(ex)
+            excepciones_creadas.append({
+                "requirement": r["label"],
+                "required": r.get("required"), "actual": r.get("actual"),
+                "reason": motivo,
+            })
+
+    rev = (await db.execute(
+        select(CompletionReview)
+        .where(CompletionReview.enrollment_id == enrollment_id)
+        .order_by(CompletionReview.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+
+    if not puede_pasar_a(estado, "completed"):
+        raise HTTPException(
+            400,
+            f"No se puede completar desde el estado '{estado}'. "
+            "Falta la recomendación del profesor.",
+        )
+
+    # Nota final: la que indique Dirección, o el promedio de lo medible
+    final = body.get("final_score")
+    if final is None:
+        partes = [v for v in (elegib["metrics"].get("attendance_pct"),
+                              elegib["metrics"].get("assignments_pct"),
+                              elegib["metrics"].get("quiz_average")) if v is not None]
+        final = round(sum(partes) / len(partes), 1) if partes else None
+
+    enr.academic_status = "completed"
+    enr.completed_at = datetime.now(tz.utc)
+    enr.approved_by = admin.user_id
+    enr.final_result = (body.get("final_result") or "passed")
+    enr.final_score = final
+    enr.completion_snapshot = construir_snapshot(
+        elegib,
+        recomendacion=rev.recommendation if rev else None,
+        aprobado_por=admin.user_id,
+        excepciones=excepciones_creadas,
+    )
+
+    try:
+        from app.services.push_service import notify_user
+        nivel = await db.get(Level, enr.level_id)
+        cuerpo = (f"¡Felicidades! Completaste {nivel.code if nivel else 'tu nivel'}. "
+                  "Tu certificado estará disponible pronto.")
+        db.add(Notification(
+            user_id=enr.student_id, type=NotificationType.info,
+            title="🎓 ¡Nivel completado!", body=cuerpo,
+            link="/dashboard/student/certificates",
+        ))
+        await notify_user(db, enr.student_id, "🎓 ¡Nivel completado!",
+                          cuerpo, "/dashboard/student/certificates",
+                          f"nivel:{enrollment_id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "approve_completion", "progression",
+                     target_id=enrollment_id,
+                     details=(f"nota={final}"
+                              + (f" · excepciones={len(excepciones_creadas)}"
+                                 if excepciones_creadas else "")))
+    await db.commit()
+    return {
+        "ok": True,
+        "academic_status": "completed",
+        "final_score": final,
+        "exceptions": excepciones_creadas,
+        "mensaje": "Nivel completado. Ya se puede emitir el certificado.",
+    }
+
+
+@router.post("/enrollments/{enrollment_id}/return-to-teacher")
+async def return_to_teacher(
+    enrollment_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Devolver el caso al profesor: refuerzo o reevaluación."""
+    from app.services.academic_config import puede_pasar_a
+
+    enr = await db.get(Enrollment, enrollment_id)
+    if not enr:
+        raise HTTPException(404, "Matrícula no encontrada")
+
+    destino = body.get("status") or "requires_reinforcement"
+    if destino not in ("requires_reinforcement", "requires_reevaluation"):
+        raise HTTPException(400, "Estado no válido")
+
+    motivo = (body.get("reason") or "").strip()
+    if not motivo:
+        raise HTTPException(400, "Explica qué falta")
+
+    actual = getattr(enr, "academic_status", "active") or "active"
+    if not puede_pasar_a(actual, destino):
+        raise HTTPException(400, f"No se puede pasar de '{actual}' a '{destino}'")
+    enr.academic_status = destino
+
+    try:
+        if getattr(enr, "teacher_id", None):
+            u = await db.get(User, enr.student_id)
+            db.add(Notification(
+                user_id=enr.teacher_id, type=NotificationType.info,
+                title="📋 Caso devuelto por Dirección",
+                body=f"{u.full_name if u else 'Un estudiante'}: {motivo[:150]}",
+                link="/dashboard/teacher",
+            ))
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "return_to_teacher", "progression",
+                     target_id=enrollment_id, details=f"{destino}: {motivo[:100]}")
+    await db.commit()
+    return {"ok": True, "academic_status": destino}
+
+
+@router.post("/enrollments/{enrollment_id}/next-level", status_code=201)
+async def create_next_enrollment(
+    enrollment_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Crear la matrícula del siguiente nivel.
+
+    ⚠️ La anterior NO se toca: queda como COMPLETED con su historia. Se crea
+    una NUEVA con su propio progreso, asistencia, tareas y certificado.
+
+    El grupo NO se asigna solo: puede no haber cupo o convenir otro horario.
+    Si no se indica, la matrícula queda sin grupo y aparece en el aviso de
+    "estudiantes sin horario" para que Dirección la coloque.
+    """
+    from app.services.progression import siguiente_nivel
+
+    anterior = await db.get(Enrollment, enrollment_id)
+    if not anterior:
+        raise HTTPException(404, "Matrícula no encontrada")
+
+    if (getattr(anterior, "academic_status", "") or "") != "completed":
+        raise HTTPException(
+            400,
+            "Ese nivel todavía no está completado. Apruébalo antes de crear el "
+            "siguiente.",
+        )
+
+    level_id = body.get("level_id")
+    if not level_id:
+        sug = await siguiente_nivel(db, anterior)
+        if not sug:
+            raise HTTPException(
+                400,
+                "No hay un nivel siguiente en ese curso. Indica el nivel a mano.",
+            )
+        level_id = sug.id
+
+    nivel = await db.get(Level, int(level_id))
+    if not nivel:
+        raise HTTPException(404, "Nivel no encontrado")
+
+    course_id = body.get("course_id") or anterior.course_id
+
+    # ⚠️ V3.9.54 — El nivel debe PERTENECER a ese curso.
+    #
+    # Sin esto se podía crear "curso de inglés + nivel de español" mandando
+    # los IDs por API. El frontend no lo ofrece, pero eso no es una
+    # protección: el backend tiene que rechazarlo.
+    if nivel.course_id != course_id:
+        _curso_real = await db.get(Course, nivel.course_id)
+        raise HTTPException(400, {
+            "mensaje": (
+                f"El nivel {nivel.code} pertenece a "
+                f"«{_curso_real.name if _curso_real else 'otro curso'}», "
+                "no al curso indicado."
+            ),
+        })
+
+    # El grupo, si se indica, debe ser de ese curso y ese nivel
+    _serie = (body.get("series_id") or "").strip() or None
+    _serie_obj = None
+    if _serie:
+        _s = await db.get(ClassSeries, _serie)
+        if not _s:
+            raise HTTPException(404, "Grupo no encontrado")
+        _serie_obj = _s
+        if _s.level_id != nivel.id or _s.course_id != course_id:
+            raise HTTPException(400, {
+                "mensaje": (
+                    f"El grupo «{_s.name}» no es de ese curso y nivel. "
+                    "Elige uno que corresponda."
+                ),
+            })
+        # Y el profesor, coherente con el grupo
+        _profe = (body.get("teacher_id") or "").strip() or None
+        if _profe and _s.teacher_id and _profe != _s.teacher_id:
+            _p = await db.get(User, _s.teacher_id)
+            raise HTTPException(400, {
+                "mensaje": (
+                    f"Ese grupo lo imparte {_p.full_name if _p else 'otro profesor'}. "
+                    "Déjalo en blanco para usar el del grupo."
+                ),
+            })
+
+    # No duplicar una matrícula que ya exista
+    ya = (await db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == anterior.student_id,
+            Enrollment.course_id == course_id,
+            Enrollment.level_id == int(level_id),
+            Enrollment.is_active.is_(True),
+        )
+    )).scalar_one_or_none()
+    if ya:
+        raise HTTPException(400, "Ese estudiante ya tiene una matrícula activa en ese nivel")
+
+    nueva = Enrollment(
+        student_id=anterior.student_id,
+        course_id=course_id,
+        level_id=int(level_id),
+        # V3.9.55 — Si se eligió un grupo y no se indicó profesor, se toma el
+        # TITULAR DEL GRUPO. Antes la validación decía "déjalo en blanco para
+        # usar el del grupo", pero luego se guardaba None: la matrícula
+        # quedaba sin profesor y el estudiante sin ver sus clases.
+        teacher_id=(body.get("teacher_id") or None
+                    or (_serie_obj.teacher_id if _serie_obj else None)),
+        series_id=_serie,
+        plan_id=body.get("plan_id") or anterior.plan_id,
+        modality=anterior.modality,
+        is_active=True,
+        academic_status="active",
+        previous_enrollment_id=enrollment_id,
+    )
+    db.add(nueva)
+    await db.flush()
+
+    # El nivel actual del estudiante sí avanza (es su nivel de hoy)
+    try:
+        st = await db.get(Student, anterior.student_id)
+        if st:
+            st.current_level_id = int(level_id)
+    except Exception:
+        pass
+
+    try:
+        from app.services.push_service import notify_user
+        cuerpo = f"Ya estás inscrito en {nivel.code} — {nivel.name}."
+        db.add(Notification(
+            user_id=anterior.student_id, type=NotificationType.info,
+            title="🚀 ¡Bienvenido a tu siguiente nivel!", body=cuerpo,
+            link="/dashboard/student",
+        ))
+        await notify_user(db, anterior.student_id,
+                          "🚀 ¡Bienvenido a tu siguiente nivel!", cuerpo,
+                          "/dashboard/student", f"nuevo:{nueva.id}")
+    except Exception:
+        pass
+
+    await log_action(db, admin.user_id, "create_next_enrollment", "progression",
+                     target_id=nueva.id, details=f"desde={enrollment_id}")
+    await db.commit()
+    return {
+        "ok": True,
+        "enrollment_id": nueva.id,
+        "level_code": nivel.code,
+        "needs_group": not nueva.series_id,
+        "mensaje": ("Matrícula creada. Falta asignarle grupo y horario."
+                    if not nueva.series_id else "Matrícula creada."),
     }

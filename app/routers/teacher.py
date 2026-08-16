@@ -570,19 +570,42 @@ async def save_attendance(
             state = r.get("state")
             if not sid or state != "present":
                 continue
+            # V3.9.56 — El progreso pertenece a la MATRÍCULA del estudiante en
+            # ese nivel. Si repite, la nueva no hereda la anterior.
+            _enr_att = (await db.execute(
+                select(Enrollment).where(
+                    Enrollment.student_id == sid,
+                    Enrollment.level_id == session.level_id,
+                    Enrollment.is_active.is_(True),
+                ).order_by(Enrollment.enrolled_at.desc()).limit(1)
+            )).scalar_one_or_none()
+
             mp = (await db.execute(
                 select(ModuleProgress).where(
                     ModuleProgress.student_id == sid,
                     ModuleProgress.module_id == session.module_id,
-                )
+                    # V3.9.57 — Solo de esta matrícula
+                    ModuleProgress.enrollment_id == (_enr_att.id if _enr_att else None),
+                ).limit(1)
             )).scalar_one_or_none()
             if not mp:
-                mp = ModuleProgress(student_id=sid, module_id=session.module_id, status="in_progress")
+                mp = ModuleProgress(
+                    student_id=sid, module_id=session.module_id,
+                    status="in_progress",
+                    enrollment_id=_enr_att.id if _enr_att else None,
+                )
                 db.add(mp)
+            # V3.9.57 — El legacy NO se adopta: se conserva como estaba.
             mp.attended_count = (mp.attended_count or 0) + 1
-            mp.status = "completed" if mp.attended_count >= 1 else "in_progress"
-            if mp.status == "completed" and not mp.completed_at:
-                mp.completed_at = now
+            # V3.9.54 — ELIMINADA la regla `attended >= 1 → completed`.
+            #
+            # Asistir a una clase del módulo NO lo completa: solo demuestra
+            # que empezó. El estado real lo calcula `estado_de_modulo()` en
+            # progression.py mirando asistencia, tareas y quizzes del módulo.
+            #
+            # Aquí solo se registra el hecho: vino a una clase.
+            if mp.status in (None, "locked"):
+                mp.status = "in_progress"
         await db.commit()
 
     return {"ok": True, "updated": updated}
@@ -1737,3 +1760,280 @@ async def teacher_at_risk(
 
     solo = None if await es_admin(db, teacher.user_id) else teacher.user_id
     return await estudiantes_en_riesgo(db, solo)
+
+
+# ============================================================================
+# V3.9.53 P3 — PROGRESIÓN ACADÉMICA (lado del profesor)
+# ============================================================================
+
+async def _puede_gestionar_enrollment(db, user_id: str, enr) -> bool:
+    """¿Este profesor es el RESPONSABLE ACTUAL de esta matrícula?
+
+    Vale el profesor asignado a la matrícula o el titular de su grupo. Un
+    sustituto de una sesión NO: cubrir una clase no da derecho a decidir si
+    alguien termina un nivel.
+    """
+    from app.services.teacher_permissions import es_admin, grupos_del_profesor
+
+    if await es_admin(db, user_id):
+        return True
+    if getattr(enr, "teacher_id", None) == user_id:
+        return True
+    grupo = getattr(enr, "series_id", None)
+    if grupo:
+        return grupo in await grupos_del_profesor(db, user_id)
+    return False
+
+
+@router.get("/enrollments/{enrollment_id}/eligibility")
+async def enrollment_eligibility(
+    enrollment_id: str,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Si este estudiante está listo para terminar su nivel, y qué le falta."""
+    from app.services.progression import elegibilidad_de_enrollment
+    from app.models import SkillAssessment, CompletionReview
+
+    enr = await db.get(Enrollment, enrollment_id)
+    if not enr:
+        raise HTTPException(404, "Matrícula no encontrada")
+    if not await _puede_gestionar_enrollment(db, teacher.user_id, enr):
+        raise HTTPException(404, "Matrícula no encontrada")
+
+    datos = await elegibilidad_de_enrollment(db, enr)
+
+    u = await db.get(User, enr.student_id)
+    nivel = await db.get(Level, enr.level_id)
+    curso = await db.get(Course, enr.course_id)
+
+    # Historial de evaluaciones: no se pisan, se acumulan
+    historial = [{
+        "skill": s.skill, "score": float(s.score), "source": s.source,
+        "notes": s.notes,
+        "evaluated_at": s.evaluated_at.isoformat() if s.evaluated_at else None,
+    } for s in (await db.execute(
+        select(SkillAssessment)
+        .where(SkillAssessment.enrollment_id == enrollment_id)
+        .order_by(SkillAssessment.evaluated_at.desc())
+    )).scalars().all()]
+
+    revisiones = [{
+        "recommendation": r.recommendation, "comment": r.comment,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in (await db.execute(
+        select(CompletionReview)
+        .where(CompletionReview.enrollment_id == enrollment_id)
+        .order_by(CompletionReview.created_at.desc())
+    )).scalars().all()]
+
+    return {
+        "student": {"id": u.id, "name": u.full_name} if u else None,
+        "course_name": curso.name if curso else None,
+        "level_code": nivel.code if nivel else None,
+        "level_name": nivel.name if nivel else None,
+        **datos,
+        "skill_history": historial,
+        "reviews": revisiones,
+    }
+
+
+@router.post("/enrollments/{enrollment_id}/skills", status_code=201)
+async def assess_skill(
+    enrollment_id: str,
+    body: dict,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Evaluar una habilidad. Escala 0–100.
+
+    Cada evaluación se AÑADE: no se sobrescribe la anterior. Así queda el
+    historial de cómo fue mejorando, y la nota de B1 no se pierde cuando se
+    le evalúe en B2 (son matrículas distintas).
+    """
+    from app.models import SkillAssessment
+    from app.services.academic_config import (
+        HABILIDADES_REQUERIDAS, HABILIDADES_OPCIONALES, ESCALA_MAXIMA,
+    )
+
+    enr = await db.get(Enrollment, enrollment_id)
+    if not enr:
+        raise HTTPException(404, "Matrícula no encontrada")
+    if not await _puede_gestionar_enrollment(db, teacher.user_id, enr):
+        raise HTTPException(404, "Matrícula no encontrada")
+
+    skill = (body.get("skill") or "").strip().lower()
+    validas = HABILIDADES_REQUERIDAS + HABILIDADES_OPCIONALES
+    if skill not in validas:
+        raise HTTPException(400, f"Habilidad no válida. Opciones: {', '.join(validas)}")
+
+    try:
+        score = float(body.get("score"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "La nota debe ser un número")
+    if not (0 <= score <= ESCALA_MAXIMA):
+        raise HTTPException(400, f"La nota va de 0 a {ESCALA_MAXIMA:.0f}")
+
+    fuente = body.get("source") or "teacher_assessment"
+    if fuente not in ("continuous", "final_exam", "teacher_assessment"):
+        fuente = "teacher_assessment"
+
+    a = SkillAssessment(
+        enrollment_id=enrollment_id, student_id=enr.student_id,
+        skill=skill, score=score, source=fuente,
+        notes=(body.get("notes") or "").strip()[:500] or None,
+        evaluated_by=teacher.user_id,
+    )
+    db.add(a)
+    await log_action(db, teacher.user_id, "assess_skill", "progression",
+                     target_id=enrollment_id, details=f"{skill}={score}")
+    await db.commit()
+    return {"ok": True, "id": a.id, "skill": skill, "score": score}
+
+
+@router.post("/enrollments/{enrollment_id}/recommend")
+async def recommend_completion(
+    enrollment_id: str,
+    body: dict,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """La recomendación del profesor sobre terminar el nivel.
+
+    ⚠️ NO completa nada. Solo pasa el caso a Dirección, que es quien aprueba
+    oficialmente. El profesor conoce al estudiante; Dirección responde por el
+    certificado.
+    """
+    from app.models import CompletionReview
+    from app.services.progression import elegibilidad_de_enrollment, construir_snapshot
+    from app.services.academic_config import RECOMENDACIONES, puede_pasar_a
+
+    enr = await db.get(Enrollment, enrollment_id)
+    if not enr:
+        raise HTTPException(404, "Matrícula no encontrada")
+    if not await _puede_gestionar_enrollment(db, teacher.user_id, enr):
+        raise HTTPException(404, "Matrícula no encontrada")
+
+    if (getattr(enr, "academic_status", "active") or "active") == "completed":
+        raise HTTPException(400, "Ese nivel ya está completado")
+
+    rec = (body.get("recommendation") or "").strip()
+    if rec not in RECOMENDACIONES:
+        raise HTTPException(
+            400, f"Recomendación no válida. Opciones: {', '.join(RECOMENDACIONES)}")
+
+    comentario = (body.get("comment") or "").strip()
+    if not comentario:
+        raise HTTPException(400, "Explica brevemente tu recomendación")
+
+    elegib = await elegibilidad_de_enrollment(db, enr)
+
+    r = CompletionReview(
+        enrollment_id=enrollment_id, teacher_id=teacher.user_id,
+        recommendation=rec, comment=comentario[:1000],
+        reinforcement_area=(body.get("reinforcement_area") or "").strip() or None,
+        metrics_snapshot=construir_snapshot(elegib, recomendacion=rec),
+    )
+    db.add(r)
+
+    # El estado avanza según lo que recomiende
+    destino = {
+        "recommend_promotion": "completion_review",
+        "requires_reinforcement": "requires_reinforcement",
+        "requires_reevaluation": "requires_reevaluation",
+    }[rec]
+    actual = getattr(enr, "academic_status", "active") or "active"
+    if puede_pasar_a(actual, destino):
+        enr.academic_status = destino
+
+    # Avisar a Dirección cuando hay que aprobar
+    try:
+        u = await db.get(User, enr.student_id)
+        nivel = await db.get(Level, enr.level_id)
+        if rec == "recommend_promotion":
+            for a in (await db.execute(
+                select(User).where(User.role == UserRole.super_admin)
+            )).scalars().all():
+                db.add(Notification(
+                    user_id=a.id, type=NotificationType.info,
+                    title="🎓 Listo para aprobar nivel",
+                    body=(f"{u.full_name if u else 'Un estudiante'} está listo para "
+                          f"terminar {nivel.code if nivel else 'su nivel'}."),
+                    link="/dashboard/admin/completions",
+                ))
+        elif rec == "requires_reinforcement":
+            db.add(Notification(
+                user_id=enr.student_id, type=NotificationType.info,
+                title="📚 Tu profesor te recomendó refuerzo",
+                body=comentario[:200], link="/dashboard/student",
+            ))
+    except Exception:
+        pass
+
+    await log_action(db, teacher.user_id, "recommend_completion", "progression",
+                     target_id=enrollment_id, details=rec)
+    await db.commit()
+    return {
+        "ok": True, "recommendation": rec,
+        "academic_status": enr.academic_status,
+        "mensaje": ("Enviado a Dirección para aprobación."
+                    if rec == "recommend_promotion"
+                    else "Registrado. El estudiante fue notificado."),
+    }
+
+
+@router.get("/completion-queue")
+async def teacher_completion_queue(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Los estudiantes del profesor listos para revisión final, o con refuerzo
+    pendiente. Solo sus matrículas."""
+    from app.services.progression import elegibilidad_de_enrollment
+    from app.services.teacher_permissions import es_admin, grupos_del_profesor
+
+    cond = [Enrollment.is_active.is_(True)]
+    if not await es_admin(db, teacher.user_id):
+        grupos = await grupos_del_profesor(db, teacher.user_id)
+        propias = [Enrollment.teacher_id == teacher.user_id]
+        if grupos:
+            propias.append(Enrollment.series_id.in_(grupos))
+        cond.append(or_(*propias))
+
+    filas = (await db.execute(
+        select(Enrollment, User, Level)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Level, Enrollment.level_id == Level.id)
+        .where(*cond)
+    )).all()
+
+    listos, refuerzo, en_curso = [], [], 0
+    for e, u, nivel in filas:
+        estado = getattr(e, "academic_status", "active") or "active"
+        if estado == "completed":
+            continue
+        elegib = await elegibilidad_de_enrollment(db, e)
+        fila = {
+            "enrollment_id": e.id,
+            "student_id": u.id, "student_name": u.full_name,
+            "level_code": nivel.code,
+            "academic_status": estado,
+            "eligible": elegib["eligible"],
+            "pending": elegib["pending"],
+            "met_count": elegib["met_count"],
+            "total_count": elegib["total_count"],
+        }
+        if estado in ("requires_reinforcement", "requires_reevaluation"):
+            refuerzo.append(fila)
+        elif elegib["eligible"] or estado == "completion_review":
+            listos.append(fila)
+        else:
+            en_curso += 1
+
+    return {
+        "ready_for_review": listos,
+        "needs_reinforcement": refuerzo,
+        "in_progress": en_curso,
+        "counts": {"ready": len(listos), "reinforcement": len(refuerzo),
+                   "in_progress": en_curso},
+    }
