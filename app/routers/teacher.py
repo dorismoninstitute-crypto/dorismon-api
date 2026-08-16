@@ -2,7 +2,7 @@
 from typing import Annotated
 from datetime import datetime, timedelta, timezone as tz
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import require_teacher_or_admin, CurrentUser, get_current_user
@@ -780,12 +780,27 @@ async def list_submissions(
     a = await db.get(Assignment, assignment_id)
     if not a:
         raise HTTPException(404)
-    if teacher.role == "teacher" and a.teacher_id != teacher.user_id:
-        raise HTTPException(403)
+
+    # V3.9.50 — Autorización CENTRAL. Antes comparaba `a.teacher_id` a mano,
+    # así que tras una transferencia permanente de grupo el nuevo profesor
+    # responsable NO podía ver las entregas de las tareas que creó el
+    # anterior. La función central sí distingue creador de responsable actual.
+    from app.services.teacher_permissions import exigir_actividad_propia
+    await exigir_actividad_propia(db, teacher.user_id, a, "tarea")
+
+    # V3.9.50 — SOLO ENTREGAS REALES.
+    #
+    # Desde P2 existen filas de AssignmentSubmission creadas solo para el
+    # seguimiento (marcar que vio o empezó la tarea), sin `submitted_at`.
+    # "Existe fila" NO significa "entregó": esta pantalla es de entregas, así
+    # que exige `submitted_at`.
     stmt = (
         select(AssignmentSubmission, User)
         .join(User, AssignmentSubmission.student_id == User.id)
-        .where(AssignmentSubmission.assignment_id == assignment_id)
+        .where(
+            AssignmentSubmission.assignment_id == assignment_id,
+            AssignmentSubmission.submitted_at.is_not(None),
+        )
     )
     rows = (await db.execute(stmt)).all()
     return [{
@@ -808,8 +823,19 @@ async def grade_submission(
     if not sub:
         raise HTTPException(404)
     a = await db.get(Assignment, sub.assignment_id)
-    if teacher.role == "teacher" and a.teacher_id != teacher.user_id:
-        raise HTTPException(403)
+    if not a:
+        raise HTTPException(404)
+
+    # V3.9.50 — Autorización central: el profesor que RECIBE un grupo puede
+    # calificar las tareas que dejó pendientes el anterior, sin que eso
+    # borre a quien la creó. Un sustituto de sesión NO obtiene este permiso.
+    from app.services.teacher_permissions import exigir_actividad_propia
+    await exigir_actividad_propia(db, teacher.user_id, a, "tarea")
+
+    # V3.9.50 — No se puede calificar lo que no se entregó (las filas de
+    # seguimiento no son entregas)
+    if not sub.submitted_at:
+        raise HTTPException(400, "Ese estudiante todavía no ha entregado")
     # V3.9.20 FIX: validar la nota — antes aceptaba cualquier body y podía marcar
     # "calificado" sin nota (y notificar "Tu calificación es None")
     if body.get("score") is None:
@@ -990,6 +1016,12 @@ async def list_observations(
     teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
     db: AsyncSession = Depends(get_db),
 ):
+    # V3.9.50 SEGURIDAD — Antes se podían LEER las observaciones de un
+    # estudiante ajeno con solo conocer su ID. El POST ya estaba protegido;
+    # el GET no. Leer información privada es tan grave como escribirla.
+    from app.services.teacher_permissions import exigir_estudiante_propio
+    await exigir_estudiante_propio(db, teacher.user_id, student_id)
+
     items = (await db.execute(
         select(Observation, User)
         .join(User, Observation.teacher_id == User.id)
@@ -1508,3 +1540,200 @@ async def my_groups(
             "upcoming_classes": futuras,
         })
     return {"items": out}
+
+
+# ============================================================================
+# V3.9.49 P2 — SEGUIMIENTO ACADÉMICO
+# ============================================================================
+
+@router.get("/assignments/{assignment_id}/tracking")
+async def assignment_tracking(
+    assignment_id: int,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Quién entregó y quién NO, sobre el roster real de la tarea.
+
+    ANTES solo se listaban las entregas existentes: quien no entregaba
+    simplemente no aparecía, y no había forma de saber a quién le faltaba.
+    """
+    from app.services.tracking import seguimiento_de_tarea
+    from app.services.teacher_permissions import exigir_actividad_propia
+
+    a = await db.get(Assignment, assignment_id)
+    if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+    await exigir_actividad_propia(db, teacher.user_id, a, "tarea")
+
+    datos = await seguimiento_de_tarea(db, a)
+    return {
+        "assignment": {
+            "id": a.id, "title": a.title,
+            "due_at": a.due_at.isoformat() if a.due_at else None,
+            "max_score": float(a.max_score) if getattr(a, "max_score", None) else 100.0,
+            "series_id": getattr(a, "series_id", None),
+        },
+        **datos,
+    }
+
+
+@router.get("/quizzes/{quiz_id}/tracking")
+async def quiz_tracking(
+    quiz_id: int,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Quién hizo el quiz, con qué nota, y quién no lo ha intentado."""
+    from app.services.tracking import seguimiento_de_quiz
+    from app.services.teacher_permissions import exigir_actividad_propia
+
+    q = await db.get(Quiz, quiz_id)
+    if not q:
+        raise HTTPException(404, "Quiz no encontrado")
+    await exigir_actividad_propia(db, teacher.user_id, q, "quiz")
+
+    datos = await seguimiento_de_quiz(db, q)
+    return {
+        "quiz": {
+            "id": q.id, "title": q.title,
+            "max_attempts": q.max_attempts,
+            "passing_score": float(q.passing_score or 60),
+            "is_published": q.is_published,
+        },
+        **datos,
+    }
+
+
+@router.post("/assignments/{assignment_id}/remind")
+async def remind_pending(
+    assignment_id: int,
+    body: dict,
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Recordarle la tarea a quienes no la han entregado.
+
+    Como pediste: por notificación DENTRO de la plataforma y al teléfono,
+    no por WhatsApp. Se puede avisar a todos los pendientes o a uno solo.
+    """
+    from app.services.tracking import seguimiento_de_tarea
+    from app.services.teacher_permissions import exigir_actividad_propia
+    from app.services.push_service import notify_user
+
+    a = await db.get(Assignment, assignment_id)
+    if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+    await exigir_actividad_propia(db, teacher.user_id, a, "tarea")
+
+    datos = await seguimiento_de_tarea(db, a)
+    solo = (body.get("student_id") or "").strip() or None
+
+    pendientes = [
+        x for x in datos["items"]
+        if x["estado"] in ("assigned", "viewed", "in_progress", "overdue")
+        and (not solo or x["student_id"] == solo)
+    ]
+    if not pendientes:
+        return {"ok": True, "notified": 0,
+                "mensaje": "No hay entregas pendientes."}
+
+    cuando = ""
+    if a.due_at:
+        from zoneinfo import ZoneInfo as _ZI
+        _d = a.due_at if a.due_at.tzinfo else a.due_at.replace(tzinfo=tz.utc)
+        cuando = _d.astimezone(_ZI("America/Santo_Domingo")).strftime(
+            " (vence el %d/%m a las %I:%M %p)").replace(" 0", " ")
+
+    avisados = 0
+    for p in pendientes:
+        vencida = p["estado"] == "overdue"
+        titulo = "⏰ Tarea atrasada" if vencida else "📝 Recordatorio de tarea"
+        cuerpo = (
+            f"'{a.title}' sigue sin entregar{cuando}."
+            if vencida else
+            f"No olvides entregar '{a.title}'{cuando}."
+        )
+        db.add(Notification(
+            user_id=p["student_id"], type=NotificationType.reminder,
+            title=titulo, body=cuerpo, link="/dashboard/student/assignments",
+        ))
+        try:
+            await notify_user(db, p["student_id"], titulo, cuerpo,
+                              "/dashboard/student/assignments", f"tarea:{a.id}")
+        except Exception:
+            pass
+        avisados += 1
+
+    await db.commit()
+    return {
+        "ok": True, "notified": avisados,
+        "mensaje": f"Se le recordó a {avisados} estudiante{'s' if avisados != 1 else ''}.",
+    }
+
+
+@router.get("/pending-grading")
+async def pending_grading(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Entregas esperando calificación, para el panel del profesor.
+
+    ANTES el profesor tenía que entrar tarea por tarea para enterarse de que
+    le habían entregado. No le llegaba ningún aviso.
+    """
+    from app.services.teacher_permissions import es_admin, grupos_del_profesor
+
+    admin = await es_admin(db, teacher.user_id)
+    cond = [
+        AssignmentSubmission.submitted_at.is_not(None),
+        AssignmentSubmission.score.is_(None),
+    ]
+    if not admin:
+        grupos = await grupos_del_profesor(db, teacher.user_id)
+        propias = [Assignment.teacher_id == teacher.user_id]
+        if grupos:
+            propias.append(Assignment.series_id.in_(grupos))
+        cond.append(or_(*propias))
+
+    filas = (await db.execute(
+        select(AssignmentSubmission, Assignment, User)
+        .join(Assignment, AssignmentSubmission.assignment_id == Assignment.id)
+        .join(User, AssignmentSubmission.student_id == User.id)
+        .where(*cond)
+        .order_by(AssignmentSubmission.submitted_at)
+    )).all()
+
+    ahora = datetime.now(tz.utc)
+    items = []
+    for sub, a, u in filas:
+        entregada = sub.submitted_at
+        if entregada and entregada.tzinfo is None:
+            entregada = entregada.replace(tzinfo=tz.utc)
+        items.append({
+            "submission_id": sub.id,
+            "assignment_id": a.id, "assignment_title": a.title,
+            "student_id": u.id, "student_name": u.full_name,
+            "submitted_at": entregada.isoformat() if entregada else None,
+            "days_waiting": (ahora - entregada).days if entregada else 0,
+            "has_file": bool(sub.file_url),
+            "file_url": sub.file_url, "file_name": sub.file_name,
+        })
+
+    return {
+        "items": items,
+        "count": len(items),
+        "oldest_days": max((x["days_waiting"] for x in items), default=0),
+    }
+
+
+@router.get("/at-risk")
+async def teacher_at_risk(
+    teacher: Annotated[CurrentUser, Depends(require_teacher_or_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Los estudiantes del profesor que necesitan atención, con el motivo."""
+    from app.services.tracking import estudiantes_en_riesgo
+    from app.services.teacher_permissions import es_admin
+
+    solo = None if await es_admin(db, teacher.user_id) else teacher.user_id
+    return await estudiantes_en_riesgo(db, solo)

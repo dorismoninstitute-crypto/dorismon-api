@@ -63,6 +63,11 @@ def _leer_blanks_est(txt):
     except Exception:
         return None
 
+
+def _iso_o_none(dt):
+    return dt.isoformat() if dt else None
+
+
 @router.get("/dashboard")
 async def student_dashboard(
     user: Annotated[CurrentUser, Depends(get_current_user)],
@@ -483,6 +488,8 @@ async def my_assignments(
             "kind": (a.kind.value if a.kind else "written"),
             "media_url": a.media_url,
             "blanks": _leer_blanks_est(a.blanks_json),
+            # V3.9.49 P2 — para que el profesor sepa si la vio
+            "viewed_at": _iso_o_none(getattr(sub, "viewed_at", None) if sub else None),
             "submitted": bool(sub and sub.submitted_at),
             "graded": bool(sub and sub.graded_at),
             "score": float(sub.score) if sub and sub.score else None,
@@ -490,6 +497,14 @@ async def my_assignments(
             "submission_id": sub.id if sub else None,
             "submitted_at": sub.submitted_at.isoformat() if sub and sub.submitted_at else None,
         })
+
+    # V3.9.50 — El LISTADO es de solo lectura respecto a `viewed_at`.
+    #
+    # ANTES se marcaban TODAS como vistas al abrir la pantalla "Tareas". Eso
+    # destruía justo lo que P2 quiere medir: la diferencia entre "no la vio"
+    # y "la abrió y no la hizo". Ahora `viewed_at` se marca solo al abrir el
+    # detalle de UNA tarea concreta (GET /student/assignments/{id}).
+
     return {"items": out, "blocked_by_plan": False}
 
 
@@ -521,6 +536,25 @@ async def submit_assignment(
     sub.file_url = body.get("file_url")
     sub.file_name = body.get("file_name")
     sub.submitted_at = datetime.now(tz.utc)
+
+    # V3.9.49 P2 — Avisarle al profesor que le entregaron. Antes tenía que
+    # entrar tarea por tarea para enterarse.
+    try:
+        from app.services.push_service import notify_user
+        _yo = await db.get(User, user.user_id)
+        _profe = a.teacher_id
+        if _profe:
+            _cuerpo = f"{_yo.full_name if _yo else 'Un estudiante'} entregó '{a.title}'."
+            db.add(Notification(
+                user_id=_profe, type=NotificationType.info,
+                title="📥 Nueva entrega", body=_cuerpo,
+                link="/dashboard/teacher/assignments",
+            ))
+            await notify_user(db, _profe, "📥 Nueva entrega", _cuerpo,
+                              "/dashboard/teacher/assignments", f"entrega:{a.id}")
+    except Exception:
+        pass
+
     await db.commit()
     await db.refresh(sub)
     return {"submission_id": sub.id, "submitted_at": sub.submitted_at.isoformat()}
@@ -1562,3 +1596,121 @@ async def my_makeup_requests(
             "makeup_title": nueva.title if nueva else None,
         })
     return {"items": out}
+
+
+@router.get("/assignments/{assignment_id}")
+async def get_assignment_detail(
+    assignment_id: int,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.50 — Detalle de UNA tarea. Aquí SÍ se marca como vista.
+
+    Este es el único punto donde `viewed_at` se escribe: abrir el detalle es
+    el hecho real de "el estudiante vio esta tarea". Abrir el listado no lo es.
+    """
+    if user.role != "student":
+        raise HTTPException(403)
+
+    a = await db.get(Assignment, assignment_id)
+    if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+
+    # Misma regla de audiencia que el resto: no basta con conocer el ID
+    from app.services.audience import puede_acceder_a_tarea
+    if not await puede_acceder_a_tarea(db, user.user_id, a):
+        raise HTTPException(404, "Tarea no encontrada")
+
+    sub = (await db.execute(
+        select(AssignmentSubmission).where(
+            AssignmentSubmission.assignment_id == assignment_id,
+            AssignmentSubmission.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+
+    # El hecho: abrió esta tarea
+    ahora = _dt.now(_tz.utc)
+    if not sub:
+        sub = AssignmentSubmission(
+            assignment_id=assignment_id, student_id=user.user_id,
+            viewed_at=ahora,
+        )
+        db.add(sub)
+    elif not sub.viewed_at:
+        sub.viewed_at = ahora
+    await db.commit()
+
+    return {
+        "id": a.id, "title": a.title,
+        "description": a.description, "instructions": a.instructions,
+        "kind": (a.kind.value if a.kind else "written"),
+        "media_url": a.media_url,
+        "blanks": _leer_blanks_est(a.blanks_json),
+        "due_at": a.due_at.isoformat() if a.due_at else None,
+        "max_score": float(a.max_score) if a.max_score else 100.0,
+        "viewed_at": sub.viewed_at.isoformat() if sub.viewed_at else None,
+        "started_at": sub.started_at.isoformat() if sub.started_at else None,
+        "submitted_at": sub.submitted_at.isoformat() if sub.submitted_at else None,
+        "content": sub.content,
+        "file_url": sub.file_url, "file_name": sub.file_name,
+        "score": float(sub.score) if sub.score is not None else None,
+        "feedback": sub.feedback,
+    }
+
+
+@router.post("/assignments/{assignment_id}/draft")
+async def save_assignment_draft(
+    assignment_id: int,
+    body: dict,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    """V3.9.50 — Guardar un borrador. ESTE es el hecho que marca "empezada".
+
+    ANTES `started_at` existía pero nada lo escribía: había un estado que el
+    sistema no podía alcanzar nunca. Ahora el evento es claro —
+
+        empieza:  el estudiante guarda contenido parcial
+        termina:  entrega (submitted_at)
+
+    Abrir la tarea NO la marca como empezada; solo como vista.
+    """
+    if user.role != "student":
+        raise HTTPException(403)
+
+    a = await db.get(Assignment, assignment_id)
+    if not a:
+        raise HTTPException(404, "Tarea no encontrada")
+
+    from app.services.audience import puede_acceder_a_tarea
+    if not await puede_acceder_a_tarea(db, user.user_id, a):
+        raise HTTPException(404, "Tarea no encontrada")
+
+    sub = (await db.execute(
+        select(AssignmentSubmission).where(
+            AssignmentSubmission.assignment_id == assignment_id,
+            AssignmentSubmission.student_id == user.user_id,
+        )
+    )).scalar_one_or_none()
+
+    if sub and sub.submitted_at:
+        raise HTTPException(400, "Ya entregaste esta tarea")
+
+    ahora = _dt.now(_tz.utc)
+    contenido = (body.get("content") or "")
+
+    if not sub:
+        sub = AssignmentSubmission(
+            assignment_id=assignment_id, student_id=user.user_id,
+            viewed_at=ahora, started_at=ahora, content=contenido,
+        )
+        db.add(sub)
+    else:
+        if not sub.viewed_at:
+            sub.viewed_at = ahora
+        if not sub.started_at:
+            sub.started_at = ahora
+        sub.content = contenido
+
+    await db.commit()
+    return {"ok": True, "started_at": sub.started_at.isoformat() if sub.started_at else None}

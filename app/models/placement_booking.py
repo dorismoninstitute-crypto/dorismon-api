@@ -505,6 +505,11 @@ class AssignmentSubmission(Base):
     assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id", ondelete="CASCADE"))
     student_id: Mapped[str] = mapped_column(ForeignKey("students.user_id", ondelete="CASCADE"))
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # V3.9.49 P2 — Para saber si la vio y si la empezó, no solo si la entregó.
+    # Sin esto no se distingue "no la vio" de "la vio y no la hizo", que son
+    # dos problemas distintos y se atienden distinto.
+    viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_url: Mapped[str | None] = mapped_column(String, nullable=True)
     file_name: Mapped[str | None] = mapped_column(String, nullable=True)

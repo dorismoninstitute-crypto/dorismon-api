@@ -61,6 +61,8 @@ async def contexto_academico(db: AsyncSession, student_id: str) -> dict:
         "teacher_ids": [e.teacher_id for e in filas if getattr(e, "teacher_id", None)],
         # Si no está en ningún grupo, ve el contenido "suelto" de su nivel
         "sin_grupo": not any(getattr(e, "series_id", None) for e in filas),
+        # V3.9.51 — necesario para resolver la audiencia explícita en SQL
+        "_student_id": student_id,
     }
 
 
@@ -271,30 +273,110 @@ async def destinatarios_de_clase(db: AsyncSession, sesion) -> set[str]:
     return {x for (x,) in filas}
 
 
-async def destinatarios_de_actividad(db: AsyncSession, recurso) -> set[str]:
+async def destinatarios_de_actividad(db: AsyncSession, recurso,
+                                     tipo: str = "assignment") -> set[str]:
     """A quiénes les toca una tarea o un quiz.
 
-    ANTES se avisaba a todos los inscritos del nivel, sin mirar el profesor.
-    Por eso llegaban avisos de contenido ajeno.
+    ⚠️ V3.9.51 — MISMO ORDEN DE PRECISIÓN que `puede_acceder_a_tarea`.
+
+    Antes esta función NO miraba `ActivityAudience`, así que una tarea
+    dirigida a estudiantes concretos o a varios grupos se le notificaba (y se
+    contaba en el seguimiento) a gente que no podía ni abrirla. Dos reglas
+    distintas para la misma pregunta.
+
+    El orden es el mismo, siempre:
+      1. ActivityAudience explícita → varios grupos o estudiantes concretos
+      2. series_id                  → un grupo
+      3. teacher_id + level_id      → los del profesor en ese nivel
+      4. institucional              → todos los del nivel
     """
     from app.models import Enrollment
+
+    # 1. Audiencia ampliada: si está definida, manda ella
+    ampliada = await _audiencia_explicita(db, tipo, recurso.id)
+    if ampliada is not None:
+        destinatarios = set(ampliada["students"])
+        if ampliada["series"]:
+            filas = (await db.execute(
+                select(Enrollment.student_id).where(
+                    Enrollment.series_id.in_(ampliada["series"]),
+                    Enrollment.is_active.is_(True),
+                )
+            )).all()
+            destinatarios |= {x for (x,) in filas}
+        return destinatarios
 
     condiciones = [
         Enrollment.level_id == recurso.level_id,
         Enrollment.is_active.is_(True),
     ]
 
-    # V3.9.45 — Si va a un grupo, SOLO a ese grupo. Antes se avisaba a todos
-    # los del profesor en ese nivel, así que el otro grupo también recibía el
-    # aviso de una tarea que no le tocaba.
+    # 2. Un grupo concreto
     grupo = getattr(recurso, "series_id", None)
     if grupo:
         condiciones.append(Enrollment.series_id == grupo)
+    # 3. Del profesor, en ese nivel
     elif getattr(recurso, "teacher_id", None):
         condiciones.append(Enrollment.teacher_id == recurso.teacher_id)
+    # 4. Institucional: todos los del nivel
 
     filas = (await db.execute(select(Enrollment.student_id).where(*condiciones))).all()
     return {x for (x,) in filas}
+
+
+async def actividades_del_estudiante(db: AsyncSession, Modelo, student_id: str,
+                                     tipo: str = "assignment", extra=None) -> list:
+    """Las tareas (o quizzes) que le tocan a ESTE estudiante.
+
+    V3.9.51 — Helper central para que `tracking.py` no vuelva a decidir
+    audiencia por su cuenta. Antes AT_RISK repetía la lógica a mano con
+    level_id/series_id/teacher_id, y eso es exactamente cómo aparecen dos
+    fuentes de verdad que se desincronizan.
+    """
+    from sqlalchemy import and_
+
+    ctx = await contexto_academico(db, student_id)
+    cond = [filtro_actividades_del_estudiante(ctx, Modelo)]
+    if extra is not None:
+        cond.append(extra)
+
+    candidatas = (await db.execute(select(Modelo).where(and_(*cond)))).scalars().all()
+
+    # Las que tienen audiencia ampliada se comprueban una a una: el filtro SQL
+    # no puede expresar "solo estos estudiantes" sin complicar la consulta.
+    salida = []
+    for a in candidatas:
+        ampliada = await _audiencia_explicita(db, tipo, a.id)
+        if ampliada is None:
+            salida.append(a)
+        elif student_id in ampliada["students"] or (
+                ampliada["series"] & set(ctx["series_ids"])):
+            salida.append(a)
+
+    # Y las dirigidas explícitamente a él, que el filtro SQL no alcanza
+    ids = {a.id for a in salida}
+    try:
+        from app.models import ActivityAudience
+        extra_ids = {
+            x for (x,) in (await db.execute(
+                select(ActivityAudience.activity_id).where(
+                    ActivityAudience.activity_type == tipo,
+                    ActivityAudience.student_id == student_id,
+                )
+            )).all()
+        }
+        faltan = extra_ids - ids
+        if faltan:
+            cond2 = [Modelo.id.in_(faltan)]
+            if extra is not None:
+                cond2.append(extra)
+            salida += (await db.execute(
+                select(Modelo).where(and_(*cond2))
+            )).scalars().all()
+    except ImportError:
+        pass
+
+    return salida
 
 
 # ============================================================================
@@ -365,12 +447,41 @@ def filtro_actividades_del_estudiante(ctx: dict, Modelo):
     V3.9.45: antes faltaba la primera regla y por eso dos grupos del mismo
     profesor se veían el contenido entre sí.
     """
-    from sqlalchemy import and_, or_, false
+    from sqlalchemy import and_, or_, false, true
 
     if not ctx["level_ids"]:
         return false()
 
     base = Modelo.level_id.in_(ctx["level_ids"])
+
+    # V3.9.51 — Las actividades con AUDIENCIA EXPLÍCITA se excluyen de las
+    # reglas generales: si alguien definió a quién va, manda esa definición.
+    #
+    # Antes el listado no lo miraba (solo el acceso individual), así que una
+    # tarea dirigida a estudiantes concretos le APARECÍA a los demás aunque
+    # no pudieran abrirla. Dos reglas para la misma pregunta.
+    tipo_act = "quiz" if getattr(Modelo, "__tablename__", "") == "quizzes" else "assignment"
+    try:
+        from app.models import ActivityAudience
+        con_audiencia = select(ActivityAudience.activity_id).where(
+            ActivityAudience.activity_type == tipo_act
+        )
+        sin_audiencia_explicita = ~Modelo.id.in_(con_audiencia)
+
+        # Las que SÍ tienen audiencia y le corresponden a él
+        mias_explicitas = Modelo.id.in_(
+            select(ActivityAudience.activity_id).where(
+                ActivityAudience.activity_type == tipo_act,
+                or_(
+                    ActivityAudience.student_id == ctx.get("_student_id"),
+                    ActivityAudience.series_id.in_(ctx["series_ids"])
+                    if ctx["series_ids"] else false(),
+                ),
+            )
+        )
+    except ImportError:
+        sin_audiencia_explicita = true()
+        mias_explicitas = false()
 
     # Actividades dirigidas a un grupo: solo las de SUS grupos
     if ctx["series_ids"]:
@@ -389,7 +500,9 @@ def filtro_actividades_del_estudiante(ctx: dict, Modelo):
             ),
         )
 
-    return and_(base, or_(de_su_grupo, sin_grupo))
+    # Reglas generales: solo para las que NO tienen audiencia explícita
+    generales = and_(sin_audiencia_explicita, or_(de_su_grupo, sin_grupo))
+    return and_(base, or_(generales, mias_explicitas))
 
 
 # ============================================================================
@@ -472,3 +585,108 @@ async def puede_acceder_a_material(db: AsyncSession, student_id: str, material) 
     if material.level_id and material.level_id not in ctx["level_ids"]:
         return False
     return True
+
+
+# ============================================================================
+# V3.9.52 — ÁMBITO DE UNA MATRÍCULA
+# ============================================================================
+#
+# Dorismon es una academia de idiomas: Juan puede llevar English B1 con Carlos
+# y Spanish A2 con Andrea al mismo tiempo. Todo lo académico —tareas,
+# quizzes, asistencia, actividad— pertenece a UNA matrícula, no a la persona.
+#
+# Sin esto, las señales de un curso contaminan al otro: Juan aparece "en
+# riesgo" en inglés por faltas que en realidad tuvo en español.
+
+def _ctx_de_enrollment(enr) -> dict:
+    """El contexto académico de UNA matrícula, con la forma que esperan los
+    filtros existentes. Así se reutiliza la misma regla sin duplicarla."""
+    return {
+        "enrollments": [enr],
+        "level_ids": [enr.level_id] if enr.level_id else [],
+        "course_ids": [enr.course_id] if enr.course_id else [],
+        "series_ids": ([enr.series_id] if getattr(enr, "series_id", None) else []),
+        "teacher_ids": ([enr.teacher_id] if getattr(enr, "teacher_id", None) else []),
+        "sin_grupo": not getattr(enr, "series_id", None),
+        "_student_id": enr.student_id,
+    }
+
+
+async def actividades_del_enrollment(db: AsyncSession, Modelo, enr,
+                                     tipo: str = "assignment", extra=None) -> list:
+    """Las tareas (o quizzes) que le tocan a ESTA matrícula.
+
+    Respeta curso, nivel, grupo, profesor responsable y `ActivityAudience`.
+    Es la misma regla que usa el acceso individual: si no puede abrirla,
+    tampoco cuenta para su riesgo.
+    """
+    from sqlalchemy import and_, or_
+
+    ctx = _ctx_de_enrollment(enr)
+    if not ctx["level_ids"]:
+        return []
+
+    cond = [filtro_actividades_del_estudiante(ctx, Modelo)]
+    if enr.course_id and hasattr(Modelo, "course_id"):
+        cond.append(or_(Modelo.course_id == enr.course_id,
+                        Modelo.course_id.is_(None)))
+    if extra is not None:
+        cond.append(extra)
+
+    candidatas = (await db.execute(select(Modelo).where(and_(*cond)))).scalars().all()
+
+    # Las de audiencia ampliada se comprueban una a una
+    salida = []
+    for a in candidatas:
+        ampliada = await _audiencia_explicita(db, tipo, a.id)
+        if ampliada is None:
+            salida.append(a)
+        elif enr.student_id in ampliada["students"] or (
+                ampliada["series"] & set(ctx["series_ids"])):
+            salida.append(a)
+    return salida
+
+
+async def sesiones_del_enrollment(db: AsyncSession, enr, desde=None, hasta=None,
+                                  limite: int = 10) -> list:
+    """Las clases que le correspondían a ESTA matrícula.
+
+    EXCLUYE los eventos abiertos: faltar al Conversation Club no es faltar a
+    clase, y no debe contar para el riesgo académico.
+    """
+    from sqlalchemy import and_, desc, or_
+    from app.models import ClassSession
+
+    cond = [
+        ClassSession.course_id == enr.course_id,
+        ClassSession.level_id == enr.level_id,
+        # Los eventos opcionales no cuentan como clase
+        ClassSession.is_open_event.is_(False),
+    ]
+
+    grupo = getattr(enr, "series_id", None)
+    if grupo:
+        # De su grupo, o privadas suyas
+        cond.append(or_(
+            ClassSession.series_id == grupo,
+            ClassSession.student_id == enr.student_id,
+        ))
+    elif getattr(enr, "teacher_id", None):
+        cond.append(or_(
+            and_(ClassSession.series_id.is_(None),
+                 ClassSession.teacher_id == enr.teacher_id),
+            ClassSession.student_id == enr.student_id,
+        ))
+    else:
+        cond.append(ClassSession.student_id == enr.student_id)
+
+    if desde is not None:
+        cond.append(ClassSession.starts_at_utc >= desde)
+    if hasta is not None:
+        cond.append(ClassSession.starts_at_utc <= hasta)
+
+    q = select(ClassSession).where(and_(*cond)).order_by(
+        desc(ClassSession.starts_at_utc))
+    if limite:
+        q = q.limit(limite)
+    return (await db.execute(q)).scalars().all()

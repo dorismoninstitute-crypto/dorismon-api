@@ -7777,3 +7777,103 @@ async def revoke_quiz_grant(
     await log_action(db, admin.user_id, "revoke_quiz_grant", "quizzes", target_id=grant_id)
     await db.commit()
     return {"ok": True}
+
+
+# ============================================================================
+# V3.9.49 P2 — PANEL ACADÉMICO DEL ADMIN
+# ============================================================================
+
+@router.get("/at-risk-overview")
+async def at_risk_overview(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Estudiantes que necesitan atención, con el MOTIVO de cada uno.
+
+    No es una etiqueta suelta: cada estudiante trae las señales que lo
+    pusieron ahí (ausencias, tareas sin entregar, promedio bajo, inactividad)
+    y las reglas usadas, para que se entienda por qué aparece.
+    """
+    from app.services.tracking import estudiantes_en_riesgo
+
+    return await estudiantes_en_riesgo(db, None)
+
+
+@router.get("/academic-overview")
+async def academic_overview(
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+    days: int = 30,
+):
+    """Panorama académico: entrega, quizzes y trabajo pendiente por profesor.
+
+    Sirve para ver si el instituto va bien sin entrar a cada clase.
+    """
+    from app.services.tracking import estudiantes_en_riesgo
+
+    ahora = datetime.now(tz.utc)
+    desde = ahora - timedelta(days=max(1, min(180, days)))
+
+    # --- Tareas del periodo ---
+    tareas = (await db.execute(
+        select(Assignment).where(Assignment.created_at >= desde)
+    )).scalars().all() if hasattr(Assignment, "created_at") else (
+        await db.execute(select(Assignment))
+    ).scalars().all()
+
+    ids = [t.id for t in tareas]
+    entregadas = calificadas = 0
+    if ids:
+        entregadas = (await db.execute(
+            select(func.count()).select_from(AssignmentSubmission).where(
+                AssignmentSubmission.assignment_id.in_(ids),
+                AssignmentSubmission.submitted_at.is_not(None),
+            )
+        )).scalar() or 0
+        calificadas = (await db.execute(
+            select(func.count()).select_from(AssignmentSubmission).where(
+                AssignmentSubmission.assignment_id.in_(ids),
+                AssignmentSubmission.score.is_not(None),
+            )
+        )).scalar() or 0
+
+    # --- Trabajo pendiente por profesor ---
+    pendientes = (await db.execute(
+        select(Assignment.teacher_id, func.count())
+        .select_from(AssignmentSubmission)
+        .join(Assignment, AssignmentSubmission.assignment_id == Assignment.id)
+        .where(
+            AssignmentSubmission.submitted_at.is_not(None),
+            AssignmentSubmission.score.is_(None),
+        ).group_by(Assignment.teacher_id)
+    )).all()
+
+    por_profesor = []
+    for tid, n in pendientes:
+        if not tid:
+            continue
+        u = await db.get(User, tid)
+        por_profesor.append({
+            "teacher_id": tid,
+            "teacher_name": u.full_name if u else "—",
+            "pending_grading": n,
+        })
+    por_profesor.sort(key=lambda x: -x["pending_grading"])
+
+    riesgo = await estudiantes_en_riesgo(db, None)
+
+    return {
+        "days": days,
+        "assignments": {
+            "total": len(tareas),
+            "submitted": entregadas,
+            "graded": calificadas,
+            "pending_grading": max(0, entregadas - calificadas),
+        },
+        "teachers_pending": por_profesor,
+        "at_risk": {
+            "count": riesgo["count"],
+            "top": riesgo["items"][:5],
+        },
+        "reglas_riesgo": riesgo["reglas"],
+    }

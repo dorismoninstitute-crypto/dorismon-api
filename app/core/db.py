@@ -189,6 +189,15 @@ async def init_db():
         # ADITIVA Y CONSERVADORA: todos los materiales existentes quedan como
         # "institutional", que es como se comportaban. No se les inventa una
         # audiencia que nadie definió.
+        # V3.9.49 P2 — Seguimiento de tareas.
+        # ADITIVA: las entregas existentes quedan con NULL, que significa
+        # "no consta que la viera". No se inventa historial que no ocurrió.
+        v3949_migrations = [
+            "ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS viewed_at TIMESTAMPTZ",
+            "ALTER TABLE assignment_submissions ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
+        ]
+        migrations.extend(v3949_migrations)
+
         v3946_migrations = [
             "ALTER TABLE materials ADD COLUMN IF NOT EXISTS audience_kind VARCHAR DEFAULT 'institutional'",
             "ALTER TABLE materials ADD COLUMN IF NOT EXISTS series_id VARCHAR",
