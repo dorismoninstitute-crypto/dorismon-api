@@ -222,12 +222,14 @@ async def init_db():
                ON module_progress(enrollment_id, module_id)
                WHERE enrollment_id IS NOT NULL""",
         ]
-        migrations.extend(v3956_migrations)
+        # Se añade después de v3955: sus índices dependen de lesson_progress.enrollment_id.
 
         v3955_migrations = [
             "ALTER TABLE lesson_progress ADD COLUMN IF NOT EXISTS enrollment_id VARCHAR",
         ]
         migrations.extend(v3955_migrations)
+        # IMPORTANTE: v3956 usa lesson_progress.enrollment_id; por eso va después de v3955.
+        migrations.extend(v3956_migrations)
 
         v3953_migrations = [
             "ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS academic_status VARCHAR DEFAULT 'active'",
@@ -457,23 +459,40 @@ async def init_db():
                         continue  # ya está: nada que hacer
                     _sql = f"ALTER TABLE {_tabla} ADD COLUMN {_col}{_resto}"
 
+            _normalizada = " ".join(m.split())
+            _resumen = _normalizada[:120]
+            _critica = any(c in _normalizada for c in _criticas)
+
             try:
-                await conn.execute(sa_text(_sql))
+                # PostgreSQL deja TODA la transacción en estado abortado tras
+                # una sentencia fallida. Un SAVEPOINT por migración permite
+                # revertir solo esa sentencia y continuar de forma segura con
+                # las no críticas. DDL de PostgreSQL es transaccional.
+                if _es_postgres:
+                    async with conn.begin_nested():
+                        await conn.execute(sa_text(_sql))
+                else:
+                    await conn.execute(sa_text(_sql))
             except Exception as exc:
-                _resumen = " ".join(m.split())[:120]
                 _texto = str(exc).lower()
-                # Estos son esperables e inofensivos: ya estaba aplicado
+                # Estos son esperables e inofensivos: el SAVEPOINT ya dejó la
+                # transacción principal utilizable.
                 _ya_estaba = any(x in _texto for x in (
                     "already exists", "duplicate", "ya existe"))
                 if _ya_estaba:
                     continue
 
-                _critica = any(c in " ".join(m.split()) for c in _criticas)
                 if _critica and _es_postgres:
-                    _log.error("MIGRACIÓN CRÍTICA FALLÓ: %s → %s", _resumen, exc)
-                    _fallos_criticos.append(_resumen)
+                    # Una migración crítica no se acumula para seguir probando:
+                    # detenemos el arranque con la causa original.
+                    _log.exception("MIGRACIÓN CRÍTICA FALLÓ: %s", _resumen)
+                    raise RuntimeError(
+                        f"Migración crítica falló: {_resumen} → {exc}"
+                    ) from exc
                 else:
-                    # En SQLite (desarrollo) muchas sentencias no aplican
+                    # En SQLite (desarrollo) algunas sentencias PostgreSQL no
+                    # aplican; en PostgreSQL las no críticas quedan aisladas por
+                    # SAVEPOINT y no envenenan las siguientes migraciones.
                     _log.warning("Migración omitida: %s → %s", _resumen, exc)
 
         # ── V3.9.57 — SQLite: recrear las tablas sin la constraint vieja ──
