@@ -48,7 +48,12 @@ async def admin_dashboard(
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     week_ahead = now + timedelta(days=7)
 
-    u = await db.get(User, admin.user_id)
+    # La identidad del dashboard debe ser SIEMPRE la del usuario autenticado.
+    # Usamos un nombre explícito para evitar que loops posteriores sobrescriban
+    # accidentalmente esta referencia (regresión detectada en v3.9.60).
+    admin_user = await db.get(User, admin.user_id)
+    if not admin_user:
+        raise HTTPException(404, "Usuario administrador no encontrado")
 
     total_students = (await db.execute(
         select(func.count()).select_from(User).where(User.role == UserRole.student)
@@ -107,13 +112,13 @@ async def admin_dashboard(
         .where(User.is_active.is_(True), User.role == UserRole.teacher)
     )).all()
     teachers_without_students_list = []
-    for t, u in all_teachers:
+    for t, teacher_user in all_teachers:
         if t.user_id not in teachers_with_students:
             teachers_without_students_list.append({
-                "user_id": u.id,
-                "full_name": u.full_name,
-                "email": u.email,
-                "gender": u.gender,
+                "user_id": teacher_user.id,
+                "full_name": teacher_user.full_name,
+                "email": teacher_user.email,
+                "gender": teacher_user.gender,
                 "specialties": t.specialties or "",
                 "modalities": t.modalities or "",
                 "levels_taught": t.levels_taught or "",
@@ -126,8 +131,13 @@ async def admin_dashboard(
     )).scalar() or 0
 
     return {
-        "user": {"id": u.id, "full_name": u.full_name, "email": u.email,
-                 "avatar_url": u.avatar_url, "role": "super_admin"},
+        "user": {
+            "id": admin_user.id,
+            "full_name": admin_user.full_name,
+            "email": admin_user.email,
+            "avatar_url": admin_user.avatar_url,
+            "role": admin_user.role.value,
+        },
         "stats": {
             "total_students": total_students,
             "total_teachers": total_teachers,
