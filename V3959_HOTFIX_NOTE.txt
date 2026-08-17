@@ -1,0 +1,14 @@
+Dorismon backend v3.9.59 — PostgreSQL migration catalog type hotfix
+
+Fixes Render startup error:
+  operator does not exist: name[] = text[]
+
+Changes only app/core/db.py migration discovery logic:
+- Casts pg_attribute.attname (PostgreSQL type name) to text before array comparison.
+- Casts ARRAY literals explicitly to text[].
+- Restricts standalone unique-index removal to the exact legacy column pairs only.
+- Keeps per-migration SAVEPOINT behavior from v3.9.58.
+- No DELETE/TRUNCATE/data migration added.
+
+Backend Python compileall: OK.
+Production PostgreSQL execution must still be verified by Render startup log.

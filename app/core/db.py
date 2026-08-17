@@ -338,11 +338,11 @@ async def init_db():
                 JOIN pg_class t ON t.oid = c.conrelid
                 WHERE t.relname = 'lesson_progress'
                   AND c.contype = 'u'
-                  AND (SELECT array_agg(a.attname ORDER BY a.attname)
+                  AND (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
                        FROM unnest(c.conkey) k
                        JOIN pg_attribute a
                          ON a.attrelid = c.conrelid AND a.attnum = k)
-                      = ARRAY['lesson_id','student_id']
+                      = ARRAY['lesson_id','student_id']::text[]
               LOOP
                 EXECUTE format('ALTER TABLE lesson_progress DROP CONSTRAINT %I',
                                r.conname);
@@ -355,27 +355,47 @@ async def init_db():
                 JOIN pg_class t ON t.oid = c.conrelid
                 WHERE t.relname = 'module_progress'
                   AND c.contype = 'u'
-                  AND (SELECT array_agg(a.attname ORDER BY a.attname)
+                  AND (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
                        FROM unnest(c.conkey) k
                        JOIN pg_attribute a
                          ON a.attrelid = c.conrelid AND a.attnum = k)
-                      = ARRAY['module_id','student_id']
+                      = ARRAY['module_id','student_id']::text[]
               LOOP
                 EXECUTE format('ALTER TABLE module_progress DROP CONSTRAINT %I',
                                r.conname);
               END LOOP;
 
-              -- Y los índices únicos equivalentes que no sean constraint
+              -- Y solo los índices únicos equivalentes que NO pertenecen
+              -- a una constraint. No se eliminan otros índices únicos de estas
+              -- tablas: se comparan exactamente sus columnas.
               FOR r IN
                 SELECT i.relname AS iname
                 FROM pg_index x
                 JOIN pg_class i ON i.oid = x.indexrelid
                 JOIN pg_class t ON t.oid = x.indrelid
-                WHERE t.relname IN ('lesson_progress','module_progress')
-                  AND x.indisunique
+                WHERE x.indisunique
                   AND x.indpred IS NULL
-                  AND i.relname NOT LIKE 'uq_%_enrollment'
-                  AND i.relname NOT LIKE '%_pkey'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pg_constraint pc
+                    WHERE pc.conindid = x.indexrelid
+                  )
+                  AND (
+                    (t.relname = 'lesson_progress' AND
+                     (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
+                      FROM unnest(x.indkey::smallint[]) AS k(attnum)
+                      JOIN pg_attribute a
+                        ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+                      WHERE k.attnum > 0)
+                     = ARRAY['lesson_id','student_id']::text[])
+                    OR
+                    (t.relname = 'module_progress' AND
+                     (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
+                      FROM unnest(x.indkey::smallint[]) AS k(attnum)
+                      JOIN pg_attribute a
+                        ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+                      WHERE k.attnum > 0)
+                     = ARRAY['module_id','student_id']::text[])
+                  )
               LOOP
                 EXECUTE format('DROP INDEX IF EXISTS %I', r.iname);
               END LOOP;
