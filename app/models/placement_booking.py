@@ -421,6 +421,10 @@ class ClassSeries(Base):
     end_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # opcional si num_classes está seteado
     num_classes: Mapped[int | None] = mapped_column(Integer, nullable=True)  # opcional si end_date está seteado
     modality: Mapped[Modality] = mapped_column()
+    # El enlace general del grupo. NO hay `video_provider` en la serie a
+    # propósito (V3.9.63): la fuente de verdad del proveedor es cada
+    # ClassSession, y el proveedor "de la serie" se DERIVA de sus sesiones.
+    # Así no hacen falta ni columna ni migración nuevas para esta función.
     meeting_url: Mapped[str | None] = mapped_column(String, nullable=True)
     branch_id: Mapped[int | None] = mapped_column(ForeignKey("branches.id"), nullable=True)
     classroom_id: Mapped[int | None] = mapped_column(ForeignKey("classrooms.id"), nullable=True)

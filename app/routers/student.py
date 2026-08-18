@@ -814,8 +814,17 @@ async def my_calendar(
         events.append({
             "type": "class", "id": s.id, "title": s.title,
             "starts_at": s.starts_at_utc.isoformat(),
+            # V3.9.64 — El calendario necesita los MISMOS datos que el resto
+            # de pantallas para decidir si se puede entrar a la clase. Sin
+            # `video_provider`, una clase con Video Dorismon y sin enlace de
+            # respaldo se quedaba sin botón. `ends_at_utc` y `status` los usa
+            # el botón para saber si la clase está por empezar, en curso o ya
+            # terminó.
+            "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
             "modality": s.modality.value,
             "meeting_url": s.meeting_url,
+            "video_provider": getattr(s, "video_provider", "meet") or "meet",
+            "status": s.status.value if s.status else "scheduled",
             "location": await _build_location(db, s),  # V3.0.3
         })
     if enrollments:

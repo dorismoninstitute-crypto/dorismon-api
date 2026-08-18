@@ -273,6 +273,38 @@ async def destinatarios_de_clase(db: AsyncSession, sesion) -> set[str]:
     return {x for (x,) in filas}
 
 
+async def destinatarios_de_serie(db: AsyncSession, series_id: str) -> set[str]:
+    """A QUIÉNES les corresponde una serie completa (el grupo real).
+
+    ⚠️ V3.9.62 — POR QUÉ EXISTE ESTA FUNCIÓN.
+
+    Cuando se reprogramaba una serie o se le cambiaba el profesor, el aviso
+    se mandaba a todo el que tuviera ese `course_id + level_id`. Es decir:
+    cambiabas el horario de B1 Mañana y le llegaba también a B1 Noche, que
+    no se enteró de nada porque su horario no cambió.
+
+    La regla correcta es la MISMA que ya usa `destinatarios_de_clase` para
+    una sesión de grupo: pertenece al grupo quien tiene esa matrícula, no
+    quien comparte nivel.
+
+    Devuelve un `set` vacío si el grupo no tiene a nadie matriculado todavía.
+    Eso es un resultado legítimo, no un error: una serie recién creada aún
+    no tiene estudiantes y no hay a quién avisar.
+    """
+    from app.models import Enrollment
+
+    if not series_id:
+        return set()
+
+    filas = (await db.execute(
+        select(Enrollment.student_id).where(
+            Enrollment.series_id == series_id,
+            Enrollment.is_active.is_(True),
+        )
+    )).all()
+    return {x for (x,) in filas}
+
+
 async def destinatarios_de_actividad(db: AsyncSession, recurso,
                                      tipo: str = "assignment") -> set[str]:
     """A quiénes les toca una tarea o un quiz.

@@ -309,6 +309,13 @@ async def init_db():
         ]
         migrations.extend(v3926_migrations)
 
+        # ── V3.9.63 — Editar serie recurrente: SIN migración ──
+        #
+        # La edición completa de series (video, enlace, horario, profesor) NO
+        # añade ni una columna. El proveedor de video de un grupo se DERIVA de
+        # sus ClassSession, que ya tienen `video_provider` desde v3.9.26.
+        # Menos esquema que mantener y cero riesgo en el arranque de Render.
+
         # ⚠️ V3.9.57 — ESTE BLOQUE VA AL FINAL A PROPÓSITO.
         #
         # Las migraciones se aplican en el orden de esta lista, y los bloques

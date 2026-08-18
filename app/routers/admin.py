@@ -676,6 +676,12 @@ async def list_admin_sessions(
                 else "single"
             ),
             "video_provider": getattr(s, "video_provider", "meet") or "meet",
+            # V3.9.62 — Módulo y profesor programado. Se exponen para que
+            # Dirección pueda comprobar que al editar una serie recurrente
+            # NO se perdió la rotación de módulos ni el histórico de quién
+            # estaba asignado originalmente.
+            "module_id": s.module_id,
+            "scheduled_teacher_id": s.scheduled_teacher_id,
         })
     return {"items": out, "page": page, "limit": limit, "filter_period": filter_period}
 
@@ -3048,6 +3054,69 @@ async def load_module_templates(
 
 # ============= V1.7 — SERIES RECURRENTES + CLASES PRIVADAS =============
 
+async def _video_efectivo_de_serie(db, series_id: str) -> dict:
+    """V3.9.63 — Qué video usa HOY un grupo, leído de sus propias clases.
+
+    La serie NO guarda `video_provider`: la fuente de verdad es cada
+    ClassSession. Guardarlo también en la serie habría creado dos copias del
+    mismo dato, que es como se empiezan a contradecir.
+
+    QUÉ DEVUELVE Y POR QUÉ ESE ORDEN:
+
+      1. La PRÓXIMA clase futura no cancelada. El editor de series sirve para
+         cambiar el futuro, así que debe mostrar la configuración futura
+         vigente. Si las clases pasadas fueron por Meet y las próximas son
+         por Video Dorismon, lo correcto es "dorismon": es lo que el
+         estudiante se va a encontrar.
+
+      2. Si no hay futuras, la clase MÁS RECIENTE. El grupo terminó, pero su
+         última configuración conocida sigue siendo la mejor respuesta.
+
+      3. Si la serie no tiene ninguna clase, "meet": es el comportamiento
+         histórico y lo que hace `ClassSession.video_provider` por defecto.
+
+    Se devuelve también el `meeting_url` de esa misma clase, para que el
+    editor precargue un par coherente y no mezcle el proveedor de una sesión
+    con el enlace de otra.
+    """
+    from sqlalchemy import or_ as _or
+
+    ahora = datetime.now(tz.utc)
+
+    ref = (await db.execute(
+        select(ClassSession).where(
+            ClassSession.series_id == series_id,
+            ClassSession.starts_at_utc > ahora,
+            ClassSession.status != SessionStatus.cancelled,
+        ).order_by(ClassSession.starts_at_utc.asc()).limit(1)
+    )).scalar_one_or_none()
+
+    if ref is None:
+        # Sin futuras: la más reciente. Se prefiere una no cancelada, porque
+        # una clase cancelada no dice cómo se daba el grupo.
+        ref = (await db.execute(
+            select(ClassSession).where(
+                ClassSession.series_id == series_id,
+                ClassSession.status != SessionStatus.cancelled,
+            ).order_by(ClassSession.starts_at_utc.desc()).limit(1)
+        )).scalar_one_or_none()
+
+    if ref is None:
+        ref = (await db.execute(
+            select(ClassSession).where(ClassSession.series_id == series_id)
+            .order_by(ClassSession.starts_at_utc.desc()).limit(1)
+        )).scalar_one_or_none()
+
+    if ref is None:
+        return {"video_provider": "meet", "meeting_url": None, "source_session_id": None}
+
+    return {
+        "video_provider": getattr(ref, "video_provider", "meet") or "meet",
+        "meeting_url": ref.meeting_url,
+        "source_session_id": ref.id,
+    }
+
+
 DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 DAY_NAMES_REV = {v: k for k, v in DAY_NAMES.items()}
 
@@ -3154,6 +3223,9 @@ async def create_class_series(
         end_date=end_date,
         num_classes=num_classes,
         modality=modality,
+        # El enlace general del grupo. El PROVEEDOR no se guarda aquí: viaja
+        # a cada ClassSession (`video_provider=_vp` más abajo) y se deriva de
+        # ellas cuando hace falta. Una sola fuente de verdad.
         meeting_url=body.get("meeting_url"),
         branch_id=body.get("branch_id"),
         classroom_id=body.get("classroom_id"),
@@ -3259,6 +3331,7 @@ async def list_class_series(
         t_user = await db.get(User, s.teacher_id)
         level = await db.get(Level, s.level_id)
         course = await db.get(Course, s.course_id)
+        _video = await _video_efectivo_de_serie(db, s.id)
         out.append({
             "id": s.id,
             "name": s.name,
@@ -3274,6 +3347,16 @@ async def list_class_series(
             "start_date": s.start_date.isoformat() if s.start_date else None,
             "end_date": s.end_date.isoformat() if s.end_date else None,
             "modality": s.modality.value,
+            # V3.9.63: el modal de "Editar serie" necesita el estado REAL del
+            # video para precargarlo. Sin esto, abrir el modal y guardar
+            # borraba el enlace que ya tenía el grupo.
+            #
+            # El proveedor se DERIVA de la próxima clase futura (ver
+            # `_video_efectivo_de_serie`): el editor cambia el futuro, así que
+            # debe mostrar la configuración futura vigente, no un dato
+            # duplicado en la serie que podría haberse quedado atrás.
+            "meeting_url": _video["meeting_url"] or s.meeting_url,
+            "video_provider": _video["video_provider"],
             "is_active": s.is_active,
             "total_classes": total,
             "future_classes": future,
@@ -3334,20 +3417,52 @@ async def reschedule_class_series(
     admin: Annotated[CurrentUser, Depends(require_admin)],
     db: AsyncSession = Depends(get_db),
 ):
-    """V3.9.8: Reprograma una serie a FUTURO. Cambia hora, días y/o profesor y
-    regenera SOLO las clases futuras (las pasadas quedan intactas).
+    """V3.9.62 — Editar una serie recurrente COMPLETA, sin destruir nada.
 
-    Seguro para producción: nunca toca clases que ya ocurrieron ni su historial.
+    ══ QUÉ PROBLEMA RESUELVE ══
 
-    Body (todos opcionales — solo se cambia lo que se envía):
-    - days_of_week: "mon,wed,fri"
-    - start_time_hhmm: "17:00"
-    - duration_min: 90
-    - teacher_id: "uuid"
-    - modality: "online" | "presencial" | "hibrida"
-    - meeting_url: "https://..."
+    Una serie con un Google Meet viejo que dejó de funcionar no se podía
+    arreglar: el modal no dejaba tocar el enlace ni el proveedor de video, y
+    lo único parecido —"reprogramar"— BORRABA todas las clases futuras y las
+    volvía a crear. Cambiar un link costaba el historial del grupo.
+
+    ══ LA REGLA NUEVA ══
+
+    Se toca lo MÍNIMO necesario:
+
+      · Solo cambia el video (proveedor y/o enlace) → se actualizan las
+        clases futuras EN SITIO. No se borra ni una.
+      · Cambia la hora y/o la duración, pero los días siguen siendo los
+        mismos → también EN SITIO: se mueve la hora de cada clase futura
+        conservando su fecha.
+      · Cambian los DÍAS (la regla de recurrencia de verdad) → ahí sí hay
+        que regenerar fechas, y se copia explícitamente todo lo que la
+        clase traía: módulo, profesor programado, video, sede, aula, cupo,
+        si cuenta para progreso y su título.
+
+    Actualizar en sitio conserva los IDs de sesión, y con ellos la
+    asistencia, las entregas, las grabaciones y los recordatorios ya
+    enviados, que cuelgan de esos IDs.
+
+    ══ LO QUE NUNCA SE TOCA ══
+
+    Las clases PASADAS. Y las clases futuras ya canceladas: una cancelación
+    es un hecho ocurrido, no un hueco que rellenar.
+
+    Body (todo opcional — solo cambia lo que se envía):
+      - days_of_week:    "mon,wed,fri"
+      - start_time_hhmm: "17:00"          (hora dominicana)
+      - duration_min:    90
+      - teacher_id:      "uuid"           (cambio permanente de profesor)
+      - modality:        "online" | "presencial" | "hibrida"
+      - video_provider:  "meet" | "dorismon"
+      - meeting_url:     "https://..."    (Meet, Zoom, Teams o cualquier HTTPS)
+      - confirm_overlap: true             (si el profesor nuevo ya tiene clase)
     """
-    from datetime import datetime as dt, timedelta as td
+    from datetime import timedelta as td
+    from zoneinfo import ZoneInfo
+
+    _RD = ZoneInfo("America/Santo_Domingo")
 
     series = await db.get(ClassSeries, series_id)
     if not series:
@@ -3355,126 +3470,380 @@ async def reschedule_class_series(
 
     now = datetime.now(tz.utc)
 
-    # Aplicar cambios a la serie (solo los campos enviados)
-    if body.get("days_of_week"):
-        series.days_of_week = body["days_of_week"]
-    if body.get("start_time_hhmm"):
-        series.start_time_hhmm = body["start_time_hhmm"]
-    if body.get("duration_min"):
-        series.duration_min = int(body["duration_min"])
-    if body.get("teacher_id"):
-        # Validar que el profesor exista
-        t = await db.get(Teacher, body["teacher_id"])
-        if not t:
-            raise HTTPException(404, "Profesor no encontrado")
-        series.teacher_id = body["teacher_id"]
-    if body.get("modality"):
-        series.modality = Modality(body["modality"])
-    if "meeting_url" in body:
-        series.meeting_url = body["meeting_url"]
+    # ── 1. LEER Y VALIDAR LO QUE SE PIDE ────────────────────────────────
+    #
+    # Nada se escribe hasta que TODO esté validado. Una serie a medio
+    # cambiar es peor que una serie sin cambiar.
 
-    # Contar clases futuras y pasadas
-    future_sessions = (await db.execute(
+    cambios_txt: list[str] = []   # para el aviso y la auditoría
+
+    # Días
+    dias_nuevos = None
+    if body.get("days_of_week"):
+        crudos = [d.strip().lower() for d in str(body["days_of_week"]).split(",") if d.strip()]
+        invalidos = [d for d in crudos if d not in DAY_NAMES]
+        if invalidos:
+            raise HTTPException(400, f"Días inválidos: {', '.join(invalidos)}")
+        if not crudos:
+            raise HTTPException(400, "Indica al menos un día de la semana")
+        # Ordenados de lunes a domingo, sin repetidos
+        dias_nuevos = ",".join(sorted(set(crudos), key=lambda d: DAY_NAMES[d]))
+
+    dias_actuales = ",".join(sorted(
+        {d.strip().lower() for d in (series.days_of_week or "").split(",") if d.strip()},
+        key=lambda d: DAY_NAMES.get(d, 99)))
+    cambia_recurrencia = dias_nuevos is not None and dias_nuevos != dias_actuales
+
+    # Hora
+    hora_nueva = None
+    if body.get("start_time_hhmm"):
+        crudo = str(body["start_time_hhmm"]).strip()
+        try:
+            _hh, _mm = crudo.split(":")
+            _hh, _mm = int(_hh), int(_mm)
+            if not (0 <= _hh <= 23 and 0 <= _mm <= 59):
+                raise ValueError
+        except Exception:
+            raise HTTPException(400, "Hora inválida (usa HH:MM, por ejemplo 19:00)")
+        hora_nueva = f"{_hh:02d}:{_mm:02d}"
+
+    # Duración
+    dur_nueva = None
+    if body.get("duration_min") is not None:
+        try:
+            dur_nueva = int(body["duration_min"])
+        except Exception:
+            raise HTTPException(400, "Duración inválida")
+        if not (15 <= dur_nueva <= 480):
+            raise HTTPException(400, "La duración debe estar entre 15 y 480 minutos")
+
+    # Modalidad
+    mod_nueva = None
+    if body.get("modality"):
+        try:
+            mod_nueva = Modality(body["modality"])
+        except Exception:
+            raise HTTPException(400, "Modalidad inválida (online/presencial/hibrida)")
+
+    # ── VIDEO: proveedor y enlace ───────────────────────────────────────
+    #
+    # V3.9.63 — El proveedor ACTUAL no se lee de la serie (la serie no lo
+    # guarda): se deriva de la próxima clase futura no cancelada. Así el
+    # editor razona sobre la configuración que el estudiante se va a
+    # encontrar, no sobre un dato duplicado que pudo quedarse atrás.
+    _video_actual = await _video_efectivo_de_serie(db, series_id)
+    prov_actual = _video_actual["video_provider"]
+    url_actual = _video_actual["meeting_url"] or series.meeting_url
+
+    prov_nuevo = None
+    if body.get("video_provider"):
+        if body["video_provider"] not in ("meet", "dorismon"):
+            raise HTTPException(400, "Proveedor de video inválido (meet/dorismon)")
+        prov_nuevo = body["video_provider"]
+
+    # `meeting_url` se lee con `in body` a propósito: mandar cadena vacía
+    # significa "quítalo", y eso es distinto de no mandarlo.
+    url_nueva = None
+    url_enviada = "meeting_url" in body
+    if url_enviada:
+        url_nueva = (body.get("meeting_url") or "").strip() or None
+        # Solo https. Un enlace de clase que no cifra no se acepta.
+        if url_nueva and not url_nueva.lower().startswith("https://"):
+            raise HTTPException(400, "El enlace debe empezar con https://")
+
+    prov_final = prov_nuevo or prov_actual
+    url_final = url_nueva if url_enviada else url_actual
+
+    # ⚠️ Se distingue CAMBIAR EL PROVEEDOR de CAMBIAR EL ENLACE.
+    #
+    # Si solo se toca el enlace, NO se escribe `video_provider` en ninguna
+    # sesión. Sin esta separación, abrir el editor de un grupo que da clase
+    # por Video Dorismon y guardar solo un enlace de respaldo habría
+    # reescrito el proveedor de todas sus clases futuras.
+    cambia_proveedor = prov_nuevo is not None and prov_nuevo != prov_actual
+    cambia_url = url_enviada and url_final != url_actual
+
+    # Un enlace externo SIN enlace no es una clase, es un callejón sin
+    # salida. Con Video Dorismon el enlace es opcional (es el respaldo).
+    if prov_final == "meet" and not url_final:
+        raise HTTPException(
+            400, "Con enlace externo hace falta el link de la reunión "
+                 "(Meet, Zoom, Teams u otro https://)")
+
+    # Profesor (se delega al flujo existente más abajo)
+    profe_nuevo = (body.get("teacher_id") or "").strip() or None
+    if profe_nuevo and profe_nuevo == series.teacher_id:
+        profe_nuevo = None  # ya es el suyo: no es un cambio
+
+    # ── 2. QUÉ CLASES ENTRAN ────────────────────────────────────────────
+    #
+    # Solo futuras y no canceladas. Una clase cancelada del futuro es un
+    # hecho registrado: no se mueve, no se borra, no se le cambia el link.
+    futuras = (await db.execute(
         select(ClassSession).where(
             ClassSession.series_id == series_id,
             ClassSession.starts_at_utc > now,
-        )
+            ClassSession.status != SessionStatus.cancelled,
+        ).order_by(ClassSession.starts_at_utc)
     )).scalars().all()
-    past_count = (await db.execute(
+
+    pasadas = (await db.execute(
         select(func.count()).select_from(ClassSession).where(
             ClassSession.series_id == series_id,
             ClassSession.starts_at_utc <= now,
         )
     )).scalar() or 0
 
-    # ¿Cuántas clases futuras hay que regenerar? (misma cantidad que se borra)
-    num_to_regen = len(future_sessions)
-    if num_to_regen == 0:
-        raise HTTPException(400, "Esta serie no tiene clases futuras para reprogramar.")
+    if cambia_recurrencia and not futuras:
+        raise HTTPException(
+            400, "Esta serie no tiene clases futuras: no hay fechas que regenerar. "
+                 "Si quieres reactivar el grupo, crea una serie nueva.")
 
-    # Borrar las clases futuras
-    for sess in future_sessions:
-        await db.delete(sess)
+    # ── 3. APLICAR A LA SERIE ───────────────────────────────────────────
+    if dias_nuevos and cambia_recurrencia:
+        series.days_of_week = dias_nuevos
+        _lbl = {"mon": "Lun", "tue": "Mar", "wed": "Mié", "thu": "Jue",
+                "fri": "Vie", "sat": "Sáb", "sun": "Dom"}
+        cambios_txt.append("días: " + ", ".join(_lbl.get(d, d) for d in dias_nuevos.split(",")))
+
+    cambia_hora = hora_nueva is not None and hora_nueva != (series.start_time_hhmm or "")
+    if cambia_hora:
+        series.start_time_hhmm = hora_nueva
+        try:
+            _h12 = datetime(2000, 1, 1, int(hora_nueva[:2]), int(hora_nueva[3:5]))
+            cambios_txt.append(f"hora: {_h12.strftime('%I:%M %p').lstrip('0')}")
+        except Exception:
+            cambios_txt.append(f"hora: {hora_nueva}")
+
+    cambia_duracion = dur_nueva is not None and dur_nueva != (series.duration_min or 90)
+    if cambia_duracion:
+        series.duration_min = dur_nueva
+        cambios_txt.append(f"duración: {dur_nueva} min")
+
+    cambia_modalidad = mod_nueva is not None and mod_nueva != series.modality
+    if cambia_modalidad:
+        series.modality = mod_nueva
+        cambios_txt.append(f"modalidad: {mod_nueva.value}")
+
+    cambia_video = cambia_proveedor or cambia_url
+    if cambia_url:
+        # La serie SÍ guarda el enlace general (columna que ya existía), para
+        # que las clases que se creen después lo hereden. El proveedor no.
+        series.meeting_url = url_final
+    if cambia_proveedor:
+        cambios_txt.append(
+            "video: clase dentro de Dorismon" if prov_final == "dorismon"
+            else "video: enlace externo")
+    elif cambia_url:
+        cambios_txt.append("nuevo enlace de la clase")
+
+    # ── 4. LAS CLASES FUTURAS ───────────────────────────────────────────
+    actualizadas = 0
+    regeneradas = 0
+    no_movidas = 0   # su hora nueva ya pasó: se quedan donde estaban
+
+    if not cambia_recurrencia:
+        # ═══ CAMINO EN SITIO ═══
+        #
+        # Sin borrar nada. Se conservan los IDs y con ellos asistencia,
+        # entregas, grabaciones, recordatorios enviados e histórico.
+        duracion = series.duration_min or 90
+        for s in futuras:
+            tocada = False
+
+            # Cada cosa por separado: cambiar el enlace NO reescribe el
+            # proveedor de la clase, y viceversa.
+            if cambia_proveedor:
+                s.video_provider = prov_final
+                tocada = True
+            if cambia_url:
+                s.meeting_url = url_final
+                tocada = True
+
+            if cambia_modalidad:
+                s.modality = mod_nueva
+                tocada = True
+
+            if cambia_hora or cambia_duracion:
+                inicio = s.starts_at_utc
+                if inicio.tzinfo is None:
+                    inicio = inicio.replace(tzinfo=tz.utc)
+
+                movida = False
+                if cambia_hora:
+                    fecha_rd = inicio.astimezone(_RD).date()
+                    hh, mm = (series.start_time_hhmm or "00:00").split(":")
+                    nuevo_inicio = datetime(
+                        fecha_rd.year, fecha_rd.month, fecha_rd.day,
+                        int(hh), int(mm), tzinfo=_RD).astimezone(tz.utc)
+
+                    # Si la hora nueva de ESE día ya pasó, la clase se queda
+                    # en su hora original. Mover una clase al pasado sería
+                    # inventar historia: figuraría como dada sin ocurrir.
+                    if nuevo_inicio <= now:
+                        no_movidas += 1
+                    else:
+                        s.starts_at_utc = nuevo_inicio
+                        inicio = nuevo_inicio
+                        movida = True
+
+                # La duración se aplica igual, se haya movido o no: si la
+                # clase se queda a su hora, su duración nueva sí es válida.
+                if movida or cambia_duracion:
+                    s.ends_at_utc = inicio + td(minutes=duracion)
+                    tocada = True
+
+            if tocada:
+                actualizadas += 1
+    else:
+        # ═══ CAMINO DE REGENERACIÓN ═══
+        #
+        # Solo aquí, y solo porque los días cambiaron de verdad. Antes de
+        # borrar se copia TODO lo que cada clase traía, para devolvérselo a
+        # la clase que ocupa su lugar. Lo que no se copia, se pierde.
+        conservar = [{
+            "title": s.title,
+            "description": s.description,
+            "module_id": s.module_id,
+            "scheduled_teacher_id": s.scheduled_teacher_id or s.teacher_id,
+            "teacher_id": s.teacher_id,
+            "counts_for_progress": s.counts_for_progress,
+            "capacity": s.capacity,
+            "branch_id": s.branch_id,
+            "classroom_id": s.classroom_id,
+            # Se conserva el proveedor DE CADA CLASE salvo que se haya
+            # pedido cambiarlo explícitamente. Igual con el enlace.
+            "video_provider": prov_final if cambia_proveedor else (
+                getattr(s, "video_provider", "meet") or "meet"),
+            "meeting_url": url_final if cambia_url else s.meeting_url,
+            "modality": mod_nueva if cambia_modalidad else s.modality,
+        } for s in futuras]
+
+        cuantas = len(futuras)
+        for s in futuras:
+            await db.delete(s)
+        await db.flush()
+
+        # V3.9.17 — Si la hora nueva de HOY todavía no pasó, la primera
+        # clase puede ser HOY. Antes siempre saltaba a mañana y si movías
+        # "hoy 7pm → hoy 7am" la clase de hoy desaparecía.
+        ahora_rd = now.astimezone(_RD)
+        try:
+            _hh, _mm = (series.start_time_hhmm or "00:00").split(":")
+            hoy_a_la_hora = ahora_rd.replace(
+                hour=int(_hh), minute=int(_mm), second=0, microsecond=0)
+            desde = ahora_rd.date() if hoy_a_la_hora > ahora_rd else (ahora_rd + td(days=1)).date()
+        except Exception:
+            desde = (ahora_rd + td(days=1)).date()
+
+        nuevas_fechas = _generate_session_dates(
+            desde, None, cuantas, series.days_of_week, series.start_time_hhmm)
+        if not nuevas_fechas:
+            raise HTTPException(400, "No se pudieron generar fechas con esos días y hora")
+
+        duracion = series.duration_min or 90
+        for i, naive in enumerate(nuevas_fechas):
+            base = conservar[i] if i < len(conservar) else conservar[-1]
+            inicio = naive.replace(tzinfo=_RD).astimezone(tz.utc)
+            db.add(ClassSession(
+                course_id=series.course_id,
+                level_id=series.level_id,
+                teacher_id=base["teacher_id"] or series.teacher_id,
+                title=base["title"] or f"{series.name} — Clase {pasadas + i + 1}",
+                description=base["description"],
+                modality=base["modality"] or series.modality,
+                starts_at_utc=inicio,
+                ends_at_utc=inicio + td(minutes=duracion),
+                meeting_url=base["meeting_url"],
+                video_provider=base["video_provider"],
+                branch_id=base["branch_id"],
+                classroom_id=base["classroom_id"],
+                capacity=base["capacity"] if base["capacity"] is not None else series.capacity,
+                module_id=base["module_id"],
+                counts_for_progress=base["counts_for_progress"],
+                scheduled_teacher_id=base["scheduled_teacher_id"],
+                series_id=series.id,
+            ))
+            regeneradas += 1
+
     await db.flush()
 
-    # Regenerar a partir de mañana, con la misma cantidad de clases futuras
-    # V3.9.17 FIX: si la hora nueva de HOY (en hora dominicana) todavía no pasó,
-    # la primera clase regenerada puede ser HOY mismo. Antes siempre saltaba a
-    # mañana, y si cambiabas "hoy 7pm → hoy 7am" la clase de hoy desaparecía.
-    from zoneinfo import ZoneInfo as _ZI2
-    _rd2 = _ZI2("America/Santo_Domingo")
-    now_rd = now.astimezone(_rd2)
-    try:
-        _hh, _mm = (series.start_time_hhmm or "00:00").split(":")
-        new_time_today = now_rd.replace(hour=int(_hh), minute=int(_mm), second=0, microsecond=0)
-        regen_start = now_rd.date() if new_time_today > now_rd else (now_rd + td(days=1)).date()
-    except Exception:
-        regen_start = (now_rd + td(days=1)).date()
-    new_dates = _generate_session_dates(
-        regen_start, None, num_to_regen,
-        series.days_of_week, series.start_time_hhmm
-    )
-
-    created = 0
-    duration = series.duration_min or 90
-    from zoneinfo import ZoneInfo as _ZI
-    _rd = _ZI("America/Santo_Domingo")
-    # Continuar la numeración después de las clases pasadas
-    for i, naive_dt in enumerate(new_dates):
-        # V3.9.16 FIX: la hora es hora DOMINICANA (UTC-4), convertir a UTC
-        starts_at = naive_dt.replace(tzinfo=_rd).astimezone(tz.utc)
-        ends_at = starts_at + td(minutes=duration)
-        session = ClassSession(
-            course_id=series.course_id,
-            level_id=series.level_id,
-            teacher_id=series.teacher_id,
-            title=f"{series.name} — Clase {past_count + i + 1}",
-            modality=series.modality,
-            starts_at_utc=starts_at,
-            ends_at_utc=ends_at,
-            meeting_url=series.meeting_url,
-            branch_id=series.branch_id,
-            classroom_id=series.classroom_id,
-            capacity=series.capacity,
-            series_id=series.id,
+    # ── 5. PROFESOR: SE DELEGA, NO SE DUPLICA ───────────────────────────
+    #
+    # El cambio permanente de profesor tiene su propio flujo (avisos a las
+    # tres partes, detección de choques de horario, histórico). Se reutiliza
+    # tal cual. Va DESPUÉS de mover el horario para que los choques se
+    # busquen contra las horas NUEVAS, no contra las viejas.
+    profe_resultado = None
+    if profe_nuevo:
+        profe_resultado = await _aplicar_cambio_profesor_serie(
+            db, series, profe_nuevo, admin.user_id,
+            confirm_overlap=bool(body.get("confirm_overlap")),
         )
-        db.add(session)
-        created += 1
+        cambios_txt.append(f"profesor: {profe_resultado['teacher']}")
 
-    await log_action(db, admin.user_id, "update_class_series", "sessions",
-                     target_id=series_id, details=f"reschedule: regen={created}, kept_past={past_count}")
+    if not cambios_txt:
+        raise HTTPException(400, "No se envió ningún cambio")
+
+    detalle = "; ".join(cambios_txt)
+    await log_action(
+        db, admin.user_id, "update_class_series", "sessions", target_id=series_id,
+        details=(f"editar serie [{detalle}] — en_sitio={actualizadas}, "
+                 f"regeneradas={regeneradas}, sin_mover={no_movidas}, pasadas_intactas={pasadas}"))
     await db.commit()
-    # V3.9.21: avisar a los estudiantes del nivel que el horario de su serie cambió
+
+    # ── 6. AVISAR AL GRUPO REAL ─────────────────────────────────────────
+    #
+    # V3.9.62 — Antes el aviso salía por course_id + level_id: cambiabas el
+    # horario de B1 Mañana y le llegaba también a B1 Noche, que no se enteró
+    # de nada porque su horario no cambió. Ahora se usa el servicio central
+    # de audiencia, la MISMA regla que decide qué clases ve el estudiante.
     try:
-        dias_map = {"mon": "Lun", "tue": "Mar", "wed": "Mié", "thu": "Jue", "fri": "Vie", "sat": "Sáb", "sun": "Dom"}
-        dias_txt = ", ".join(dias_map.get(d.strip(), d) for d in (series.days_of_week or "").split(",") if d.strip())
-        try:
-            _h, _m = (series.start_time_hhmm or "00:00").split(":")
-            _dt12 = datetime(2000, 1, 1, int(_h), int(_m))
-            hora_txt = _dt12.strftime("%I:%M %p").lstrip("0")
-        except Exception:
-            hora_txt = series.start_time_hhmm or ""
-        rows = (await db.execute(
-            select(Enrollment.student_id).where(
-                Enrollment.course_id == series.course_id,
-                Enrollment.level_id == series.level_id,
-                Enrollment.is_active.is_(True),
-            )
-        )).all()
-        for (st_id,) in rows:
+        from app.services.audience import destinatarios_de_serie
+        from app.services.push_service import notify_user
+
+        solo_video = cambia_video and not (
+            cambia_recurrencia or cambia_hora or cambia_duracion
+            or cambia_modalidad or profe_nuevo)
+        titulo = "🔗 Nuevo enlace para tu clase" if solo_video else "🔄 Cambió el horario de tu clase"
+        cuerpo = f"'{series.name}': {detalle}. Revisa tu calendario."
+
+        destinatarios = await destinatarios_de_serie(db, series.id)
+        for uid in destinatarios:
             db.add(Notification(
-                user_id=st_id, type=NotificationType.info,
-                title="🔄 Tu horario de clases cambió",
-                body=f"'{series.name}' ahora es: {dias_txt} a las {hora_txt}. Revisa tu calendario.",
+                user_id=uid, type=NotificationType.info,
+                title=titulo, body=cuerpo, link="/dashboard/student",
+            ))
+            await notify_user(db, uid, titulo, cuerpo,
+                              "/dashboard/student", f"serie:{series.id}")
+
+        # El profesor también necesita enterarse de que su clase se movió.
+        # Si hubo cambio de profesor, de eso ya avisó el flujo delegado.
+        if series.teacher_id and not profe_nuevo:
+            db.add(Notification(
+                user_id=series.teacher_id, type=NotificationType.info,
+                title=titulo, body=f"'{series.name}': {detalle}.",
+                link="/dashboard/teacher",
             ))
         await db.commit()
     except Exception:
+        # Un aviso que falla no debe deshacer un cambio ya guardado.
         pass
 
     return {
         "ok": True,
-        "regenerated_classes": created,
-        "kept_past_classes": past_count,
+        "modo": "regenerada" if cambia_recurrencia else "en_sitio",
+        "cambios": cambios_txt,
+        "updated_classes": actualizadas,
+        "regenerated_classes": regeneradas,
+        "kept_past_classes": pasadas,
+        "not_moved_classes": no_movidas,
+        # Se devuelve el estado EFECTIVO tras el cambio, derivado igual que
+        # lo hace el listado, para que el frontend refresque con el mismo
+        # criterio con el que precargó el editor.
+        "video_provider": prov_final,
+        "meeting_url": url_final,
+        "teacher_conflicts": (profe_resultado or {}).get("had_conflicts", 0),
     }
 
 
@@ -6125,31 +6494,32 @@ async def act_on_alert(
     return {"ok": True, "action": accion}
 
 
-# ============================================================================
-# V3.9.32 — CAMBIAR EL PROFESOR DE UNA SERIE (cuando uno no está disponible)
-# ============================================================================
-
-@router.post("/class-series/{series_id}/change-teacher")
-async def change_series_teacher(
-    series_id: str,
-    body: dict,
-    admin: Annotated[CurrentUser, Depends(require_admin)],
-    db: AsyncSession = Depends(get_db),
+async def _aplicar_cambio_profesor_serie(
+    db: AsyncSession,
+    series: ClassSeries,
+    nuevo_id: str,
+    actor_id: str,
+    desde: datetime | None = None,
+    confirm_overlap: bool = False,
+    commit: bool = False,
 ):
-    """Pasa las clases futuras de una serie a otro profesor.
+    """V3.9.62 — El cambio permanente de profesor de una serie, en un solo sitio.
 
-    ANTES había que editar clase por clase. Si un profesor se enfermaba una
-    semana, eran diez ediciones a mano.
+    Antes esta lógica vivía dentro del endpoint `change-teacher`. Al permitir
+    también cambiar el profesor desde "Editar serie" habrían quedado DOS
+    copias de la misma regla, y con el tiempo se habrían separado: una
+    avisando a quien toca y la otra no, una detectando choques y la otra no.
 
-    AVISA DE CHOQUES: si el profesor nuevo ya tiene clase a esa hora, lo dice
-    ANTES de hacer el cambio. Se puede confirmar igual (a veces hay razones),
-    pero a propósito, no por accidente.
+    Es la MISMA función para los dos caminos. Si mañana cambia la política de
+    sustituciones, cambia una vez.
+
+    No hace `commit` por defecto: quien la llama decide cuándo cerrar la
+    transacción, para que mover el horario y cambiar el profesor sean UN solo
+    cambio y no dos a medias.
     """
-    series = await db.get(ClassSeries, series_id)
-    if not series:
-        raise HTTPException(404, "Serie no encontrada")
+    from app.services.audience import destinatarios_de_serie
+    from app.services.push_service import notify_user
 
-    nuevo_id = (body.get("teacher_id") or "").strip()
     if not nuevo_id:
         raise HTTPException(400, "Indica el profesor nuevo")
     if nuevo_id == series.teacher_id:
@@ -6159,18 +6529,12 @@ async def change_series_teacher(
     if not nuevo or nuevo.role != UserRole.teacher:
         raise HTTPException(404, "Profesor no encontrado")
 
-    now = datetime.now(tz.utc)
-    desde = now
-    if body.get("from_date"):
-        try:
-            desde = datetime.fromisoformat(body["from_date"].replace("Z", "+00:00"))
-        except ValueError:
-            pass
+    corte = desde or datetime.now(tz.utc)
 
     futuras = (await db.execute(
         select(ClassSession).where(
-            ClassSession.series_id == series_id,
-            ClassSession.starts_at_utc >= desde,
+            ClassSession.series_id == series.id,
+            ClassSession.starts_at_utc >= corte,
             ClassSession.status != SessionStatus.cancelled,
         ).order_by(ClassSession.starts_at_utc)
     )).scalars().all()
@@ -6179,6 +6543,8 @@ async def change_series_teacher(
         raise HTTPException(400, "Esta serie no tiene clases futuras que cambiar")
 
     # ¿El profesor nuevo ya está ocupado en alguna de esas horas?
+    # Se avisa ANTES de tocar nada. Se puede confirmar igual (a veces hay
+    # razones), pero a propósito, no por accidente.
     choques = []
     for s in futuras:
         ini, fin = s.starts_at_utc, s.ends_at_utc
@@ -6201,7 +6567,7 @@ async def change_series_teacher(
                 "conflict_title": ocupado.title,
             })
 
-    if choques and not body.get("confirm_overlap"):
+    if choques and not confirm_overlap:
         raise HTTPException(409, {
             "necesita_confirmacion": True,
             "conflicts": choques[:5],
@@ -6212,13 +6578,13 @@ async def change_series_teacher(
         })
 
     anterior = await db.get(User, series.teacher_id) if series.teacher_id else None
+    anterior_id = series.teacher_id
     for s in futuras:
         s.teacher_id = nuevo_id
     series.teacher_id = nuevo_id
 
     # Avisar a los tres lados
     try:
-        from app.services.push_service import notify_user
         cuerpo = f"'{series.name}': ahora la imparte {nuevo.full_name}."
 
         db.add(Notification(
@@ -6229,7 +6595,7 @@ async def change_series_teacher(
         ))
         await notify_user(db, nuevo_id, "📅 Te asignaron una serie de clases",
                           f"'{series.name}' — {len(futuras)} clases.",
-                          "/dashboard/teacher", f"serie:{series_id}")
+                          "/dashboard/teacher", f"serie:{series.id}")
 
         if anterior:
             db.add(Notification(
@@ -6239,34 +6605,76 @@ async def change_series_teacher(
                 link="/dashboard/teacher",
             ))
 
-        estudiantes = (await db.execute(
-            select(Enrollment.student_id).where(
-                Enrollment.course_id == series.course_id,
-                Enrollment.level_id == series.level_id,
-                Enrollment.is_active.is_(True),
-            )
-        )).all()
-        for (uid,) in estudiantes:
+        # V3.9.62 — Solo el GRUPO real, vía el servicio central de audiencia.
+        # Antes se avisaba por course_id + level_id: B1 Noche recibía el
+        # cambio de profesor de B1 Mañana, que no era suyo.
+        for uid in await destinatarios_de_serie(db, series.id):
             db.add(Notification(
                 user_id=uid, type=NotificationType.info,
                 title="👨‍🏫 Cambio de profesor", body=cuerpo,
                 link="/dashboard/student",
             ))
             await notify_user(db, uid, "👨‍🏫 Cambio de profesor", cuerpo,
-                              "/dashboard/student", f"profe:{series_id}")
+                              "/dashboard/student", f"profe:{series.id}")
     except Exception:
         pass
 
-    await log_action(db, admin.user_id, "change_series_teacher", "sessions",
-                     target_id=series_id,
-                     details=f"{series.teacher_id} → {nuevo_id}, {len(futuras)} clases")
-    await db.commit()
+    await log_action(db, actor_id, "change_series_teacher", "sessions",
+                     target_id=series.id,
+                     details=f"{anterior_id} → {nuevo_id}, {len(futuras)} clases")
+    if commit:
+        await db.commit()
+
     return {
         "ok": True,
         "changed": len(futuras),
         "teacher": nuevo.full_name,
         "had_conflicts": len(choques),
     }
+
+
+# ============================================================================
+# V3.9.32 — CAMBIAR EL PROFESOR DE UNA SERIE (cuando uno no está disponible)
+# ============================================================================
+
+@router.post("/class-series/{series_id}/change-teacher")
+async def change_series_teacher(
+    series_id: str,
+    body: dict,
+    admin: Annotated[CurrentUser, Depends(require_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Pasa las clases futuras de una serie a otro profesor.
+
+    ANTES había que editar clase por clase. Si un profesor se enfermaba una
+    semana, eran diez ediciones a mano.
+
+    AVISA DE CHOQUES: si el profesor nuevo ya tiene clase a esa hora, lo dice
+    ANTES de hacer el cambio. Se puede confirmar igual (a veces hay razones),
+    pero a propósito, no por accidente.
+
+    V3.9.62: la lógica vive en `_aplicar_cambio_profesor_serie`, compartida
+    con "Editar serie". Este endpoint es la puerta HTTP, nada más.
+    """
+    series = await db.get(ClassSeries, series_id)
+    if not series:
+        raise HTTPException(404, "Serie no encontrada")
+
+    desde = None
+    if body.get("from_date"):
+        try:
+            desde = datetime.fromisoformat(body["from_date"].replace("Z", "+00:00"))
+        except ValueError:
+            desde = None
+
+    return await _aplicar_cambio_profesor_serie(
+        db, series,
+        nuevo_id=(body.get("teacher_id") or "").strip(),
+        actor_id=admin.user_id,
+        desde=desde,
+        confirm_overlap=bool(body.get("confirm_overlap")),
+        commit=True,
+    )
 
 
 @router.get("/teachers/{teacher_id}/availability")
