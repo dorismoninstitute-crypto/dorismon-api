@@ -39,6 +39,76 @@ async def _destinatarios_de_clase(db, s) -> set[str]:
     return await destinatarios_de_clase(db, s)
 
 
+def _tiene_entrada_online(s) -> bool:
+    """V3.9.67 — Delega en la regla central de modalidad.
+
+    presencial nunca ofrece videollamada, aunque conserve `meeting_url`.
+    """
+    from app.services.audience import tiene_entrada_online
+    return tiene_entrada_online(s)
+
+
+async def _validar_config_clase(db, *, modalidad, video_provider, meeting_url,
+                                branch_id, classroom_id):
+    """V3.9.69 — ¿Es coherente esta configuración de clase?
+
+    UNA sola regla para la serie y para la sesión suelta. Antes cada
+    formulario tenía la suya y no coincidían: el editor de serie exigía
+    `meeting_url` aunque la serie fuera PRESENCIAL, y el de clase suelta
+    exigía enlace en Híbrida aunque se usara Video Dorismon.
+
+    Se valida siempre la configuración EFECTIVA (la que quedará tras el
+    cambio), no la que venga en el cuerpo de la petición: cambiar solo la
+    sede de una serie presencial no puede fallar por un enlace que nadie
+    pidió.
+
+        presencial          -> sede obligatoria. Video NO se exige.
+        online + dorismon   -> el enlace es respaldo OPCIONAL.
+        online + externo    -> enlace https:// obligatorio.
+        hibrida             -> sede obligatoria + video válido.
+
+    El frontend muestra estos mismos errores antes de enviar, pero la fuente
+    de verdad es esta.
+    """
+    valor = getattr(modalidad, "value", modalidad) or "online"
+
+    if valor in ("presencial", "hibrida"):
+        if not branch_id:
+            raise HTTPException(
+                400, "Una clase presencial necesita sede: si no, el estudiante "
+                     "no sabe a dónde ir.")
+
+    if valor in ("online", "hibrida"):
+        if video_provider != "dorismon" and not meeting_url:
+            raise HTTPException(
+                400, "Con enlace externo hace falta el link de la reunión "
+                     "(Meet, Zoom, Teams u otro https://)")
+        if meeting_url and not str(meeting_url).lower().startswith("https://"):
+            raise HTTPException(400, "El enlace debe empezar con https://")
+
+    if branch_id is not None:
+        try:
+            branch_id = int(branch_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Sede inválida")
+        if not await db.get(Branch, branch_id):
+            raise HTTPException(404, "Esa sede no existe")
+
+    if classroom_id is not None:
+        try:
+            classroom_id = int(classroom_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Aula inválida")
+        _aula = await db.get(Classroom, classroom_id)
+        if not _aula:
+            raise HTTPException(404, "Esa aula no existe")
+        # Un aula de otra sede diría una cosa en la ficha y otra en la puerta.
+        if branch_id and _aula.branch_id and _aula.branch_id != branch_id:
+            raise HTTPException(400, "Esa aula no pertenece a la sede elegida")
+
+    return branch_id, classroom_id
+
+
 @router.get("/dashboard")
 async def admin_dashboard(
     admin: Annotated[CurrentUser, Depends(require_admin)],
@@ -748,52 +818,111 @@ async def create_session(
         raise HTTPException(400, "Formato de fecha inválido")
     if ends_at <= starts_at:
         raise HTTPException(400, "La hora de fin debe ser posterior a la hora de inicio")
+
+    # V3.9.70 — Crear y editar obedecen EXACTAMENTE la misma regla de
+    # modalidad/video/sede. Antes POST /sessions podía crear estados que el
+    # PATCH rechazaba después (p. ej. presencial sin sede o externo sin link).
+    try:
+        _mod = Modality(body["modality"])
+    except Exception:
+        raise HTTPException(400, "Modalidad inválida (online/presencial/hibrida)")
+    _vp = "dorismon" if body.get("video_provider") == "dorismon" else "meet"
+    _meeting = (body.get("meeting_url") or "").strip() or None
+    _branch, _classroom = await _validar_config_clase(
+        db, modalidad=_mod, video_provider=_vp, meeting_url=_meeting,
+        branch_id=body.get("branch_id") or None,
+        classroom_id=body.get("classroom_id") or None,
+    )
+
+    # ══ V3.9.65 — LA AUDIENCIA SE DEFINE ANTES DE AVISAR ══
+    #
+    # AQUÍ HABÍA UN BUG: se notificaba en bruto a TODO el nivel
+    # (`Enrollment.level_id == level_id`) y solo DESPUÉS se guardaba la
+    # audiencia explícita. Así que una clase creada para María y Pedro se
+    # anunciaba a todo A2, y María y Pedro recibían el aviso dos veces —
+    # porque `_avisar_clase_nueva` volvía a avisar, esta vez bien.
+    #
+    # El orden correcto es: primero se sabe a quién va, luego se avisa. El
+    # aviso lo hace `_avisar_clase_nueva`, que ya usa el servicio central de
+    # audiencia y respeta grupo, audiencia explícita y clase privada.
+    destinatarios = body.get("student_ids") or []
+
+    # ══ V3.9.67 — LA AUDIENCIA TIENE QUE SER COHERENTE ══
+    #
+    # Se valida ANTES de crear nada. Una sesión con audiencia contradictoria
+    # es peor que una sesión que no se creó: nadie sabe a quién pertenece.
+    _serie_pedida = (body.get("series_id") or "").strip() or None
+
+    if body.get("is_open_event"):
+        # Un evento abierto es, por definición, para quien se registre. Si
+        # además se guardara una audiencia explícita o un grupo, quedarían dos
+        # verdades contradictorias en la base.
+        if destinatarios or _serie_pedida:
+            raise HTTPException(
+                400, "Un evento abierto no lleva estudiantes ni grupo: "
+                     "se apunta quien quiera.")
+    elif destinatarios and _serie_pedida:
+        raise HTTPException(
+            400, "Elige una cosa: el grupo completo o estudiantes concretos.")
+
+    if _serie_pedida:
+        _serie = await db.get(ClassSeries, _serie_pedida)
+        if not _serie:
+            raise HTTPException(404, "El grupo indicado no existe")
+        if not _serie.is_active:
+            raise HTTPException(400, "Ese grupo ya no está activo")
+        # El curso y el nivel SÍ deben coincidir: si no, la clase diría A2 y
+        # la audiencia sería la de B1. El PROFESOR puede ser distinto — eso es
+        # una sustitución, que es legítima.
+        if _serie.course_id != body["course_id"] or _serie.level_id != body["level_id"]:
+            raise HTTPException(
+                400, "Ese grupo es de otro curso o nivel que la clase.")
+        _serie_pedida = _serie.id
+
+    if destinatarios and not _serie_pedida:
+        from app.models import Student
+
+        # Nunca se confía en los IDs que llegan del frontend. Se comprueba
+        # que cada uno sea un estudiante real antes de darle acceso a una
+        # clase. No se exige que tenga grupo ni Enrollment: el sentido de
+        # esta función es precisamente la clase para quien todavía no lo
+        # tiene (reposición, refuerzo, alumno nuevo sin asignar).
+        pedidos = list(dict.fromkeys(str(x) for x in destinatarios if x))[:60]
+        validos = set()
+        if pedidos:
+            validos = {
+                x for (x,) in (await db.execute(
+                    select(Student.user_id).where(Student.user_id.in_(pedidos))
+                )).all()
+            }
+        invalidos = [x for x in pedidos if x not in validos]
+        if invalidos:
+            raise HTTPException(
+                400, f"No son estudiantes válidos: {', '.join(invalidos[:5])}")
+
+        destinatarios = pedidos
+
+    # Solo después de validar configuración y audiencia se persiste la sesión.
+    # Así una petición inválida no deja una fila a medio construir en la
+    # transacción, y los IDs normalizados de sede/aula son los que se guardan.
     s = ClassSession(
         teacher_id=body["teacher_id"], course_id=body["course_id"], level_id=body["level_id"],
         title=body["title"], description=body.get("description"),
-        modality=Modality(body["modality"]),
-        starts_at_utc=starts_at,
-        ends_at_utc=ends_at,
-        meeting_url=body.get("meeting_url"),
-        branch_id=body.get("branch_id"), classroom_id=body.get("classroom_id"),
-        capacity=body.get("capacity", 15),
-        video_provider=("dorismon" if body.get("video_provider") == "dorismon" else "meet"),  # V3.9.26
-        module_id=body.get("module_id"),  # V1.5
-        is_open_event=body.get("is_open_event", False),
-        # V3.9.43 — Una clase suelta puede pertenecer a un grupo. Antes no se
-        # podía indicar, así que la clase quedaba sin dueño y NADIE la veía.
-        series_id=body.get("series_id") or None,
-        scheduled_teacher_id=body.get("teacher_id"),
+        modality=_mod, starts_at_utc=starts_at, ends_at_utc=ends_at,
+        meeting_url=_meeting, branch_id=_branch, classroom_id=_classroom,
+        capacity=body.get("capacity", 15), video_provider=_vp,
+        module_id=body.get("module_id"), is_open_event=body.get("is_open_event", False),
+        series_id=_serie_pedida, scheduled_teacher_id=body.get("teacher_id"),
     )
     db.add(s)
     await db.flush()
 
-    # Notificar a los estudiantes del nivel
-    students = (await db.execute(
-        select(Enrollment.student_id).where(
-            Enrollment.level_id == body["level_id"], Enrollment.is_active.is_(True),
-        )
-    )).scalars().all()
-    for sid in students:
-        db.add(Notification(
-            user_id=sid, type=NotificationType.class_scheduled,
-            title=f"Nueva clase: {s.title}",
-            body=f"Inicia: {s.starts_at_utc.strftime('%d/%m %H:%M')}",
-            link="/dashboard/student/calendar",
-        ))
-
-    await log_action(db, admin.user_id, "create_session", "admin", target_id=s.id)
-    await db.flush()
-
-    # V3.9.43 — Destinatarios explícitos de una clase suelta.
-    # Si se indica una lista de estudiantes, SOLO ellos la verán. Resuelve el
-    # caso de la clase que se creaba y no le aparecía a nadie.
-    destinatarios = body.get("student_ids") or []
     if destinatarios and not s.series_id and not s.student_id:
         from app.models import SessionAudience
-        for sid in destinatarios[:60]:
+        for sid in destinatarios:
             db.add(SessionAudience(session_id=s.id, student_id=sid))
 
+    await log_action(db, admin.user_id, "create_session", "admin", target_id=s.id)
     await db.commit()
     await _avisar_clase_nueva(db, s)  # V3.9.32
     return {"id": s.id, "audience": len(destinatarios) or None}
@@ -909,18 +1038,11 @@ async def cancel_session(
         starts_for_msg = s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)
         from zoneinfo import ZoneInfo as _ZIc
         when_local = starts_for_msg.astimezone(_ZIc("America/Santo_Domingo")).strftime("%d/%m/%Y %I:%M %p")
-        affected_ids = set()
-        if s.student_id:
-            affected_ids.add(s.student_id)
-        else:
-            enr_rows = (await db.execute(
-                select(Enrollment.student_id).where(
-                    Enrollment.course_id == s.course_id,
-                    Enrollment.level_id == s.level_id,
-                    Enrollment.is_active.is_(True),
-                )
-            )).all()
-            affected_ids.update(sid for (sid,) in enr_rows)
+        # V3.9.65 — La audiencia REAL, igual que al crear o editar. Antes se
+        # avisaba por course_id + level_id: cancelabas la clase de refuerzo de
+        # María y Pedro y se enteraba todo A2, incluida gente que no tenía
+        # ninguna clase ese día.
+        affected_ids = await _destinatarios_de_clase(db, s)
         for st_id in affected_ids:
             db.add(Notification(
                 user_id=st_id, type=NotificationType.info,
@@ -1876,10 +1998,48 @@ async def update_session(
     from datetime import timezone as tz
     s = await db.get(ClassSession, session_id)
     if not s: raise HTTPException(404)
+
+    # ══ V3.9.65 — HASTA DÓNDE LLEGA ESTE CAMBIO ══
+    #
+    # EL PROBLEMA REAL: Dirección quería que UN miércoles fuera presencial y
+    # terminaba con todos los miércoles futuros presenciales, porque el único
+    # camino visible era el editor de la SERIE, que por diseño aplica a todo.
+    #
+    # `ClassSession.modality` siempre fue por sesión: la excepción puntual ya
+    # era posible, solo faltaba poder PEDIRLA. Eso es lo que añade `apply_to`.
+    #
+    #   "this"                -> solo esta clase (comportamiento de siempre)
+    #   "this_and_following"  -> esta y las futuras de su misma serie
+    #   "all"                 -> NO se atiende aquí a propósito (ver abajo)
+    #
+    # "all" vive en PATCH /admin/class-series/{id}/reschedule, que ya existe,
+    # ya conserva el historial y ya tiene 66 tests. Duplicar esa lógica aquí
+    # sería crear una segunda verdad que con el tiempo se desviaría.
+    apply_to = (body.pop("apply_to", None) or "this").strip()
+    if apply_to == "all":
+        raise HTTPException(400, {
+            "usar_endpoint_de_serie": True,
+            "mensaje": "Para cambiar toda la serie usa "
+                       "PATCH /admin/class-series/{series_id}/reschedule.",
+        })
+    if apply_to not in ("this", "this_and_following"):
+        raise HTTPException(400, "apply_to debe ser 'this' o 'this_and_following'")
+    if apply_to == "this_and_following" and not s.series_id:
+        raise HTTPException(400, "Esta clase no pertenece a una serie recurrente")
+
     # ¿Es pasada? Si sí, solo permite editar título/descripción
     starts = s.starts_at_utc
     if starts.tzinfo is None:
         starts = starts.replace(tzinfo=tz.utc)
+
+    # ⚠️ V3.9.67 — La frontera de "las siguientes" se fija con la hora
+    # ORIGINAL, ANTES de tocar nada.
+    #
+    # Si el admin además mueve la clase, el conjunto de "siguientes" debe
+    # seguir siendo el que él veía al decidir. Calcularlo con la hora NUEVA
+    # cambiaba el grupo afectado bajo sus pies: adelantar la clase metía en el
+    # lote a sesiones anteriores, y atrasarla dejaba fuera a las que sí quería.
+    inicio_original = starts
     is_past = starts <= datetime.now(tz.utc)
     allowed_past = {"title", "description", "recording_url", "teacher_notes"}
     # V3.9.21: guardar valores previos para detectar cambios que importan al estudiante
@@ -1902,6 +2062,89 @@ async def update_session(
         elif hasattr(s, field):
             setattr(s, field, value)
 
+    # ══ V3.9.69 — VALIDAR LA CONFIGURACIÓN EFECTIVA DE LA SESIÓN ══
+    #
+    # El frontend ya avisa, pero la fuente de verdad es esta: nadie debe poder
+    # dejar una clase online sin forma de entrar, ni una presencial sin sede,
+    # mandando el JSON a mano.
+    #
+    # Se valida el ESTADO RESULTANTE (`s` ya tiene aplicados los cambios),
+    # no el cuerpo de la petición: cambiar solo el título de una clase bien
+    # configurada no puede fallar.
+    if not is_past and any(
+        k in body for k in ("modality", "video_provider", "meeting_url",
+                            "branch_id", "classroom_id")
+    ):
+        # Si cambia la sede sin escoger aula, el aula anterior deja de ser una
+        # decisión válida. Se limpia ANTES de validar el estado efectivo; de
+        # otro modo el validador rechazaría precisamente el cambio que intenta
+        # corregir una combinación sede/aula antigua.
+        if "branch_id" in body and "classroom_id" not in body and s.classroom_id:
+            try:
+                _a = await db.get(Classroom, int(s.classroom_id))
+            except (TypeError, ValueError):
+                _a = None
+            try:
+                _sede_id = int(s.branch_id) if s.branch_id is not None else None
+            except (TypeError, ValueError):
+                _sede_id = None
+            if not _a or (_a.branch_id and _a.branch_id != _sede_id):
+                s.classroom_id = None
+                # También se propaga la limpieza si el alcance es "esta y las
+                # siguientes": ninguna futura debe conservar el aula vieja.
+                body["classroom_id"] = None
+
+        _b, _c = await _validar_config_clase(
+            db, modalidad=s.modality,
+            video_provider=getattr(s, "video_provider", "meet") or "meet",
+            meeting_url=s.meeting_url,
+            branch_id=s.branch_id, classroom_id=s.classroom_id)
+        # Persistir los valores normalizados, no los strings crudos del JSON.
+        if "branch_id" in body:
+            s.branch_id = _b
+            body["branch_id"] = _b
+        if "classroom_id" in body:
+            s.classroom_id = _c
+            body["classroom_id"] = _c
+
+    # ── V3.9.65 — Propagar a las SIGUIENTES, si se pidió ────────────────
+    #
+    # Solo campos de logística: cómo y dónde se da la clase. NO se propagan
+    # fecha/hora (una hora concreta no tiene sentido en otra fecha), ni el
+    # título (cada clase tiene su número), ni el profesor: el cambio
+    # permanente de profesor tiene su propio flujo con detección de choques
+    # e histórico, y repetirlo aquí sería duplicarlo.
+    PROPAGABLES = ("modality", "meeting_url", "video_provider",
+                   "branch_id", "classroom_id", "capacity")
+    siguientes_tocadas = 0
+    if apply_to == "this_and_following" and not is_past:
+        pedidos = {f: v for f, v in body.items() if f in PROPAGABLES}
+        if pedidos:
+            # La frontera es la hora ORIGINAL, capturada antes de editar.
+            inicio_ref = inicio_original
+            ahora_ref = datetime.now(tz.utc)
+            # Desde ESTA sesión hacia adelante. El `> ahora` es la red de
+            # seguridad: aunque esta sesión estuviera en el pasado, jamás se
+            # reescribe una clase ya ocurrida.
+            posteriores = (await db.execute(
+                select(ClassSession).where(
+                    ClassSession.series_id == s.series_id,
+                    ClassSession.id != s.id,
+                    ClassSession.starts_at_utc > inicio_ref,
+                    ClassSession.starts_at_utc > ahora_ref,
+                    ClassSession.status != SessionStatus.cancelled,
+                )
+            )).scalars().all()
+            for otra in posteriores:
+                for field, value in pedidos.items():
+                    if field == "modality":
+                        otra.modality = Modality(value)
+                    elif field == "video_provider":
+                        otra.video_provider = "dorismon" if value == "dorismon" else "meet"
+                    else:
+                        setattr(otra, field, value)
+                siguientes_tocadas += 1
+
     # V3.9.21: si cambió hora/profesor/modalidad/link de una clase FUTURA,
     # avisar a los estudiantes afectados (antes editabas y nadie se enteraba)
     if not is_past:
@@ -1919,30 +2162,42 @@ async def update_session(
             cambios.append("nuevo link de clase")
         if cambios:
             try:
-                affected = set()
-                if s.student_id:
-                    affected.add(s.student_id)
+                # V3.9.65 — La audiencia REAL de la clase, vía el servicio
+                # central. Antes se avisaba a todo el que compartiera
+                # course_id + level_id: cambiabas una clase de B1 Mañana y le
+                # llegaba a B1 Noche, y una clase creada para María y Pedro
+                # se anunciaba a todo A2.
+                affected = await _destinatarios_de_clase(db, s)
+
+                # Se dice EXPLÍCITAMENTE hasta dónde llega el cambio, para
+                # que nadie suponga que su horario habitual cambió cuando
+                # fue una excepción de un solo día.
+                if siguientes_tocadas > 0:
+                    alcance = (" Este cambio aplica a esta clase y a las "
+                               f"{siguientes_tocadas} siguientes.")
+                elif s.series_id:
+                    alcance = (" Este cambio aplica únicamente a esta clase. "
+                               "Las demás mantienen su programación habitual.")
                 else:
-                    rows = (await db.execute(
-                        select(Enrollment.student_id).where(
-                            Enrollment.course_id == s.course_id,
-                            Enrollment.level_id == s.level_id,
-                            Enrollment.is_active.is_(True),
-                        )
-                    )).all()
-                    affected.update(x for (x,) in rows)
+                    alcance = ""
+
                 for st_id in affected:
                     db.add(Notification(
                         user_id=st_id, type=NotificationType.info,
                         title="🔄 Tu clase cambió",
-                        body=f"'{s.title}': " + " · ".join(cambios) + ".",
+                        body=f"'{s.title}': " + " · ".join(cambios) + "." + alcance,
                     ))
             except Exception:
                 pass
 
-    await log_action(db, admin.user_id, "update_session", "class_sessions", session_id)
+    await log_action(db, admin.user_id, "update_session", "class_sessions", session_id,
+                     details=f"apply_to={apply_to}, siguientes={siguientes_tocadas}")
     await db.commit()
-    return {"ok": True, "is_past": is_past}
+    return {
+        "ok": True, "is_past": is_past,
+        "apply_to": apply_to,
+        "following_updated": siguientes_tocadas,
+    }
 
 
 # --- Enrollments PATCH (cambiar teacher, plan, level del estudiante) ---
@@ -3209,6 +3464,17 @@ async def create_class_series(
     except Exception:
         raise HTTPException(400, "Modalidad inválida (online/onsite/hybrid)")
 
+    # V3.9.70 — Una serie crea sesiones REALES inmediatamente: no es un
+    # borrador. Por eso la creación usa la misma validación completa que el
+    # editor. Dorismon puede ir sin fallback; un proveedor externo no.
+    _vp_nuevo = "dorismon" if body.get("video_provider") == "dorismon" else "meet"
+    _meeting_nuevo = (body.get("meeting_url") or "").strip() or None
+    _b_nuevo, _c_nuevo = await _validar_config_clase(
+        db, modalidad=modality, video_provider=_vp_nuevo,
+        meeting_url=_meeting_nuevo,
+        branch_id=body.get("branch_id") or None,
+        classroom_id=body.get("classroom_id") or None)
+
     # Crear la serie
     series = ClassSeries(
         name=body["name"],
@@ -3226,9 +3492,9 @@ async def create_class_series(
         # El enlace general del grupo. El PROVEEDOR no se guarda aquí: viaja
         # a cada ClassSession (`video_provider=_vp` más abajo) y se deriva de
         # ellas cuando hace falta. Una sola fuente de verdad.
-        meeting_url=body.get("meeting_url"),
-        branch_id=body.get("branch_id"),
-        classroom_id=body.get("classroom_id"),
+        meeting_url=_meeting_nuevo,
+        branch_id=_b_nuevo,
+        classroom_id=_c_nuevo,
         module_rotation=body.get("module_rotation"),
         capacity=body.get("capacity", 15),
     )
@@ -3275,9 +3541,9 @@ async def create_class_series(
             modality=modality,
             starts_at_utc=starts_at,
             ends_at_utc=ends_at,
-            meeting_url=body.get("meeting_url"),
-            branch_id=body.get("branch_id"),
-            classroom_id=body.get("classroom_id"),
+            meeting_url=_meeting_nuevo,
+            branch_id=_b_nuevo,
+            classroom_id=_c_nuevo,
             capacity=body.get("capacity", 15),
             module_id=mod_id,
             series_id=series.id,
@@ -3357,6 +3623,10 @@ async def list_class_series(
             # duplicado en la serie que podría haberse quedado atrás.
             "meeting_url": _video["meeting_url"] or s.meeting_url,
             "video_provider": _video["video_provider"],
+            # V3.9.69 — El editor de serie necesita precargar la sede y el
+            # aula reales. Sin esto, abrir el modal y guardar las borraba.
+            "branch_id": s.branch_id,
+            "classroom_id": s.classroom_id,
             "is_active": s.is_active,
             "total_classes": total,
             "future_classes": future,
@@ -3563,12 +3833,26 @@ async def reschedule_class_series(
     cambia_proveedor = prov_nuevo is not None and prov_nuevo != prov_actual
     cambia_url = url_enviada and url_final != url_actual
 
-    # Un enlace externo SIN enlace no es una clase, es un callejón sin
-    # salida. Con Video Dorismon el enlace es opcional (es el respaldo).
-    if prov_final == "meet" and not url_final:
-        raise HTTPException(
-            400, "Con enlace externo hace falta el link de la reunión "
-                 "(Meet, Zoom, Teams u otro https://)")
+    # ⚠️ V3.9.69 — La validación se hace sobre la MODALIDAD EFECTIVA.
+    #
+    # Antes esto exigía `meeting_url` siempre que el proveedor fuera externo,
+    # sin mirar la modalidad. Consecuencia: una serie PRESENCIAL sin enlace
+    # —que es lo normal— no se podía editar ni para cambiarle el aula: saltaba
+    # "hace falta el link de la reunión" por un video que esa serie no usa.
+    #
+    # La comprobación completa se hace más abajo, cuando ya se conocen la sede
+    # y el aula finales.
+
+    # ── V3.9.68 — Sede y aula de la serie ───────────────────────────────
+    #
+    # `ClassSeries` ya tenía `branch_id` y `classroom_id` (cero migraciones),
+    # pero el editor no los aceptaba. Consecuencia: hacías una serie
+    # presencial y todas sus clases quedaban en "Ubicación por confirmar",
+    # sin forma de arreglarlo desde el editor.
+    # V3.9.69 — Se leen aquí; la validación la hace `_validar_config_clase`
+    # más abajo, con la configuración efectiva completa.
+    sede_nueva = (body.get("branch_id") or None) if "branch_id" in body else None
+    aula_nueva = (body.get("classroom_id") or None) if "classroom_id" in body else None
 
     # Profesor (se delega al flujo existente más abajo)
     profe_nuevo = (body.get("teacher_id") or "").strip() or None
@@ -3620,7 +3904,20 @@ async def reschedule_class_series(
         series.duration_min = dur_nueva
         cambios_txt.append(f"duración: {dur_nueva} min")
 
-    cambia_modalidad = mod_nueva is not None and mod_nueva != series.modality
+    # V3.9.65 — "Toda la serie" tiene que poder REALINEAR.
+    #
+    # Antes esto solo comparaba con `series.modality`. Problema: desde v3.9.65
+    # una sesión suelta puede ser una excepción (un miércoles presencial en
+    # una serie virtual). Si luego Dirección elegía "Toda la serie → Virtual",
+    # la serie YA figuraba virtual, así que no se detectaba cambio alguno y se
+    # respondía "no enviaste ningún cambio" — dejando las excepciones puestas.
+    #
+    # Ahora también cuenta como cambio que alguna sesión FUTURA no coincida
+    # con la modalidad pedida. "Toda la serie" significa toda la serie.
+    cambia_modalidad = mod_nueva is not None and (
+        mod_nueva != series.modality
+        or any(s.modality != mod_nueva for s in futuras)
+    )
     if cambia_modalidad:
         series.modality = mod_nueva
         cambios_txt.append(f"modalidad: {mod_nueva.value}")
@@ -3636,6 +3933,39 @@ async def reschedule_class_series(
             else "video: enlace externo")
     elif cambia_url:
         cambios_txt.append("nuevo enlace de la clase")
+
+    # V3.9.69 — Validación de la configuración EFECTIVA de la serie: lo que
+    # quedará tras el cambio, mezclando lo pedido con lo que ya tenía.
+    _mod_final = mod_nueva if mod_nueva is not None else series.modality
+    _sede_final = sede_nueva if "branch_id" in body else series.branch_id
+    _aula_final = aula_nueva if "classroom_id" in body else series.classroom_id
+    # Si se cambia de sede sin elegir aula, no se arrastra el aula vieja: sería
+    # un aula de otra sede.
+    if "branch_id" in body and "classroom_id" not in body and sede_nueva != series.branch_id:
+        _aula_final = None
+        aula_nueva = None
+        body["classroom_id"] = None
+    _sede_final, _aula_final = await _validar_config_clase(
+        db, modalidad=_mod_final, video_provider=prov_final,
+        meeting_url=url_final, branch_id=_sede_final, classroom_id=_aula_final)
+    # Persistir SIEMPRE los IDs ya normalizados por la validación central.
+    if "branch_id" in body:
+        sede_nueva = _sede_final
+    if "classroom_id" in body:
+        aula_nueva = _aula_final
+
+    cambia_sede = "branch_id" in body and sede_nueva != series.branch_id
+    cambia_aula = "classroom_id" in body and aula_nueva != series.classroom_id
+    if cambia_sede:
+        series.branch_id = sede_nueva
+    if cambia_aula:
+        series.classroom_id = aula_nueva
+    if cambia_sede or cambia_aula:
+        _b = await db.get(Branch, series.branch_id) if series.branch_id else None
+        _c = await db.get(Classroom, series.classroom_id) if series.classroom_id else None
+        _txt = " / ".join(x for x in [_b.name if _b else None,
+                                      _c.name if _c else None] if x)
+        cambios_txt.append(f"lugar: {_txt}" if _txt else "sin sede asignada")
 
     # ── 4. LAS CLASES FUTURAS ───────────────────────────────────────────
     actualizadas = 0
@@ -3662,6 +3992,14 @@ async def reschedule_class_series(
 
             if cambia_modalidad:
                 s.modality = mod_nueva
+                tocada = True
+
+            # V3.9.68 — Sede y aula, solo si se pidieron cambiar.
+            if cambia_sede:
+                s.branch_id = sede_nueva
+                tocada = True
+            if cambia_aula:
+                s.classroom_id = aula_nueva
                 tocada = True
 
             if cambia_hora or cambia_duracion:
@@ -3709,8 +4047,8 @@ async def reschedule_class_series(
             "teacher_id": s.teacher_id,
             "counts_for_progress": s.counts_for_progress,
             "capacity": s.capacity,
-            "branch_id": s.branch_id,
-            "classroom_id": s.classroom_id,
+            "branch_id": sede_nueva if cambia_sede else s.branch_id,
+            "classroom_id": aula_nueva if cambia_aula else s.classroom_id,
             # Se conserva el proveedor DE CADA CLASE salvo que se haya
             # pedido cambiarlo explícitamente. Igual con el enlace.
             "video_provider": prov_final if cambia_proveedor else (
@@ -5380,7 +5718,12 @@ async def send_class_reminders(
                         class_title=s.title,
                         when_local=when_local,
                         teacher_name=teacher_name,
-                        meeting_url=s.meeting_url,
+                        # V3.9.67 — La modalidad manda. Una clase presencial
+                        # conserva su meeting_url por dentro, pero el correo
+                        # NO debe traer el botón "Entrar a la clase": la app
+                        # decía "Presencial" y el correo del día anterior
+                        # mandaba a la videollamada.
+                        meeting_url=(s.meeting_url if _tiene_entrada_online(s) else None),
                         classroom_info=classroom_info,
                     )
                     if sent:

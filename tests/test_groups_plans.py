@@ -45,7 +45,7 @@ async def main():
             "name": "Test Grupo Mañana", "course_id": cid, "level_id": lvl["id"],
             "teacher_id": profe["id"], "days_of_week": "mon,wed",
             "start_time_hhmm": "08:00", "duration_min": 60, "start_date": hoy,
-            "num_classes": 4, "modality": "online", "capacity": 6,
+            "num_classes": 4, "modality": "online", "video_provider": "dorismon", "capacity": 6,
         })
         g = await c.get("/admin/groups", headers=AH)
         check("El panel de grupos responde", g.status_code == 200)
@@ -76,7 +76,7 @@ async def main():
                     "name": "Test Otro Nivel", "course_id": cid, "level_id": otro[0]["id"],
                     "teacher_id": profe["id"], "days_of_week": "tue",
                     "start_time_hhmm": "10:00", "duration_min": 60,
-                    "start_date": hoy, "num_classes": 2, "modality": "online",
+                    "start_date": hoy, "num_classes": 2, "modality": "online", "video_provider": "dorismon",
                 })
                 g2 = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
                 on = [x for x in g2 if x["name"] == "Test Otro Nivel"]
@@ -149,14 +149,14 @@ async def main():
                 "name": "Test Mi Grupo", "course_id": cid, "level_id": lvl["id"],
                 "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri",
                 "start_time_hhmm": "09:00", "duration_min": 60,
-                "start_date": hoy, "num_classes": 8, "modality": "online",
+                "start_date": hoy, "num_classes": 8, "modality": "online", "video_provider": "dorismon",
             })
             # Clase de OTRO estudiante con OTRO profesor, MISMO nivel
             await c.post("/admin/class-series", headers=AH, json={
                 "name": "Test Clase Ajena", "course_id": cid, "level_id": lvl["id"],
                 "teacher_id": otros[0]["id"], "days_of_week": "mon,tue,wed,thu,fri",
                 "start_time_hhmm": "08:00", "duration_min": 60,
-                "start_date": hoy, "num_classes": 8, "modality": "online",
+                "start_date": hoy, "num_classes": 8, "modality": "online", "video_provider": "dorismon",
             })
             prog = (await c.get("/progress/my-course", headers=SH)).json()
             ns = prog.get("next_session") or {}

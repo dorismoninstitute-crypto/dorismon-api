@@ -45,14 +45,14 @@ async def main():
             "title": "Test con lista",
             "starts_at_utc": (now - datetime.timedelta(days=1)).isoformat(),
             "ends_at_utc": (now - datetime.timedelta(days=1, hours=-1)).isoformat(),
-            "modality": "online", "teacher_id": profe["id"],
+            "modality": "online", "video_provider": "dorismon", "teacher_id": profe["id"],
             "course_id": cid, "level_id": lvl["id"],
         })).json()["id"]
         await c.post("/admin/sessions", headers=AH, json={
             "title": "Test sin lista",
             "starts_at_utc": (now - datetime.timedelta(days=2)).isoformat(),
             "ends_at_utc": (now - datetime.timedelta(days=2, hours=-1)).isoformat(),
-            "modality": "online", "teacher_id": profe["id"],
+            "modality": "online", "video_provider": "dorismon", "teacher_id": profe["id"],
             "course_id": cid, "level_id": lvl["id"],
         })
 

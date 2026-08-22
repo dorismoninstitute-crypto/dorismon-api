@@ -61,6 +61,27 @@ async def contexto_academico(db: AsyncSession, student_id: str) -> dict:
         "teacher_ids": [e.teacher_id for e in filas if getattr(e, "teacher_id", None)],
         # Si no está en ningún grupo, ve el contenido "suelto" de su nivel
         "sin_grupo": not any(getattr(e, "series_id", None) for e in filas),
+        # ══ V3.9.69 — LA COMBINACIÓN, NO LAS LISTAS SUELTAS ══
+        #
+        # Las listas de arriba se comparaban por separado, y eso abría un
+        # hueco real en cuanto un alumno tenía DOS matrículas:
+        #
+        #   Enrollment 1: A2 con Luis
+        #   Enrollment 2: B1 con Ana
+        #   -> level_ids = [A2, B1] ; teacher_ids = [Luis, Ana]
+        #
+        # Una clase suelta de B1 con LUIS pasaba el filtro: B1 está en sus
+        # niveles y Luis está en sus profesores. Pero él nunca ha tenido a
+        # Luis en B1 — esa combinación no existe en ninguna matrícula suya.
+        #
+        # `combos` guarda las ternas REALES (curso, nivel, profesor). Una
+        # clase suelta solo es suya si UNA matrícula las satisface las tres a
+        # la vez.
+        "combos": [
+            (e.course_id, e.level_id, getattr(e, "teacher_id", None))
+            for e in filas
+            if e.course_id and e.level_id and getattr(e, "teacher_id", None)
+        ],
         # V3.9.51 — necesario para resolver la audiencia explícita en SQL
         "_student_id": student_id,
     }
@@ -113,9 +134,12 @@ async def puede_acceder_a_clase(db: AsyncSession, student_id: str, sesion) -> bo
     if destinatarios is not None:
         return student_id in destinatarios
 
-    # 5. Clase suelta sin destinatarios: del profesor, en el nivel del alumno
-    if sesion.teacher_id and sesion.teacher_id in ctx["teacher_ids"]:
-        return sesion.level_id in ctx["level_ids"]
+    # 5. Clase suelta sin destinatarios: tiene que coincidir la TERNA
+    #    completa (curso + nivel + profesor) con UNA matrícula suya.
+    #    V3.9.69 — Antes se comparaban profesor y nivel por separado, así que
+    #    con dos matrículas se colaban combinaciones que él nunca tuvo.
+    if sesion.teacher_id:
+        return (sesion.course_id, sesion.level_id, sesion.teacher_id) in ctx["combos"]
 
     return False
 
@@ -261,7 +285,12 @@ async def destinatarios_de_clase(db: AsyncSession, sesion) -> set[str]:
     if explicitos is not None:
         return explicitos
 
-    # Clase suelta: los del nivel que tienen a ese profesor
+    # Clase suelta: los del nivel que tienen a ese profesor.
+    # V3.9.69 — La terna COMPLETA, para que quien la recibe sea exactamente
+    # quien puede verla y entrar. Si `destinatarios_de_clase` y
+    # `puede_acceder_a_clase` usaran reglas distintas, el roster y el acceso
+    # se contradirían: gente en la lista del profesor sin poder entrar, o al
+    # revés.
     condiciones = [
         Enrollment.course_id == sesion.course_id,
         Enrollment.level_id == sesion.level_id,
@@ -269,8 +298,45 @@ async def destinatarios_de_clase(db: AsyncSession, sesion) -> set[str]:
     ]
     if sesion.teacher_id:
         condiciones.append(Enrollment.teacher_id == sesion.teacher_id)
+    else:
+        # Sin profesor no hay terna posible: nadie la recibe por esta vía.
+        return set()
     filas = (await db.execute(select(Enrollment.student_id).where(*condiciones))).all()
     return {x for (x,) in filas}
+
+
+def tiene_entrada_online(sesion) -> bool:
+    """¿Esta clase ofrece entrada por videollamada?
+
+    ⚠️ V3.9.67 — REGLA ÚNICA PARA TODO EL BACKEND.
+
+    Desde v3.9.65 una sesión suelta puede ser una EXCEPCIÓN presencial dentro
+    de una serie virtual, y CONSERVA a propósito su `meeting_url` y su
+    `video_provider` heredados: si mañana vuelve a virtual, la videollamada
+    regresa sola.
+
+    El riesgo de conservarlos es que alguien los use igualmente, y pasó: se
+    corrigieron las tres pantallas, pero el enlace seguía saliendo por otros
+    caminos —el correo de recordatorio de 24h, el .ics, el link de Google
+    Calendar y la propia sala de video—. La pantalla decía "Presencial" y el
+    correo del día anterior decía "Entrar a la clase".
+
+    Esta función existe para que la regla viva en UN solo sitio:
+
+        presencial -> NUNCA entrada online. Se va al aula.
+        online     -> entrada online.
+        hibrida    -> entrada online, además de la sede.
+
+    Tener `meeting_url` NO basta. La modalidad manda.
+    """
+    if sesion is None:
+        return False
+    modalidad = getattr(sesion, "modality", None)
+    valor = getattr(modalidad, "value", modalidad)
+    if valor == "presencial":
+        return False
+    return bool(getattr(sesion, "meeting_url", None)) or \
+        getattr(sesion, "video_provider", None) == "dorismon"
 
 
 async def destinatarios_de_serie(db: AsyncSession, series_id: str) -> set[str]:
@@ -442,20 +508,29 @@ def filtro_clases_del_estudiante(ctx: dict, ClassSession, student_id: str):
     except ImportError:
         pass
 
-    # Clases sueltas de su profesor, en su nivel
-    if ctx["teacher_ids"] and ctx["level_ids"]:
+    # Clases sueltas de su profesor, en su nivel — por TERNA COMPLETA.
+    # V3.9.69: antes esto cruzaba `teacher_ids` con `level_ids` por separado.
+    if ctx.get("combos"):
         try:
             from app.models import SessionAudience
             _con_audiencia = select(SessionAudience.session_id)
         except ImportError:
             _con_audiencia = None
 
+        # Una rama OR por cada matrícula real: (curso Y nivel Y profesor).
+        _ternas = or_(*[
+            and_(
+                ClassSession.course_id == _c,
+                ClassSession.level_id == _l,
+                ClassSession.teacher_id == _t,
+            )
+            for (_c, _l, _t) in ctx["combos"]
+        ])
         cond = [
             ClassSession.series_id.is_(None),
             ClassSession.student_id.is_(None),
             ClassSession.is_open_event.is_(False),
-            ClassSession.teacher_id.in_(ctx["teacher_ids"]),
-            ClassSession.level_id.in_(ctx["level_ids"]),
+            _ternas,
         ]
         # Si la clase tiene destinatarios definidos, ya entró por la rama de
         # arriba: aquí solo van las abiertas a todo el grupo del profesor.

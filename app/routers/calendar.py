@@ -25,6 +25,42 @@ def _ics_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
 
 
+
+async def _autorizar_sesion(db: AsyncSession, user: CurrentUser, s):
+    """¿Puede ESTE usuario ver los datos de ESTA clase?
+
+    ⚠️ V3.9.67 — HUECO CERRADO. Antes estos endpoints solo comprobaban que
+    hubiera sesión iniciada. Cualquier usuario logueado que consiguiera un
+    `session_id` podía pedir el .ics o el link de Google Calendar y recibir
+    los detalles de una clase ajena, INCLUIDO el `meeting_url`.
+
+    Con las clases de audiencia explícita eso contradecía la regla básica:
+    María seleccionada sí, Pedro no seleccionado no. Da igual que el
+    calendario "solo" genere un archivo: es el mismo dato.
+    """
+    if user.role == "super_admin":
+        return
+    if s.teacher_id == user.user_id:
+        return
+    if user.role == "student":
+        from app.services.audience import puede_acceder_a_clase
+        if await puede_acceder_a_clase(db, user.user_id, s):
+            return
+    raise HTTPException(403, "Esta clase no es tuya.")
+
+
+def _link_visible(s) -> str | None:
+    """El enlace SOLO si la modalidad lo permite.
+
+    V3.9.67 — Una clase presencial conserva su `meeting_url` (para volver a
+    virtual sin perder nada), pero no debe ofrecerlo. Antes el .ics y el link
+    de Google Calendar lo incluían igualmente, así que la app decía
+    "Presencial" y el calendario del estudiante traía la videollamada.
+    """
+    from app.services.audience import tiene_entrada_online
+    return s.meeting_url if (tiene_entrada_online(s) and s.meeting_url) else None
+
+
 @router.get("/session/{session_id}.ics")
 async def session_ics(
     session_id: str,
@@ -34,6 +70,8 @@ async def session_ics(
     """Genera archivo .ics descargable para una clase."""
     s = await db.get(ClassSession, session_id)
     if not s: raise HTTPException(404)
+    await _autorizar_sesion(db, user, s)
+    _link = _link_visible(s)
 
     teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
     teacher_name = teacher_user.full_name if teacher_user else "Profesor"
@@ -43,15 +81,15 @@ async def session_ics(
         b = await db.get(Branch, s.branch_id)
         cr = await db.get(Classroom, s.classroom_id) if s.classroom_id else None
         location = f"{b.name if b else ''} - {cr.name if cr else ''}".strip(" -")
-    elif s.meeting_url:
-        location = s.meeting_url
+    elif _link:
+        location = _link
 
     description_parts = []
     if s.description: description_parts.append(s.description)
     description_parts.append(f"Profesor: {teacher_name}")
     description_parts.append(f"Modalidad: {s.modality.value}")
-    if s.meeting_url:
-        description_parts.append(f"Link de la clase: {s.meeting_url}")
+    if _link:
+        description_parts.append(f"Link de la clase: {_link}")
     description = "\\n".join(description_parts)
 
     ics = f"""BEGIN:VCALENDAR
@@ -96,6 +134,8 @@ async def google_calendar_link(
     from urllib.parse import urlencode
     s = await db.get(ClassSession, session_id)
     if not s: raise HTTPException(404)
+    await _autorizar_sesion(db, user, s)
+    _link = _link_visible(s)
 
     teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
     teacher_name = teacher_user.full_name if teacher_user else "Profesor"
@@ -103,16 +143,16 @@ async def google_calendar_link(
     details = []
     if s.description: details.append(s.description)
     details.append(f"Profesor: {teacher_name}")
-    if s.meeting_url:
-        details.append(f"Link: {s.meeting_url}")
+    if _link:
+        details.append(f"Link: {_link}")
 
     location = ""
     if s.branch_id:
         b = await db.get(Branch, s.branch_id)
         cr = await db.get(Classroom, s.classroom_id) if s.classroom_id else None
         location = f"{b.name if b else ''} - {cr.name if cr else ''}".strip(" -")
-    elif s.meeting_url:
-        location = s.meeting_url
+    elif _link:
+        location = _link
 
     params = {
         "action": "TEMPLATE",

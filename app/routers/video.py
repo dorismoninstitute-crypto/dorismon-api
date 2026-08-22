@@ -49,17 +49,34 @@ async def join_class_video(
     VENTANA DE TIEMPO: se puede entrar desde 15 minutos antes y hasta 20
     minutos después de terminar. Fuera de eso, no.
     """
-    if not livekit_ready():
-        raise HTTPException(
-            503,
-            "El video de Dorismon no está configurado todavía. Usa el enlace de la clase.",
-        )
-
     s = await db.get(ClassSession, session_id)
     if not s:
         raise HTTPException(404, "Clase no encontrada")
     if s.status == SessionStatus.cancelled:
         raise HTTPException(400, "Esta clase fue cancelada")
+
+    # ⚠️ V3.9.67 — LA MODALIDAD SE MIRA ANTES QUE LIVEKIT, A PROPÓSITO.
+    #
+    # Una clase PRESENCIAL no tiene sala de video, ni siquiera para el
+    # profesor, y eso es cierto esté LiveKit configurado o no. Si se
+    # comprobara después, la respuesta sería "el video no está configurado",
+    # que es un motivo equivocado: sugiere que con LiveKit activo sí se
+    # podría entrar.
+    #
+    # La sesión conserva su `meeting_url` heredado por si vuelve a ser
+    # virtual, pero mientras sea presencial la clase ocurre en el aula.
+    from app.services.audience import tiene_entrada_online
+    if not tiene_entrada_online(s):
+        raise HTTPException(
+            400,
+            "Esta clase es presencial. Nos vemos en el aula.",
+        )
+
+    if not livekit_ready():
+        raise HTTPException(
+            503,
+            "El video de Dorismon no está configurado todavía. Usa el enlace de la clase.",
+        )
 
     me = await db.get(User, user.user_id)
     if not me:

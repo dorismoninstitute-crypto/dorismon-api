@@ -124,31 +124,38 @@ async def student_dashboard(
         .order_by(ClassSession.starts_at_utc)
         .limit(5)
     )
-    # V1.7: condición compleja: (grupal de su nivel) OR (privada para él)
-    if enrollments_rows:
-        level_ids = [l.id for e, c, l in enrollments_rows]
-        # V3.9.33: los grupos (series) a los que pertenece
-        _mis_grupos = [e.series_id for e, c, l in enrollments_rows if getattr(e, "series_id", None)]
-        # V3.9.34: sus profesores asignados
-        _mis_profes = [e.teacher_id for e, c, l in enrollments_rows if getattr(e, "teacher_id", None)]
-        # V3.9.44 — Se usa el FILTRO CENTRAL de audiencia. Antes este listado
-        # tenía su propia condición y por eso las clases sueltas con
-        # destinatarios no le aparecían a quien sí estaba asignado.
-        from app.services.audience import (
-            contexto_academico as _ctx_fn,
-            filtro_clases_del_estudiante as _filtro_clases,
+    # ══ V3.9.65 — EL FILTRO CENTRAL SE APLICA SIEMPRE ══
+    #
+    # ANTES: sin Enrollment activo, este listado se reducía a "solo tus
+    # clases privadas". Resultado: a un alumno nuevo, todavía sin grupo, una
+    # clase de refuerzo creada expresamente PARA ÉL le quedaba invisible. El
+    # backend le habría dejado entrar —la autorización sí miraba
+    # SessionAudience— pero no tenía dónde verla.
+    #
+    # ESTO NO AFLOJA NADA. `filtro_clases_del_estudiante` es el mismo filtro
+    # de siempre y sigue exigiendo pertenencia real:
+    #   · sus clases privadas;
+    #   · clases de los grupos donde está matriculado (lista vacía si no
+    #     tiene ninguno);
+    #   · clases donde está EXPLÍCITAMENTE en SessionAudience;
+    #   · clases sueltas de SU profesor en SU nivel — rama que requiere
+    #     `teacher_ids` Y `level_ids`, ambos derivados de sus matrículas, así
+    #     que sin Enrollment esa rama sencillamente no aplica.
+    #
+    # O sea: sin Enrollment y sin estar en la audiencia, no ve nada nuevo.
+    # Compartir `level_id` nunca fue suficiente y sigue sin serlo.
+    from app.services.audience import (
+        contexto_academico as _ctx_fn,
+        filtro_clases_del_estudiante as _filtro_clases,
+    )
+    _ctx_clases = await _ctx_fn(db, user.user_id)
+    next_sessions_stmt = next_sessions_stmt.where(
+        or_(
+            _filtro_clases(_ctx_clases, ClassSession, user.user_id),
+            # Privadas para este estudiante
+            ClassSession.student_id == user.user_id,
         )
-        _ctx_clases = await _ctx_fn(db, user.user_id)
-        next_sessions_stmt = next_sessions_stmt.where(
-            or_(
-                _filtro_clases(_ctx_clases, ClassSession, user.user_id),
-                # Privadas para este estudiante
-                ClassSession.student_id == user.user_id,
-            )
-        )
-    else:
-        # Sin enrollments solo ve sus privadas
-        next_sessions_stmt = next_sessions_stmt.where(ClassSession.student_id == user.user_id)
+    )
 
     sessions = (await db.execute(next_sessions_stmt)).scalars().all()
     next_classes = []
@@ -796,12 +803,15 @@ async def my_calendar(
     )
     _ctx_cal = await _ctx_fn(db, user.user_id)
 
-    session_filter = ClassSession.student_id == user.user_id  # privadas (incluye trial)
-    if enrollments:
-        session_filter = or_(
-            ClassSession.student_id == user.user_id,
-            _filtro_clases(_ctx_cal, ClassSession, user.user_id),
-        )
+    # V3.9.65 — Igual que el dashboard: el filtro central se aplica SIEMPRE,
+    # también sin Enrollment. Una clase dirigida explícitamente a este
+    # estudiante debe aparecer en su calendario aunque todavía no tenga
+    # grupo. El filtro sigue exigiendo pertenencia real; compartir nivel no
+    # basta (ver la explicación larga en el dashboard).
+    session_filter = or_(
+        ClassSession.student_id == user.user_id,  # privadas (incluye trial)
+        _filtro_clases(_ctx_cal, ClassSession, user.user_id),
+    )
     sessions = (await db.execute(
         select(ClassSession).where(
             session_filter,
@@ -964,9 +974,18 @@ async def confirm_class_attendance(
 ):
     """V3.9.21: El estudiante confirma que asistirá a una clase próxima.
     El profe/admin ve quién confirmó al abrir la asistencia."""
+    # V3.9.67 — Antes esto solo pedía sesión iniciada: cualquier usuario con
+    # un session_id podía confirmar asistencia a una clase ajena y aparecer en
+    # la lista del profesor. Ahora se exige que la clase SEA suya, con la
+    # misma regla que decide qué ve y a qué entra.
+    if user.role != "student":
+        raise HTTPException(403, "Solo estudiantes confirman asistencia")
     s = await db.get(ClassSession, session_id)
     if not s:
         raise HTTPException(404, "Clase no encontrada")
+    from app.services.audience import puede_acceder_a_clase
+    if not await puede_acceder_a_clase(db, user.user_id, s):
+        raise HTTPException(403, "Esta clase no es tuya.")
     if s.status != SessionStatus.scheduled:
         raise HTTPException(400, "La clase no está programada")
     ends = s.ends_at_utc
@@ -1525,9 +1544,46 @@ async def request_makeup(
     """
     from app.models import MakeupRequest
 
+    # V3.9.67 — La clase perdida tiene que haber sido SUYA. Antes no se
+    # comprobaba: se podía pedir reponer la clase de otro grupo.
+    if user.role != "student":
+        raise HTTPException(403, "Solo estudiantes piden reposiciones")
     s = await db.get(ClassSession, session_id)
     if not s:
         raise HTTPException(404, "Clase no encontrada")
+    from app.services.audience import puede_acceder_a_clase
+    if not await puede_acceder_a_clase(db, user.user_id, s):
+        # ══ V3.9.68 — CAMBIAR DE GRUPO NO BORRA TU HISTORIA ══
+        #
+        # `puede_acceder_a_clase` mira la pertenencia ACTUAL. Correcto para
+        # entrar a una clase futura, pero injusto para una PASADA:
+        #
+        #   Junio: María está en Grupo A y falta a una clase.
+        #   Julio: María se transfiere al Grupo B.
+        #   Después pide reponer aquella clase de junio -> 403.
+        #
+        # Se le negaba reponer una clase a la que sí pertenecía cuando
+        # ocurrió. Va contra la regla que sostiene todo el sistema: la
+        # historia no se reescribe.
+        #
+        # No se afloja la seguridad: NO basta con compartir nivel. Hace falta
+        # EVIDENCIA de que esa sesión fue suya — que le pasaran lista o que
+        # confirmara asistencia. Sin rastro, sigue siendo 403.
+        from app.models import SessionAttendance
+        _asistio = (await db.execute(
+            select(SessionAttendance.id).where(
+                SessionAttendance.session_id == session_id,
+                SessionAttendance.student_id == user.user_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        _confirmo = (await db.execute(
+            select(ClassConfirmation.id).where(
+                ClassConfirmation.session_id == session_id,
+                ClassConfirmation.student_id == user.user_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if not (_asistio or _confirmo):
+            raise HTTPException(403, "Esa clase no era tuya.")
 
     # Debe ser una clase que ya pasó
     fin = s.ends_at_utc

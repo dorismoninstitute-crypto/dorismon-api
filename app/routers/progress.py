@@ -32,7 +32,61 @@ async def my_course_progress(
         ).order_by(Enrollment.enrolled_at.desc()).limit(1)
     )).scalar_one_or_none()
     if not enr:
-        return {"enrolled": False}
+        # ══ V3.9.67 — SIN MATRÍCULA TODAVÍA, PERO CON CLASE ══
+        #
+        # Antes esto cortaba aquí. Una estudiante nueva a la que se le creaba
+        # una clase de refuerzo la veía en el calendario, pero el bloque
+        # grande "Tu próxima clase / Entrar a la clase" del panel no aparecía,
+        # porque depende de este endpoint. Podía verla y no usarla.
+        #
+        # Una clase asignada explícitamente tiene que ser USABLE, no solo
+        # visible. Se devuelve `enrolled: False` igual que antes (no se
+        # inventa una matrícula), pero con su próxima clase real.
+        from app.services.audience import (
+            contexto_academico as _ctx_fn,
+            filtro_clases_del_estudiante as _filtro_clases,
+        )
+        _ctx = await _ctx_fn(db, user.user_id)
+        _ahora = datetime.now(tz.utc)
+        _prox = (await db.execute(
+            select(ClassSession).where(
+                or_(
+                    _filtro_clases(_ctx, ClassSession, user.user_id),
+                    ClassSession.student_id == user.user_id,
+                ),
+                ClassSession.ends_at_utc > _ahora,
+                ClassSession.status == SessionStatus.scheduled,
+            ).order_by(ClassSession.starts_at_utc).limit(1)
+        )).scalar_one_or_none()
+
+        _data = None
+        if _prox:
+            _prof = await db.get(User, _prox.teacher_id) if _prox.teacher_id else None
+            _loc = None
+            if _prox.branch_id or _prox.classroom_id:
+                _b = await db.get(Branch, _prox.branch_id) if _prox.branch_id else None
+                _cr = await db.get(Classroom, _prox.classroom_id) if _prox.classroom_id else None
+                if _cr and not _b and _cr.branch_id:
+                    _b = await db.get(Branch, _cr.branch_id)
+                _loc = {
+                    "branch_name": _b.name if _b else None,
+                    "address": _b.address if _b else None,
+                    "classroom_name": _cr.name if _cr else None,
+                }
+            _data = {
+                "id": _prox.id, "title": _prox.title,
+                "starts_at_utc": _prox.starts_at_utc.isoformat() if _prox.starts_at_utc else None,
+                "ends_at_utc": _prox.ends_at_utc.isoformat() if _prox.ends_at_utc else None,
+                "modality": _prox.modality.value,
+                "meeting_url": _prox.meeting_url,
+                "video_provider": getattr(_prox, "video_provider", "meet") or "meet",
+                "status": _prox.status.value if _prox.status else "scheduled",
+                "teacher_name": _prof.full_name if _prof else None,
+                "teacher_notes": _prox.teacher_notes,
+                "is_private": _prox.student_id is not None,
+                "location": _loc,
+            }
+        return {"enrolled": False, "next_session": _data}
 
     level = await db.get(Level, enr.level_id)
     course = await db.get(Course, enr.course_id)
@@ -99,20 +153,43 @@ async def my_course_progress(
     # Cualquier otro caso: pantalla limpia.
     #
     # Es preferible que no vea nada a que se presente a una clase ajena.
-    _mi_grupo = getattr(enr, "series_id", None)
-    if _mi_grupo:
-        _condicion_grupal = (
-            (ClassSession.series_id == _mi_grupo) & (ClassSession.student_id.is_(None))
-        )
-    else:
-        # Sin grupo: no hay clases grupales suyas. Solo verá las privadas
-        # (que se suman aparte en el or_ de abajo).
-        _condicion_grupal = false()
+    # ══ V3.9.68 — LA PRÓXIMA CLASE SALE DEL FILTRO CENTRAL ══
+    #
+    # ANTES esta consulta tenía su propia lógica: "clases de mi grupo" O "mis
+    # privadas". Correcta para el caso normal, pero le faltaba una rama que ya
+    # existía en el resto del sistema: SessionAudience.
+    #
+    # EL CASO REAL QUE FALLABA:
+    #   María tiene Enrollment A2 activo, con profesor asignado,
+    #   pero todavía SIN grupo (series_id = NULL).
+    #   Admin le crea un "Refuerzo A2" con student_ids = [María].
+    #
+    #   -> Próximas clases: aparecía ✅
+    #   -> Calendario: aparecía ✅
+    #   -> Autorización de API: la dejaba entrar ✅
+    #   -> Tarjeta "Tu próxima clase / Entrar": NO aparecía ❌
+    #
+    # En v3.9.67 esto se arregló SOLO para quien no tenía Enrollment. Pero
+    # tener matrícula sin grupo es un estado igual de real —y más común— y esa
+    # rama seguía con la lógica manual.
+    #
+    # Usar `filtro_clases_del_estudiante` elimina la divergencia de raíz: es
+    # la MISMA regla que decide el calendario, el dashboard y el acceso al
+    # video. Si el sistema dice que la clase es suya, la tarjeta la muestra.
+    #
+    # NO afloja nada: ese filtro sigue exigiendo pertenencia real (grupo,
+    # audiencia explícita, privada, o clase suelta de SU profesor en SU
+    # nivel). Compartir level_id nunca bastó y sigue sin bastar.
+    from app.services.audience import (
+        contexto_academico as _ctx_prox,
+        filtro_clases_del_estudiante as _filtro_prox,
+    )
+    _ctx_ns = await _ctx_prox(db, user.user_id)
 
     next_session = (await db.execute(
         select(ClassSession).where(
             or_(
-                _condicion_grupal,
+                _filtro_prox(_ctx_ns, ClassSession, user.user_id),
                 # Privada para este estudiante
                 ClassSession.student_id == user.user_id,
             ),

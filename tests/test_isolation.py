@@ -80,7 +80,7 @@ async def main():
                 "name": nombre, "course_id": cid, "level_id": lvl["id"],
                 "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri,sat,sun",
                 "start_time_hhmm": hora, "duration_min": 60,
-                "start_date": hoy, "num_classes": 10, "modality": "online",
+                "start_date": hoy, "num_classes": 10, "modality": "online", "video_provider": "dorismon",
                 "capacity": 10,
             })
         gs = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
@@ -194,7 +194,7 @@ async def main():
             "title": "ISO Clase en curso",
             "starts_at_utc": (now - datetime.timedelta(minutes=35)).isoformat(),
             "ends_at_utc": (now + datetime.timedelta(minutes=25)).isoformat(),
-            "modality": "online", "teacher_id": E1.get("profe", PA)["id"],
+            "modality": "online", "video_provider": "dorismon", "teacher_id": E1.get("profe", PA)["id"],
             "course_id": cid, "level_id": lvl["id"],
             "series_id": E1.get("grupo", {}).get("id"),
             "video_provider": "dorismon",
@@ -251,7 +251,7 @@ async def main():
                 "teacher_id": PA["id"],  # EL MISMO PROFESOR en los dos
                 "days_of_week": "mon,tue,wed,thu,fri,sat,sun",
                 "start_time_hhmm": hora, "duration_min": 60,
-                "start_date": hoy, "num_classes": 6, "modality": "online",
+                "start_date": hoy, "num_classes": 6, "modality": "online", "video_provider": "dorismon",
                 "capacity": 10,
             })
         gb = (await c.get("/admin/groups", headers=AH)).json().get("items", [])

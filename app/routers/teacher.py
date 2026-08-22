@@ -399,15 +399,24 @@ async def get_attendance(
         from app.services.audience import destinatarios_de_clase
         _ids = await destinatarios_de_clase(db, session)
         if _ids:
-            students_q = (
-                select(Enrollment, User)
-                .join(User, Enrollment.student_id == User.id)
-                .where(
-                    Enrollment.student_id.in_(_ids),
-                    Enrollment.is_active.is_(True),
-                )
-            )
-            rows = (await db.execute(students_q)).all()
+            # ══ V3.9.65 — LA AUDIENCIA YA DECIDIÓ QUIÉN ENTRA ══
+            #
+            # ANTES esto hacía JOIN contra Enrollment con `is_active`. La
+            # audiencia se calculaba bien y el JOIN la anulaba después: un
+            # alumno nuevo, todavía sin grupo, aparecía en la audiencia, veía
+            # la clase y estaba autorizado a entrar... pero NO salía en la
+            # lista del profesor, así que no se le podía pasar lista.
+            #
+            # Es el mismo patrón que se corrigió en el dashboard y el
+            # calendario: audiencia correcta, anulada por un JOIN posterior.
+            #
+            # No se pierde control: `destinatarios_de_clase` ya aplicó grupo,
+            # audiencia explícita y clase privada. Y el bucle de abajo solo
+            # usa el User — el Enrollment nunca se leía.
+            _users = (await db.execute(
+                select(User).where(User.id.in_(_ids))
+            )).scalars().all()
+            rows = [(None, u) for u in _users]
         else:
             rows = []
     # V3.0: avisos de ausencia para esta clase
@@ -501,6 +510,30 @@ async def save_attendance(
     if session.status == SessionStatus.cancelled:
         raise HTTPException(400, "Esta clase fue cancelada. No se puede registrar asistencia.")
     records = body.get("records", [])
+
+    # ══ V3.9.67 — SOLO SE PASA LISTA A QUIEN ESTÁ EN LA CLASE ══
+    #
+    # La comprobación de arriba valida que la SESIÓN sea del profesor, pero no
+    # validaba a QUIÉN se le escribía. Mandando el JSON a mano se podía
+    # registrar asistencia de un estudiante que nunca estuvo invitado, y eso
+    # no se queda en un dato feo: la asistencia alimenta el progreso de
+    # módulos, así que contamina el expediente académico de otra persona.
+    #
+    # Se usa la MISMA audiencia que ya decide el roster visible. Si no sale en
+    # la lista, no se le puede pasar lista.
+    from app.services.audience import destinatarios_de_clase
+    _permitidos = await destinatarios_de_clase(db, session)
+    if session.student_id:
+        _permitidos = set(_permitidos) | {session.student_id}
+    _fuera = [r.get("student_id") for r in records
+              if r.get("student_id") and r.get("student_id") not in _permitidos]
+    if _fuera:
+        raise HTTPException(
+            403,
+            f"{len(_fuera)} estudiante(s) no pertenecen a esta clase. "
+            "Solo puedes pasar lista a quienes aparecen en el roster.",
+        )
+
     updated = 0
     now = datetime.now(tz.utc)
     for r in records:

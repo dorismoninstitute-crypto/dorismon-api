@@ -66,7 +66,7 @@ async def main():
                 "name": nombre, "course_id": cid, "level_id": lvl["id"],
                 "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri",
                 "start_time_hhmm": hora, "duration_min": 60, "start_date": hoy,
-                "num_classes": 5, "modality": "online", "capacity": 10,
+                "num_classes": 5, "modality": "online", "video_provider": "dorismon", "capacity": 10,
             })
         gs = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
         GA = [x for x in gs if x["name"] == "AUTHZ Grupo A"]

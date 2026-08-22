@@ -63,7 +63,7 @@ async def main():
                 "name": nombre, "course_id": cid, "level_id": lvl["id"],
                 "teacher_id": PA["id"], "days_of_week": "mon,tue,wed,thu,fri",
                 "start_time_hhmm": hora, "duration_min": 60, "start_date": hoy,
-                "num_classes": 5, "modality": "online", "capacity": 10,
+                "num_classes": 5, "modality": "online", "video_provider": "dorismon", "capacity": 10,
             })
         gs = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
         GA = [x for x in gs if x["name"] == "P2 Grupo A"]
@@ -390,7 +390,7 @@ async def main():
                 "starts_at_utc": (now - datetime.timedelta(days=9 - i * 3)).isoformat(),
                 "ends_at_utc": (now - datetime.timedelta(days=9 - i * 3,
                                                           hours=-1)).isoformat(),
-                "modality": "online", "teacher_id": PA["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": PA["id"],
                 "course_id": cid, "level_id": lvl["id"],
                 "series_id": GA[0]["id"],
             })
@@ -423,7 +423,7 @@ async def main():
                     "title": f"P2b Reciente {i}",
                     "starts_at_utc": (now - datetime.timedelta(hours=6 - i * 2)).isoformat(),
                     "ends_at_utc": (now - datetime.timedelta(hours=5 - i * 2)).isoformat(),
-                    "modality": "online", "teacher_id": PA["id"],
+                    "modality": "online", "video_provider": "dorismon", "teacher_id": PA["id"],
                     "course_id": cid, "level_id": lvl["id"],
                     "series_id": GA[0]["id"],
                 })

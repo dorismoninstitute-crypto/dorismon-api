@@ -100,7 +100,7 @@ async def main():
                 "name": nombre, "course_id": curso["id"], "level_id": nivel["id"],
                 "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri",
                 "start_time_hhmm": hora, "duration_min": 60, "start_date": hoy,
-                "num_classes": 5, "modality": "online", "capacity": 10,
+                "num_classes": 5, "modality": "online", "video_provider": "dorismon", "capacity": 10,
             })
         gs = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
         for g in gs:
@@ -161,7 +161,7 @@ async def main():
                 "title": f"ME Spanish clase {i}",
                 "starts_at_utc": (now - datetime.timedelta(days=5 - i)).isoformat(),
                 "ends_at_utc": (now - datetime.timedelta(days=5 - i, hours=-1)).isoformat(),
-                "modality": "online", "teacher_id": PB["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": PB["id"],
                 "course_id": CB["id"], "level_id": LB[0]["id"],
                 "series_id": GS["id"],
             })
@@ -176,7 +176,7 @@ async def main():
             "title": "ME English clase ok",
             "starts_at_utc": (now - datetime.timedelta(hours=3)).isoformat(),
             "ends_at_utc": (now - datetime.timedelta(hours=2)).isoformat(),
-            "modality": "online", "teacher_id": PA["id"],
+            "modality": "online", "video_provider": "dorismon", "teacher_id": PA["id"],
             "course_id": CA["id"], "level_id": LA[0]["id"],
             "series_id": GE["id"],
         })

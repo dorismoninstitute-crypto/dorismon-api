@@ -90,7 +90,7 @@ async def main():
             "name": "P3 Grupo B1", "course_id": CA["id"], "level_id": B1["id"],
             "teacher_id": CARLOS["id"], "days_of_week": "mon,tue,wed,thu,fri",
             "start_time_hhmm": "09:00", "duration_min": 60, "start_date": hoy,
-            "num_classes": 5, "modality": "online", "capacity": 20})
+            "num_classes": 5, "modality": "online", "video_provider": "dorismon", "capacity": 20})
         gs = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
         G = [x for x in gs if x["name"] == "P3 Grupo B1"]
         if not G:
@@ -138,7 +138,7 @@ async def main():
                 "title": f"P3 Clase {i}",
                 "starts_at_utc": (now - datetime.timedelta(days=20 - i)).isoformat(),
                 "ends_at_utc": (now - datetime.timedelta(days=20 - i, hours=-1)).isoformat(),
-                "modality": "online", "teacher_id": CARLOS["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": CARLOS["id"],
                 "course_id": CA["id"], "level_id": B1["id"], "series_id": G["id"]})
             if r.status_code == 201:
                 clases.append(r.json()["id"])
@@ -224,7 +224,7 @@ async def main():
                     "title": f"P3 Mod{k} clase {i}",
                     "starts_at_utc": (now - datetime.timedelta(days=15 - k * 2 - i)).isoformat(),
                     "ends_at_utc": (now - datetime.timedelta(days=15 - k * 2 - i, hours=-1)).isoformat(),
-                    "modality": "online", "teacher_id": CARLOS["id"],
+                    "modality": "online", "video_provider": "dorismon", "teacher_id": CARLOS["id"],
                     "course_id": CA["id"], "level_id": B1["id"],
                     "series_id": G["id"], "module_id": MOD["id"]})
                 if rr.status_code == 201:
@@ -284,7 +284,7 @@ async def main():
                 "title": "P3 Clase futura",
                 "starts_at_utc": (now + datetime.timedelta(days=1)).isoformat(),
                 "ends_at_utc": (now + datetime.timedelta(days=1, hours=1)).isoformat(),
-                "modality": "online", "teacher_id": CARLOS["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": CARLOS["id"],
                 "course_id": CA["id"], "level_id": B1["id"], "series_id": G["id"]})
             if fut.status_code == 201:
                 await c.post(f"/admin/sessions/{fut.json()['id']}/substitute-teacher",
@@ -562,7 +562,7 @@ async def main():
                 "title": "P3 Clase de módulo",
                 "starts_at_utc": (now - datetime.timedelta(days=2)).isoformat(),
                 "ends_at_utc": (now - datetime.timedelta(days=2, hours=-1)).isoformat(),
-                "modality": "online", "teacher_id": CARLOS["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": CARLOS["id"],
                 "course_id": CA["id"], "level_id": B1["id"],
                 "series_id": G["id"], "module_id": MOD["id"]})
             if cm.status_code == 201:
@@ -726,7 +726,7 @@ async def main():
                     "title": "P3 Clase cobertura",
                     "starts_at_utc": (now - datetime.timedelta(days=1)).isoformat(),
                     "ends_at_utc": (now - datetime.timedelta(days=1, hours=-1)).isoformat(),
-                    "modality": "online", "teacher_id": CARLOS["id"],
+                    "modality": "online", "video_provider": "dorismon", "teacher_id": CARLOS["id"],
                     "course_id": CA["id"], "level_id": B1["id"],
                     "series_id": G["id"], "module_id": MOD2["id"]})
                 if cm2.status_code == 201:
@@ -815,7 +815,7 @@ async def main():
             "name": "P3 Grupo B2", "course_id": CA["id"], "level_id": B2["id"],
             "teacher_id": ANDREA["id"], "days_of_week": "mon,wed",
             "start_time_hhmm": "18:00", "duration_min": 60, "start_date": hoy,
-            "num_classes": 4, "modality": "online", "capacity": 20})
+            "num_classes": 4, "modality": "online", "video_provider": "dorismon", "capacity": 20})
         gs2 = (await c.get("/admin/groups", headers=AH)).json().get("items", [])
         GB2 = [x for x in gs2 if x["name"] == "P3 Grupo B2"]
 

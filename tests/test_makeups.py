@@ -55,7 +55,7 @@ async def main():
                     "name": nombre, "course_id": cid, "level_id": lvl["id"],
                     "teacher_id": profe["id"], "days_of_week": "mon,tue,wed,thu,fri",
                     "start_time_hhmm": hora, "duration_min": 60,
-                    "start_date": hoy, "num_classes": 8, "modality": "online",
+                    "start_date": hoy, "num_classes": 8, "modality": "online", "video_provider": "dorismon",
                 })
 
             pr = (await c.get("/progress/my-course", headers=SH)).json()
@@ -70,11 +70,18 @@ async def main():
                 await c.post(f"/admin/enrollments/{mia[0]['id']}/assign-group",
                              headers=AH, json={"series_id": h1[0]["id"]})
                 pr2 = (await c.get("/progress/my-course", headers=SH)).json()
-                titulo = (pr2.get("next_session") or {}).get("title", "")
-                check("Con grupo, solo ve las clases de SU horario",
-                      "Test H1" in titulo)
+                prox = pr2.get("next_session") or {}
+                titulo = prox.get("title", "")
+                # V3.9.68+: una clase SUELTA válida de su mismo curso+nivel+
+                # profesor puede ser más próxima que la sesión de su grupo.
+                # Eso es correcto. Lo que sigue prohibido es colarse en OTRA
+                # SERIE/horario del mismo profesor.
+                check("Con grupo, la próxima es su serie o una suelta válida",
+                      prox.get("series_id") in (None, h1[0]["id"]))
+                h2 = [x for x in g if x["name"] == "Test H2"]
+                h2id = h2[0]["id"] if h2 else None
                 check("NO ve el otro horario del mismo profesor",
-                      "Test H2" not in titulo)
+                      prox.get("series_id") != h2id and "Test H2" not in titulo)
 
         # ---------- Estudiantes sin horario ----------
         sh = await c.get("/admin/students-without-schedule", headers=AH)
@@ -89,7 +96,7 @@ async def main():
             "title": "Test clase perdida",
             "starts_at_utc": (now - datetime.timedelta(days=2)).isoformat(),
             "ends_at_utc": (now - datetime.timedelta(days=2, hours=-1)).isoformat(),
-            "modality": "online", "teacher_id": profe["id"],
+            "modality": "online", "video_provider": "dorismon", "teacher_id": profe["id"],
             "course_id": cid, "level_id": lvl["id"],
         })).json()["id"]
 
@@ -129,7 +136,7 @@ async def main():
             "title": "Test otra perdida",
             "starts_at_utc": (now - datetime.timedelta(days=3)).isoformat(),
             "ends_at_utc": (now - datetime.timedelta(days=3, hours=-1)).isoformat(),
-            "modality": "online", "teacher_id": profe["id"],
+            "modality": "online", "video_provider": "dorismon", "teacher_id": profe["id"],
             "course_id": cid, "level_id": lvl["id"],
         })).json()["id"]
         r2 = await c.post(f"/student/sessions/{sid2}/request-makeup", headers=SH,
@@ -206,7 +213,7 @@ async def main():
                 "title": "Test clase sustituto",
                 "starts_at_utc": (now + datetime.timedelta(days=1)).isoformat(),
                 "ends_at_utc": (now + datetime.timedelta(days=1, hours=1)).isoformat(),
-                "modality": "online", "teacher_id": profe["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": profe["id"],
                 "course_id": cid, "level_id": lvl["id"],
             })).json()["id"]
 
@@ -228,7 +235,7 @@ async def main():
                 "title": "Test clase pasada sust",
                 "starts_at_utc": (now - datetime.timedelta(days=2)).isoformat(),
                 "ends_at_utc": (now - datetime.timedelta(days=2, hours=-1)).isoformat(),
-                "modality": "online", "teacher_id": profe["id"],
+                "modality": "online", "video_provider": "dorismon", "teacher_id": profe["id"],
                 "course_id": cid, "level_id": lvl["id"],
             })).json()["id"]
             pas = await c.post(f"/admin/sessions/{vieja}/substitute-teacher",
