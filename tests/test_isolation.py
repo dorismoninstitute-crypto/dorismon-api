@@ -16,11 +16,11 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
 ESTUDIANTES = [
-    {"email": "maria.estudiante@dorismon.do", "password": "Estudiante2026!"},
-    {"email": "carlos.estudiante@dorismon.do", "password": "Estudiante2026!"},
+    {"email": "maria.estudiante@dorismon.do", "password": "Estu-Test-4823!"},
+    {"email": "carlos.estudiante@dorismon.do", "password": "Estu-Test-4823!"},
 ]
 
 
@@ -124,7 +124,7 @@ async def main():
 
         # ---------- TAREAS ----------
         tokB = (await c.post("/auth/login", json={"email": PB["email"],
-                                                   "password": "Profe2026!"})).json()
+                                                   "password": "Prof-Test-4822!"})).json()
         TB = {"Authorization": f"Bearer {tokB['access_token']}"}
         ta = await c.post("/teacher/assignments", headers=TB, json={
             "title": "ISO Tarea de B", "description": "x", "level_id": lvl["id"]})
@@ -165,7 +165,7 @@ async def main():
 
             # Y el suyo sí funciona
             tokA = (await c.post("/auth/login", json={"email": PA["email"],
-                                                       "password": "Profe2026!"})).json()
+                                                       "password": "Prof-Test-4822!"})).json()
             TA = {"Authorization": f"Bearer {tokA['access_token']}"}
             qa = await c.post("/teacher/quizzes", headers=TA, json={
                 "title": "ISO Quiz de A", "description": "x", "level_id": lvl["id"],
@@ -273,7 +273,7 @@ async def main():
                                                    "confirm_full": True})
 
             tokA2 = (await c.post("/auth/login", json={"email": PA["email"],
-                                                        "password": "Profe2026!"})).json()
+                                                        "password": "Prof-Test-4822!"})).json()
             TA2 = {"Authorization": f"Bearer {tokA2['access_token']}"}
 
             # --- TAREA dirigida SOLO al grupo de E1 ---

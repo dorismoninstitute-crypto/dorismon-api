@@ -92,12 +92,19 @@ async def student_dashboard(
         .where(Enrollment.student_id == user.user_id, Enrollment.is_active.is_(True))
     )
     enrollments_rows = (await db.execute(enrollments_stmt)).all()
+    # V3.9.76 — Profesores de todas las matrículas en UNA consulta.
+    _ids_profes_matr = {e.teacher_id for e, _, _ in enrollments_rows if e.teacher_id}
+    _profes_matr = {
+        t.id: t for t in (await db.execute(
+            select(User).where(User.id.in_(_ids_profes_matr))
+        )).scalars().all()
+    } if _ids_profes_matr else {}
     enrollments = []
     for e, c, l in enrollments_rows:
         teacher_name = None
         teacher_id = None
         if e.teacher_id:
-            t_user = await db.get(User, e.teacher_id)
+            t_user = _profes_matr.get(e.teacher_id)
             # V2.9.1: solo mostrar el profe si sigue ACTIVO
             if t_user and t_user.is_active:
                 teacher_name = t_user.full_name
@@ -158,9 +165,16 @@ async def student_dashboard(
     )
 
     sessions = (await db.execute(next_sessions_stmt)).scalars().all()
+    # V3.9.76 — Profesores de las próximas clases en UNA consulta.
+    _ids_profes_cls = {s.teacher_id for s in sessions if s.teacher_id}
+    _profes_cls = {
+        t.id: t for t in (await db.execute(
+            select(User).where(User.id.in_(_ids_profes_cls))
+        )).scalars().all()
+    } if _ids_profes_cls else {}
     next_classes = []
     for s in sessions:
-        teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
+        teacher_user = _profes_cls.get(s.teacher_id) if s.teacher_id else None
         # V2.9.1: mostrar profe solo si está activo
         t_name = teacher_user.full_name if (teacher_user and teacher_user.is_active) else "—"
         # V3.0.3: ubicación para clases presenciales/híbridas
@@ -173,6 +187,9 @@ async def student_dashboard(
             "teacher_name": t_name,
             "is_private": s.student_id is not None,  # V1.7
             "location": location,  # V3.0.3
+            # GATE 3 — Para reutilizar el MISMO botón de entrada en la lista.
+            "video_provider": getattr(s, "video_provider", "meet") or "meet",
+            "status": s.status.value if s.status else "scheduled",
         })
 
     # Tareas pendientes
@@ -180,10 +197,11 @@ async def student_dashboard(
     # Antes se contaban las de todo el nivel: el número no coincidía con lo
     # que el estudiante veía al entrar a Tareas.
     from app.services.audience import (
-        contexto_academico as _ctx_dash,
         filtro_actividades_del_estudiante as _filtro_dash,
     )
-    _ctx_d = await _ctx_dash(db, user.user_id)
+    # V3.9.76 — El contexto académico ya se calculó arriba para las clases y
+    # entre ambos usos no hay escrituras: se reutiliza el mismo resultado.
+    _ctx_d = _ctx_clases
     pending_assignments_q = (
         select(Assignment).where(_filtro_dash(_ctx_d, Assignment))
     ) if enrollments_rows else None
@@ -191,14 +209,18 @@ async def student_dashboard(
     next_assignment = None
     if pending_assignments_q is not None:
         items = (await db.execute(pending_assignments_q.limit(30))).scalars().all()
+        # V3.9.76 — Una sola consulta: qué tareas de la lista ya fueron ENVIADAS.
+        # Pendiente sigue siendo: sin entrega, o entrega con submitted_at NULL.
+        _ids_tareas = [a.id for a in items]
+        _enviadas = set((await db.execute(
+            select(AssignmentSubmission.assignment_id).where(
+                AssignmentSubmission.assignment_id.in_(_ids_tareas),
+                AssignmentSubmission.student_id == user.user_id,
+                AssignmentSubmission.submitted_at.is_not(None),
+            )
+        )).scalars().all()) if _ids_tareas else set()
         for a in items:
-            sub = (await db.execute(
-                select(AssignmentSubmission).where(
-                    AssignmentSubmission.assignment_id == a.id,
-                    AssignmentSubmission.student_id == user.user_id,
-                )
-            )).scalar_one_or_none()
-            if not sub or sub.submitted_at is None:
+            if a.id not in _enviadas:
                 pending_assignments += 1
                 if not next_assignment:
                     next_assignment = {
@@ -217,15 +239,18 @@ async def student_dashboard(
                 Quiz.is_published.is_(True),
             ).limit(20)
         )).scalars().all()
+        # V3.9.76 — Una sola consulta: qué quizzes de la lista ya tienen algún
+        # intento ENVIADO por este estudiante (antes: un COUNT por quiz).
+        _ids_quizzes = [q.id for q in quizzes]
+        _con_intento = set((await db.execute(
+            select(QuizAttempt.quiz_id).where(
+                QuizAttempt.quiz_id.in_(_ids_quizzes),
+                QuizAttempt.student_id == user.user_id,
+                QuizAttempt.submitted_at.is_not(None),
+            ).distinct()
+        )).scalars().all()) if _ids_quizzes else set()
         for q in quizzes:
-            attempts = (await db.execute(
-                select(func.count()).select_from(QuizAttempt).where(
-                    QuizAttempt.quiz_id == q.id,
-                    QuizAttempt.student_id == user.user_id,
-                    QuizAttempt.submitted_at.is_not(None),
-                )
-            )).scalar() or 0
-            if attempts == 0:
+            if q.id not in _con_intento:
                 pending_quizzes += 1
 
     # Certificados
@@ -247,15 +272,19 @@ async def student_dashboard(
     attendance_rate = int(present_count * 100 / total_att) if total_att else 0
 
     # Última calificación
-    last_grade = (await db.execute(
-        select(AssignmentSubmission).where(
+    # V3.9.76 — Entrega + tarea en UNA consulta. Mismo orden y mismo criterio;
+    # OUTER JOIN para conservar "—" / 100.0 si la tarea no existiera.
+    _fila_nota = (await db.execute(
+        select(AssignmentSubmission, Assignment)
+        .outerjoin(Assignment, Assignment.id == AssignmentSubmission.assignment_id)
+        .where(
             AssignmentSubmission.student_id == user.user_id,
             AssignmentSubmission.score.is_not(None),
         ).order_by(AssignmentSubmission.graded_at.desc()).limit(1)
-    )).scalar_one_or_none()
+    )).first()
+    last_grade, a = _fila_nota if _fila_nota else (None, None)
     last_grade_data = None
     if last_grade:
-        a = await db.get(Assignment, last_grade.assignment_id)
         last_grade_data = {
             "assignment_title": a.title if a else "—",
             "score": float(last_grade.score) if last_grade.score else None,
@@ -393,6 +422,9 @@ async def student_dashboard(
             "pending_quizzes": pending_quizzes,
             "certificates": certs_count,
             "attendance_rate": attendance_rate,
+            # GATE 3 — Cuántas asistencias registradas hay (ya calculado arriba,
+            # sin consulta nueva): 0 = "aún sin clases", no "0 % de asistencia".
+            "attendance_records": total_att,
         },
         "enrollments": enrollments,
         "next_classes": next_classes,

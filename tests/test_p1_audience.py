@@ -10,11 +10,11 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
 ESTUDIANTES = [
-    {"email": "maria.estudiante@dorismon.do", "password": "Estudiante2026!"},
-    {"email": "carlos.estudiante@dorismon.do", "password": "Estudiante2026!"},
+    {"email": "maria.estudiante@dorismon.do", "password": "Estu-Test-4823!"},
+    {"email": "carlos.estudiante@dorismon.do", "password": "Estu-Test-4823!"},
 ]
 
 
@@ -82,7 +82,7 @@ async def main():
                              headers=AH, json={"series_id": grupo["id"], "confirm_full": True})
 
         ptok = (await c.post("/auth/login", json={"email": P["email"],
-                                                  "password": "Profe2026!"})).json()
+                                                  "password": "Prof-Test-4822!"})).json()
         TH = {"Authorization": f"Bearer {ptok['access_token']}"}
 
         def _n(r):

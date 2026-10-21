@@ -102,8 +102,9 @@ async def init_db():
             "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS rate_private FLOAT DEFAULT 1000.0",  # V1.9
             "ALTER TABLE teachers ADD COLUMN IF NOT EXISTS rate_event FLOAT DEFAULT 750.0",  # V1.9
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE",  # V2.1
-            # V2.1: marcar usuarios existentes como verificados (no romper acceso)
-            "UPDATE users SET email_verified = TRUE WHERE email_verified IS NULL OR email_verified = FALSE",
+            # V3.9.75: NO volver a marcar usuarios como verificados en cada arranque.
+            # El backfill histórico de V2.1 ya cumplió su función. Mantener un UPDATE
+            # global aquí anulaba cualquier email_verified=False definido después.
             # V2.2: Perfil completo estudiante
             "ALTER TABLE students ADD COLUMN IF NOT EXISTS document_type VARCHAR",
             "ALTER TABLE students ADD COLUMN IF NOT EXISTS document_number VARCHAR",

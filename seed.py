@@ -22,8 +22,33 @@ from app.models import (
 from secrets import token_urlsafe
 
 
+import os
+
+# v3.9.76 (hotfix de auditoría): el seed NO contiene contraseñas. Es solo para desarrollo/tests y exige
+# autorización explícita (ALLOW_DEV_SEED=true) y las tres contraseñas por entorno. En PRODUCCIÓN no corre.
 ADMIN_EMAIL = "admin@dorismon.do"
-ADMIN_PASSWORD = "DorismonAdmin2026!"
+ADMIN_PASSWORD = os.getenv("SEED_ADMIN_PASSWORD") or ""
+TEACHER_PASSWORD = os.getenv("SEED_TEACHER_PASSWORD") or ""
+STUDENT_PASSWORD = os.getenv("SEED_STUDENT_PASSWORD") or ""
+
+
+def _exigir_autorizacion_de_desarrollo():
+    """Sale con código 1 y un mensaje claro (sin imprimir valores) si falta autorización o credenciales."""
+    from app.core.config import is_production
+    if is_production():
+        print("SEED BLOQUEADO: este script es solo de desarrollo y NO puede ejecutarse en producción "
+              "(RENDER / ENVIRONMENT=production). Crea las cuentas reales con contraseñas propias.")
+        sys.exit(1)
+    if (os.getenv("ALLOW_DEV_SEED") or "").strip().lower() not in ("1", "true", "yes", "on"):
+        print("SEED BLOQUEADO: falta la autorización explícita de desarrollo. Define ALLOW_DEV_SEED=true "
+              "(solo en tu entorno local).")
+        sys.exit(1)
+    faltan = [n for n, v in (("SEED_ADMIN_PASSWORD", ADMIN_PASSWORD), ("SEED_TEACHER_PASSWORD", TEACHER_PASSWORD),
+                             ("SEED_STUDENT_PASSWORD", STUDENT_PASSWORD)) if not v]
+    if faltan:
+        print("SEED BLOQUEADO: faltan variables de entorno obligatorias: " + ", ".join(faltan) +
+              ". El seed no trae contraseñas por defecto; define las tuyas (no las reutilices en producción).")
+        sys.exit(1)
 
 
 def _gen_cert_code():
@@ -31,6 +56,7 @@ def _gen_cert_code():
 
 
 async def main():
+    _exigir_autorizacion_de_desarrollo()
     await init_db()
     from sqlalchemy import select
 
@@ -56,7 +82,7 @@ async def main():
         )
         db.add(admin)
         await db.flush()
-        print(f"Admin: {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
+        print(f"Admin: {ADMIN_EMAIL}")
 
         # === 3. PROFESORES ===
         teachers_data = [
@@ -69,14 +95,14 @@ async def main():
         ]
         teacher_ids = {}
         for em, name, spec, mods, bio in teachers_data:
-            u = User(email=em, password_hash=hash_password("Profe2026!"),
+            u = User(email=em, password_hash=hash_password(TEACHER_PASSWORD),
                     full_name=name, role=UserRole.teacher)
             db.add(u)
             await db.flush()
             db.add(Teacher(user_id=u.id, specialties=spec, modalities=mods, bio=bio))
             await db.flush()  # Teacher debe existir antes de ser referenciado como FK
             teacher_ids[em] = u.id
-            print(f"Profesor: {em} / Profe2026!")
+            print(f"Profesor: {em}")
 
         # === 4. CURSOS ===
         courses_data = [
@@ -253,7 +279,7 @@ async def main():
         ]
         student_ids = {}
         for em, name, lvl_code, course_code in students_data:
-            u = User(email=em, password_hash=hash_password("Estudiante2026!"),
+            u = User(email=em, password_hash=hash_password(STUDENT_PASSWORD),
                     full_name=name, role=UserRole.student)
             db.add(u)
             await db.flush()
@@ -278,7 +304,7 @@ async def main():
                 level_id=level_id, teacher_id=assigned_teacher,
                 plan_id=assigned_plan_id,
             ))
-            print(f"Estudiante: {em} / Estudiante2026!")
+            print(f"Estudiante: {em}")
 
         # === 10. CLASES PROGRAMADAS (próximos 14 días) ===
         now = datetime.now(timezone.utc)
@@ -546,9 +572,9 @@ async def main():
         await db.commit()
 
         print("\n=== SEED COMPLETO ===")
-        print(f"ADMIN: {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
-        print(f"PROFES (Profe2026!): ana@dorismon.do, luis@dorismon.do, sara@dorismon.do")
-        print(f"ESTUDIANTES (Estudiante2026!): maria.estudiante@dorismon.do, carlos.estudiante@dorismon.do, juana.estudiante@dorismon.do")
+        print(f"ADMIN: {ADMIN_EMAIL}")
+        print("PROFES: ana@dorismon.do, luis@dorismon.do, sara@dorismon.do")
+        print("ESTUDIANTES: maria.estudiante@dorismon.do, carlos.estudiante@dorismon.do, juana.estudiante@dorismon.do")
 
 
 if __name__ == "__main__":

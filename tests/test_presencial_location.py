@@ -16,7 +16,7 @@ async def run():
         print(f"  {'✓' if cond else '✗'} {name}")
 
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
-        maria = (await c.post("/auth/login", json={"email":"maria.estudiante@dorismon.do","password":"Estudiante2026!"})).json().get("access_token")
+        maria = (await c.post("/auth/login", json={"email":"maria.estudiante@dorismon.do","password":"Estu-Test-4823!"})).json().get("access_token")
         MH = {"Authorization": f"Bearer {maria}"}
 
         # Dashboard: campo location presente en todas las clases

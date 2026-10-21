@@ -21,13 +21,13 @@ async def run():
         print(f"  {'✓' if cond else '✗'} {name}")
 
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
-        admin = await login(c, "admin@dorismon.do", "DorismonAdmin2026!")
+        admin = await login(c, "admin@dorismon.do", "Adm-Test-4821!")
         AH = {"Authorization": f"Bearer {admin}"}
 
         # Estudiante de prueba sin trial
-        stu = await login(c, "juana.estudiante@dorismon.do", "Estudiante2026!")
+        stu = await login(c, "juana.estudiante@dorismon.do", "Estu-Test-4823!")
         if not stu:
-            stu = await login(c, "carlos.estudiante@dorismon.do", "Estudiante2026!")
+            stu = await login(c, "carlos.estudiante@dorismon.do", "Estu-Test-4823!")
         SH = {"Authorization": f"Bearer {stu}"}
 
         # 1. Solicitar trial
@@ -41,7 +41,7 @@ async def run():
               dash.get("trial_info", {}).get("status") == "requested")
 
         # 3. Admin agenda CON link, en el pasado (para simular que ya pasó)
-        ana = await login(c, "ana@dorismon.do", "Profe2026!")
+        ana = await login(c, "ana@dorismon.do", "Prof-Test-4822!")
         ana_id = (await c.get("/auth/me", headers={"Authorization": f"Bearer {ana}"})).json()["id"]
         trials = (await c.get("/admin/trial-classes", headers=AH)).json()
         tlist = trials if isinstance(trials, list) else trials.get("items", [])
@@ -83,11 +83,11 @@ async def test_reschedule_visible_to_admin(base=None):
     from datetime import datetime, timezone, timedelta
     b = base or BASE
     async with httpx.AsyncClient(base_url=b, timeout=30) as c:
-        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"DorismonAdmin2026!"})).json()["access_token"]
+        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"Adm-Test-4821!"})).json()["access_token"]
         AH = {"Authorization": f"Bearer {admin}"}
-        stu = (await c.post("/auth/login", json={"email":"carlos.estudiante@dorismon.do","password":"Estudiante2026!"})).json()
+        stu = (await c.post("/auth/login", json={"email":"carlos.estudiante@dorismon.do","password":"Estu-Test-4823!"})).json()
         SH = {"Authorization": f"Bearer {stu['access_token']}"}
-        ana = (await c.post("/auth/login", json={"email":"ana@dorismon.do","password":"Profe2026!"})).json()["access_token"]
+        ana = (await c.post("/auth/login", json={"email":"ana@dorismon.do","password":"Prof-Test-4822!"})).json()["access_token"]
         ana_id = (await c.get("/auth/me", headers={"Authorization":f"Bearer {ana}"})).json()["id"]
 
         await c.post("/payments/trial-class/request", headers=SH, json={"modality":"online","preferred_level":"A2"})

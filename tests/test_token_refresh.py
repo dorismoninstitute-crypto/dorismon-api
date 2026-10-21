@@ -14,7 +14,7 @@ async def run():
         print(f"  {'✓' if cond else '✗'} {name}")
 
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
-        r = (await c.post("/auth/login", json={"email":"carlos.estudiante@dorismon.do","password":"Estudiante2026!"})).json()
+        r = (await c.post("/auth/login", json={"email":"carlos.estudiante@dorismon.do","password":"Estu-Test-4823!"})).json()
         access = r.get("access_token")
         refresh = r.get("refresh_token")
         check("login devuelve access + refresh", bool(access) and bool(refresh))

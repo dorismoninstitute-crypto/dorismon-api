@@ -14,9 +14,9 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
-PASS = "Estudiante2026!"
+PASS = "Estu-Test-4823!"
 LINK = "https://meet.google.com/v69-test-xy"
 
 
@@ -250,7 +250,7 @@ async def main():
                   rl.status_code == 200)
 
             # Simetría: el roster del profesor debe decir lo mismo
-            TH = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': luis['email'], 'password': 'Profe2026!'})).json()['access_token']}"}
+            TH = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': luis['email'], 'password': 'Prof-Test-4822!'})).json()['access_token']}"}
             rr = await c.get(f"/teacher/sessions/{cruz}/attendance", headers=TH)
             if rr.status_code == 200:
                 ids = {x.get("student_id") for x in rr.json().get("students", [])}

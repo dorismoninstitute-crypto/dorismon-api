@@ -28,19 +28,20 @@ Module (Grammar, Speaking, etc — configurables)
 Lesson (con video, PDF, audio, recursos)
 ```
 
-## Credenciales del seed inicial
+## Datos de desarrollo (seed)
+
+`python seed.py` crea cuentas **solo de desarrollo y pruebas** (admin, 3 profesores y 3 estudiantes
+con correos `@dorismon.do`). El seed **no trae contraseñas**: exige `ALLOW_DEV_SEED=true` y que definas tú
+`SEED_ADMIN_PASSWORD`, `SEED_TEACHER_PASSWORD` y `SEED_STUDENT_PASSWORD` (si falta alguna, se niega a correr). No imprime contraseñas.
 
 ```
-ADMIN:        admin@dorismon.do        / DorismonAdmin2026!
-PROFES (Profe2026!):
-  ana@dorismon.do
-  luis@dorismon.do
-  sara@dorismon.do
-ESTUDIANTES (Estudiante2026!):
-  maria.estudiante@dorismon.do  (B1)
-  carlos.estudiante@dorismon.do (A2)
-  juana.estudiante@dorismon.do  (A1)
+ADMIN:        admin@dorismon.do        / <SEED_ADMIN_PASSWORD>
+PROFES:       ana@ / luis@ / sara@dorismon.do                 / <SEED_TEACHER_PASSWORD>
+ESTUDIANTES:  maria.estudiante@ / carlos.estudiante@ / juana.estudiante@dorismon.do / <SEED_STUDENT_PASSWORD>
 ```
+
+**Producción:** el seed se niega a ejecutarse (Render / `ENVIRONMENT=production`). Las cuentas reales se
+crean con contraseñas propias. Ver `PENDIENTES_DEPLOY.md` antes de desplegar.
 
 ## Estructura
 

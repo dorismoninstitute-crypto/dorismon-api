@@ -18,13 +18,13 @@ async def run():
         print(f"  {'✓' if cond else '✗'} {name}")
 
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
-        admin = await login(c, "admin@dorismon.do", "DorismonAdmin2026!")
+        admin = await login(c, "admin@dorismon.do", "Adm-Test-4821!")
         AH = {"Authorization": f"Bearer {admin}"}
-        stu = await login(c, "maria.estudiante@dorismon.do", "Estudiante2026!")
+        stu = await login(c, "maria.estudiante@dorismon.do", "Estu-Test-4823!")
         if not stu:
-            stu = await login(c, "carlos.estudiante@dorismon.do", "Estudiante2026!")
+            stu = await login(c, "carlos.estudiante@dorismon.do", "Estu-Test-4823!")
         SH = {"Authorization": f"Bearer {stu}"}
-        ana = await login(c, "ana@dorismon.do", "Profe2026!")
+        ana = await login(c, "ana@dorismon.do", "Prof-Test-4822!")
         TH = {"Authorization": f"Bearer {ana}"}
 
         # Los 3 roles pueden ver notificaciones

@@ -14,7 +14,7 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
 HTTPS = "https://meet.google.com/v3970-valid"
 

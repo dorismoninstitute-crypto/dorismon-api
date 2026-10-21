@@ -18,7 +18,7 @@ async def run():
         check("primeros intentos dan 401", codes[0] == 401)
         check("tras 5 fallos bloquea con 429", 429 in codes)
         # Otro email no afectado
-        r = await c.post("/auth/login", json={"email": "ana@dorismon.do", "password": "Profe2026!"})
+        r = await c.post("/auth/login", json={"email": "ana@dorismon.do", "password": "Prof-Test-4822!"})
         check("otro usuario no se bloquea", r.status_code == 200)
 
     passed = sum(1 for _, c in results if c)

@@ -24,6 +24,12 @@ from app.core.db import init_db
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # v3.9.76 (P0): en producción, avisa (log CRÍTICO, sin bloquear) si quedan contraseñas de desarrollo
+    from app.core.config import is_production
+    if is_production():
+        import asyncio
+        from app.services.seguridad_arranque import auditar_cuentas_del_seed
+        asyncio.create_task(auditar_cuentas_del_seed())
     yield
 
 
@@ -45,15 +51,23 @@ else:
     _allowed_origins = [
         "https://dorismon.com",
         "https://www.dorismon.com",
-        "http://localhost:3000",
-        "http://localhost:3001",
+        "https://dorismon-web.vercel.app",
     ]
+    # v3.9.76 (P0): localhost solo en desarrollo; en producción NO se permite por defecto
+    from app.core.config import is_production as _es_produccion
+    if not _es_produccion():
+        _allowed_origins += ["http://localhost:3000", "http://localhost:3001"]
+
+# V3.9.74: los previews de Vercel NO quedan abiertos por defecto.
+# Si de verdad se necesitan para QA, se habilitan de forma explícita y solo
+# para previews cuyo nombre pertenece al proyecto Dorismon.
+_allow_vercel_previews = os.getenv("ALLOW_VERCEL_PREVIEWS", "false").lower() in {"1", "true", "yes"}
+_vercel_preview_regex = r"https://dorismon-web-[a-zA-Z0-9-]+\.vercel\.app" if _allow_vercel_previews else None
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    # Permitir cualquier preview deploy de Vercel (dorismon-web-*.vercel.app)
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=_vercel_preview_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
