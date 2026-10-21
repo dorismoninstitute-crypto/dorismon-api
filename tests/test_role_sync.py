@@ -21,9 +21,9 @@ def check(name, ok):
 
 async def main():
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
-        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"DorismonAdmin2026!"})).json()["access_token"]
+        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"Adm-Test-4821!"})).json()["access_token"]
         AH = {"Authorization": f"Bearer {admin}"}
-        ml = (await c.post("/auth/login", json={"email":"maria.estudiante@dorismon.do","password":"Estudiante2026!"})).json()
+        ml = (await c.post("/auth/login", json={"email":"maria.estudiante@dorismon.do","password":"Estu-Test-4823!"})).json()
         MH = {"Authorization": f"Bearer {ml['access_token']}"}
         mu = (await c.get("/admin/users?q=maria.estudiante", headers=AH)).json()
         maria_id = mu["items"][0]["id"]
@@ -38,7 +38,7 @@ async def main():
         seed_profes = [p for p in profes["items"] if p["email"] in ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")]
         profe = seed_profes[0] if seed_profes else profes["items"][0]
         tid, temail = profe["id"], profe["email"]
-        tl = (await c.post("/auth/login", json={"email": temail, "password":"Profe2026!"})).json()
+        tl = (await c.post("/auth/login", json={"email": temail, "password":"Prof-Test-4822!"})).json()
         TH = {"Authorization": f"Bearer {tl['access_token']}"}
         now_utc = datetime.datetime.now(datetime.timezone.utc)
 

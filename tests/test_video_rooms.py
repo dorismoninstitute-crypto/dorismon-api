@@ -23,8 +23,8 @@ import jwt
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
 SECRET = os.getenv("LIVEKIT_API_SECRET")
 
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
-STUDENT = {"email": "maria.estudiante@dorismon.do", "password": "Estudiante2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
+STUDENT = {"email": "maria.estudiante@dorismon.do", "password": "Estu-Test-4823!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
 
 
@@ -69,7 +69,7 @@ async def main():
         profes = (await c.get("/admin/users?role=teacher", headers=AH)).json()
         profe = [p for p in profes["items"] if p["email"] in SEED_TEACHERS][0]
 
-        ptok = (await c.post("/auth/login", json={"email": profe["email"], "password": "Profe2026!"})).json()
+        ptok = (await c.post("/auth/login", json={"email": profe["email"], "password": "Prof-Test-4822!"})).json()
         TH = {"Authorization": f"Bearer {ptok['access_token']}"}
         stok = (await c.post("/auth/login", json=STUDENT)).json()
         SH = {"Authorization": f"Bearer {stok['access_token']}"}
@@ -104,7 +104,10 @@ async def main():
         check("El profesor entra a su clase", r.status_code == 200)
         if r.status_code == 200:
             claims = jwt.decode(r.json()["token"], SECRET, algorithms=["HS256"])
-            check("El profesor puede administrar la sala", claims["video"].get("roomAdmin") is True)
+            # Actualizado en Gate 6G-B: el profesor modera por el backend; su token del
+            # navegador ya no lleva roomAdmin (mínimo privilegio). Sigue siendo moderador.
+            check("El profesor entra como moderador sin roomAdmin en el navegador",
+                  "roomAdmin" not in claims["video"] and r.json().get("is_moderator") is True)
 
         # El estudiante inscrito entra, pero sin poder administrar
         r2 = await c.post(f"/video/sessions/{mia}/join", headers=SH)

@@ -1325,3 +1325,137 @@ class PasswordReset(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class VideoAccessBlock(Base):
+    """GATE 6G-A — "Sacar de la clase" que dura TODA esa sesión.
+
+    Una sola fila por (clase, persona): el estado actual. Bloquear de nuevo a
+    alguien que ya tuvo permiso para volver REACTIVA la misma fila (no crea otra),
+    así nunca hay dos estados a la vez. La historia completa (cada bloqueo y cada
+    "Permitir volver", con quién y cuándo) queda en audit_logs.
+
+    No guarda tokens ni secretos. Tabla NUEVA y ADITIVA: no toca ninguna otra.
+    """
+    __tablename__ = "video_access_blocks"
+    __table_args__ = (
+        UniqueConstraint("session_id", "user_id", name="uq_video_access_block_session_user"),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    # True = no puede volver a entrar a ESTA clase; False = el profesor permitió volver
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    blocked_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    blocked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    unblocked_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    unblocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Cuántas veces se le ha sacado de esta clase (bloquear → permitir → bloquear = 2)
+    times_blocked: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+
+from sqlalchemy import BigInteger  # GATE 6H-A: tamaños de archivo > 2 GB
+
+
+class VideoRecording(Base):
+    """GATE 6H-A — Una grabación de una clase de Video Dorismon (LiveKit Egress).
+
+    No es una URL: es un proceso con estado. Estados (de LiveKit EgressStatus):
+      starting   → pedida a LiveKit, sin confirmar (EGRESS_STARTING)
+      recording  → LiveKit confirma que graba (EGRESS_ACTIVE)
+      stopping   → se pidió detener (aún sin respuesta del proveedor)
+      processing → LiveKit cierra y sube el archivo (EGRESS_ENDING)
+      ready      → archivo completo en el almacenamiento privado (EGRESS_COMPLETE con archivo)
+      failed     → error del proveedor o del almacenamiento (FAILED / ABORTED / LIMIT_REACHED)
+      deleted    → reservado para la retención futura (no se usa todavía)
+
+    `activa` vale el id de la clase mientras la grabación ocupa la sala (starting,
+    recording, stopping) y NULL después: la restricción ÚNICA impide dos grabaciones
+    activas de la misma clase aunque lleguen 10 peticiones a la vez.
+    Nunca guarda secretos ni URLs firmadas: solo bucket + clave del objeto.
+    """
+    __tablename__ = "video_recordings"
+    __table_args__ = (UniqueConstraint("activa", name="uq_video_recording_activa"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    activa: Mapped[str | None] = mapped_column(String, nullable=True)
+    provider: Mapped[str] = mapped_column(String(20), default="livekit", nullable=False)
+    egress_id: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="starting", nullable=False, index=True)
+    requested_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stop_requested_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    storage_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    storage_bucket: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    storage_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Retención: el modelo la admite; NO se borra nada automáticamente todavía.
+    retention_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class VideoRecordingAudience(Base):
+    """GATE 6H-A — Quién tenía derecho a ESA grabación, congelado al grabar.
+
+    Enrollment.series_id e is_active se EDITAN (no guardan historia): sin esta foto,
+    quien entrara al grupo meses después "heredaría" grabaciones anteriores, y un
+    cambio de grupo reescribiría el acceso histórico. Se llena al iniciar y al detener
+    (la misma regla que da acceso a la clase + quien entró por /join). Solo estudiantes;
+    profesor y Dirección se deciden por su rol al reproducir (6H-B).
+    """
+    __tablename__ = "video_recording_audience"
+    __table_args__ = (UniqueConstraint("recording_id", "user_id", name="uq_video_recording_audience"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    recording_id: Mapped[str] = mapped_column(ForeignKey("video_recordings.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    # "derecho" (le correspondía la clase) | "asistio" (entró por /join)
+    reason: Mapped[str] = mapped_column(String(20), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ClassSessionContent(Base):
+    """GATE 6F-B — Contenido educativo compartido en una clase de Video Dorismon:
+    vocabulario, frase, nota breve o enlace. Texto plano tal como lo escribió el profesor.
+    Editar no cambia la posición; ocultar retira sin borrar (sin hard delete)."""
+    __tablename__ = "class_session_content"
+    __table_args__ = (UniqueConstraint("session_id", "posicion", name="uq_class_content_posicion"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(12), nullable=False)        # vocabulario|frase|nota|enlace
+    texto: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    traduccion: Mapped[str | None] = mapped_column(String(300), nullable=True)  # significado (cualquier idioma)
+    ejemplo: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    posicion: Mapped[int] = mapped_column(Integer, nullable=False)      # orden cronológico estable
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hidden_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ClassSessionAudience(Base):
+    """GATE 6F-B — Quién PERTENECÍA a una clase. Foto acumulativa: se añade quien tenía
+    derecho o entró mientras la clase estaba en curso; nunca se recalcula ni se borra.
+    Autoridad para leer después el contenido de esa clase (no se mezcla con la audiencia por
+    grabación de 6H-A, que es por segmento)."""
+    __tablename__ = "class_session_audience"
+    __table_args__ = (UniqueConstraint("session_id", "user_id", name="uq_class_session_audience"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    session_id: Mapped[str] = mapped_column(ForeignKey("class_sessions.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    reason: Mapped[str] = mapped_column(String(20), nullable=False)      # derecho | asistio
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

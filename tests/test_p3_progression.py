@@ -15,7 +15,7 @@ import json
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 HAB = ["speaking", "listening", "reading", "writing"]
 
 
@@ -51,7 +51,7 @@ async def main():
                                ("p3.andrea@dorismon.do", "P3 Andrea")]:
             await c.post("/admin/users", headers=AH, json={
                 "email": correo, "full_name": nombre,
-                "password": "Profe2026!", "role": "teacher"})
+                "password": "Prof-Test-4822!", "role": "teacher"})
             b = (await c.get(f"/admin/users?q={correo.split('@')[0]}",
                              headers=AH)).json()
             if b.get("items"):
@@ -68,13 +68,13 @@ async def main():
                                ("p3.pedro@dorismon.do", "P3 Pedro")]:
             await c.post("/admin/users", headers=AH, json={
                 "email": correo, "full_name": nombre,
-                "password": "Estudiante2026!", "role": "student"})
+                "password": "Estu-Test-4823!", "role": "student"})
             b = (await c.get(f"/admin/users?q={correo.split('@')[0]}",
                              headers=AH)).json()
             if b.get("items"):
                 u = b["items"][0]
                 r = await c.post("/auth/login", json={"email": correo,
-                                                       "password": "Estudiante2026!"})
+                                                       "password": "Estu-Test-4823!"})
                 alumnos[nombre] = {
                     "id": u["id"],
                     "H": ({"Authorization": f"Bearer {r.json()['access_token']}"}
@@ -111,8 +111,8 @@ async def main():
                              json={"series_id": G["id"], "confirm_full": True})
         check("Se matriculan tres estudiantes en B1", len(enrs) == 3)
 
-        TC = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': CARLOS['email'], 'password': 'Profe2026!'})).json()['access_token']}"}
-        TAN = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': ANDREA['email'], 'password': 'Profe2026!'})).json()['access_token']}"}
+        TC = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': CARLOS['email'], 'password': 'Prof-Test-4822!'})).json()['access_token']}"}
+        TAN = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': ANDREA['email'], 'password': 'Prof-Test-4822!'})).json()['access_token']}"}
 
         # ══════════════════════════════════════════════════════════════════
         # ESTADO INICIAL: nadie es elegible
@@ -825,7 +825,7 @@ async def main():
             # profesor, no si queda cupo de matrículas.
             await c.post("/admin/users", headers=AH, json={
                 "email": "p3.sofia@dorismon.do", "full_name": "P3 Sofia",
-                "password": "Estudiante2026!", "role": "student"})
+                "password": "Estu-Test-4823!", "role": "student"})
             _bs = (await c.get("/admin/users?q=p3.sofia", headers=AH)).json()
             SOFIA = _bs["items"][0] if _bs.get("items") else None
 

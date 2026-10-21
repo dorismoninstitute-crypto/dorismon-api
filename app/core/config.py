@@ -19,6 +19,35 @@ def _normalize_db_url(url: str) -> str:
     return url
 
 
+def is_production() -> bool:
+    """¿Está corriendo en producción? Falla CERRADO: Render siempre define RENDER=true y eso
+    no se puede anular con ENVIRONMENT; fuera de Render, ENVIRONMENT=production/prod lo activa.
+    Local y tests: no definen ninguna de las dos."""
+    if os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    return (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or "").strip().lower() in {"production", "prod"}
+
+
+_SECRET_KEY_FALLBACK = "cambiar-en-produccion-usar-secreto-largo-y-aleatorio"
+_SECRET_KEY_MIN_LEN = 32
+
+
+def secret_key_valida(valor: str) -> bool:
+    """Una SECRET_KEY de producción no puede ser el valor de ejemplo/fallback conocido ni corta."""
+    v = (valor or "").strip()
+    return len(v) >= _SECRET_KEY_MIN_LEN and "cambiar" not in v.lower() and v != _SECRET_KEY_FALLBACK
+
+
+def exigir_configuracion_segura(secret_key: str, produccion: bool | None = None) -> None:
+    """En producción NO se arranca con el fallback conocido: se corta ANTES de firmar un solo JWT.
+    (No cambia ni lee el secreto real: solo valida el valor que ya está configurado.)"""
+    if (is_production() if produccion is None else produccion) and not secret_key_valida(secret_key):
+        raise RuntimeError(
+            "SECRET_KEY ausente o insegura en producción: define una clave aleatoria de al menos "
+            f"{_SECRET_KEY_MIN_LEN} caracteres (no el valor de ejemplo). El servicio no arranca."
+        )
+
+
 class Settings(BaseSettings):
     # Base de datos. En Render, esta variable la inyecta el servicio de Postgres.
     # Localmente, puedes usar SQLite: sqlite+aiosqlite:///./dorismon.db
@@ -26,7 +55,7 @@ class Settings(BaseSettings):
     REDIS_URL: str = "memory://"
 
     # Seguridad JWT
-    SECRET_KEY: str = "cambiar-en-produccion-usar-secreto-largo-y-aleatorio"
+    SECRET_KEY: str = _SECRET_KEY_FALLBACK   # solo desarrollo/tests: en producción se rechaza (ver abajo)
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -58,5 +87,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+exigir_configuracion_segura(settings.SECRET_KEY)   # producción: falla cerrado si falta una clave válida
 # Normalización aplicada DESPUÉS de cargar las variables
 settings.DATABASE_URL = _normalize_db_url(settings.DATABASE_URL)

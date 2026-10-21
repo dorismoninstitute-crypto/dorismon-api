@@ -9,7 +9,7 @@ from pydantic import BaseModel, EmailStr, Field
 from app.core.security import (
     hash_password, verify_password,
     create_access_token, create_refresh_token, decode_token,
-    get_current_user, CurrentUser,
+    get_current_user, CurrentUser, require_admin,
 )
 from app.core.db import get_db
 from app.models import User, Student, UserRole, Level
@@ -119,29 +119,34 @@ async def register(body: RegisterRequest, request: Request, db: AsyncSession = D
 
 
 @router.get("/email-service-status")
-async def email_service_status():
-    """V2.1.1: Endpoint público para verificar si el servicio de email está configurado.
+async def email_service_status(
+    user: Annotated[CurrentUser, Depends(require_admin)],
+):
+    """Estado del servicio de email. Solo Dirección/administración.
 
-    Útil para diagnóstico desde el frontend.
+    V3.9.74: antes era público y revelaba detalles operativos innecesarios.
     """
-    from app.services.email_service import is_email_configured, RESEND_API_KEY, EMAIL_FROM, APP_URL
+    from app.services.email_service import is_email_configured, EMAIL_FROM, APP_URL
     return {
         "configured": is_email_configured(),
         "from_address_set": bool(EMAIL_FROM),
         "app_url_set": bool(APP_URL),
-        "key_length": len(RESEND_API_KEY) if RESEND_API_KEY else 0,
     }
 
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
     # V2.9.3: Rate limiting — proteger contra ataques de adivinar contraseñas
-    from app.services.rate_limiter import check_rate_limit, register_failure, register_success
-    # Clave: IP + email (así un atacante no bloquea a otros usuarios fácilmente)
-    client_ip = request.client.host if request.client else "unknown"
-    rl_key = f"{client_ip}:{body.email.lower()}"
+    from app.services.rate_limiter import (
+        check_rate_limit, register_failure, register_success, claves_login, IP_MAX_ATTEMPTS)
+    # Claves por IP solo cuando la identidad del cliente es fiable. En Render la resolución usa
+    # CF-Connecting-IP; fuera de Render, conexión directa o proxies explícitamente administrados.
+    # Si la IP no puede demostrarse, no se crea un bucket compartido capaz de bloquear a terceros.
+    rl_key, ip_key = claves_login(request, body.email)
 
-    allowed, retry_after = check_rate_limit(rl_key)
+    allowed, retry_after = (check_rate_limit(rl_key) if rl_key else (True, 0))
+    if allowed and ip_key:
+        allowed, retry_after = check_rate_limit(ip_key)
     if not allowed:
         mins = max(1, retry_after // 60)
         raise HTTPException(
@@ -150,9 +155,19 @@ async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends
         )
 
     user = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
-    if not user or not verify_password(body.password, user.password_hash):
+    # GATE 4 — bcrypt (12 rondas, ~0,5 s de CPU) se ejecuta FUERA del event
+    # loop: antes congelaba al servidor entero mientras alguien iniciaba sesión.
+    # Misma función, mismo hash, misma regla (sin usuario no se verifica nada).
+    from fastapi.concurrency import run_in_threadpool
+    password_ok = bool(user) and await run_in_threadpool(
+        verify_password, body.password, user.password_hash)
+    if not user or not password_ok:
         # Registrar el intento fallido
-        locked, lock_secs = register_failure(rl_key)
+        locked, lock_secs = (register_failure(rl_key) if rl_key else (False, 0))
+        if ip_key:
+            ip_locked, ip_secs = register_failure(ip_key, IP_MAX_ATTEMPTS)
+            if ip_locked and not locked:
+                locked, lock_secs = True, ip_secs
         if locked:
             mins = max(1, lock_secs // 60)
             raise HTTPException(
@@ -163,8 +178,9 @@ async def login(body: LoginRequest, request: Request, db: AsyncSession = Depends
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cuenta desactivada")
 
-    # Login exitoso: limpiar el contador de intentos
-    register_success(rl_key)
+    # Login exitoso: limpiar el contador de intentos, si existía una identidad IP fiable.
+    if rl_key:
+        register_success(rl_key)
     user.last_login_at = datetime.now(tz.utc)
     await log_action(db, user.id, "login", "auth")
     await db.commit()
@@ -182,6 +198,8 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, payload["sub"])
     if not user:
         raise HTTPException(401, "Usuario no encontrado")
+    if not user.is_active:
+        raise HTTPException(403, "Cuenta desactivada")
     return TokenResponse(
         access_token=create_access_token(user.id, user.role.value),
         refresh_token=create_refresh_token(user.id),
@@ -457,13 +475,14 @@ async def forgot_password(
 
 
 @router.post("/test-email")
-async def test_email_endpoint(body: dict):
-    """V2.1.2: Endpoint público de diagnóstico — envía un email de prueba.
+async def test_email_endpoint(
+    body: dict,
+    user: Annotated[CurrentUser, Depends(require_admin)],
+):
+    """Envía un email de diagnóstico. Solo Dirección/administración.
 
-    USO: POST /auth/test-email con body {"to": "tu@email.com"}
-    Sirve para probar Resend SIN depender de usuarios existentes.
-
-    Logs detallados: si falla, los logs de Render te dicen exactamente por qué.
+    V3.9.74: este endpoint antes era público. Mantenerlo autenticado evita que
+    terceros usen la infraestructura de Dorismon para provocar envíos de correo.
     """
     import logging
     log = logging.getLogger(__name__)

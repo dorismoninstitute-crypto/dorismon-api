@@ -717,6 +717,18 @@ async def list_admin_sessions(
         )).all()
         trial_ids = {x for (x,) in _tr if x}
 
+    # GATE 1 — Cuántos estudiantes concretos tiene cada clase (SessionAudience).
+    # UNA consulta agrupada para toda la página, nunca una por clase. Las clases
+    # sin audiencia explícita quedan en 0 y se ven como siempre.
+    audiencia_por_clase = {}
+    if _ids:
+        from app.models import SessionAudience
+        audiencia_por_clase = dict((await db.execute(
+            select(SessionAudience.session_id, func.count())
+            .where(SessionAudience.session_id.in_(_ids))
+            .group_by(SessionAudience.session_id)
+        )).all())
+
     out = []
     for s in sessions:
         teacher_user = await db.get(User, s.teacher_id) if s.teacher_id else None
@@ -752,6 +764,7 @@ async def list_admin_sessions(
             # estaba asignado originalmente.
             "module_id": s.module_id,
             "scheduled_teacher_id": s.scheduled_teacher_id,
+            "audience_count": audiencia_por_clase.get(s.id, 0),  # GATE 1
         })
     return {"items": out, "page": page, "limit": limit, "filter_period": filter_period}
 
@@ -899,6 +912,18 @@ async def create_session(
         if invalidos:
             raise HTTPException(
                 400, f"No son estudiantes válidos: {', '.join(invalidos[:5])}")
+
+        # GATE 1 — Una clase NUEVA no se crea para una cuenta desactivada,
+        # aunque el ID llegue a mano por la API. Solo afecta a la creación:
+        # las audiencias históricas no se tocan.
+        inactivos = [
+            x for (x,) in (await db.execute(
+                select(User.id).where(User.id.in_(pedidos), User.is_active.is_(False))
+            )).all()
+        ] if pedidos else []
+        if inactivos:
+            raise HTTPException(
+                400, f"Estudiantes desactivados, no se pueden incluir: {', '.join(inactivos[:5])}")
 
         destinatarios = pedidos
 
@@ -2135,12 +2160,57 @@ async def update_session(
                     ClassSession.status != SessionStatus.cancelled,
                 )
             )).scalars().all()
+            # ══ V3.9.73 — VALIDAR CADA ESTADO FUTURO ANTES DE TOCARLO ══
+            #
+            # Una excepción futura puede tener una combinación distinta a la
+            # sesión actual. Ejemplo: la actual ya tiene sede, pero la del
+            # viernes no; propagar solo `modality=presencial` no puede dejar
+            # el viernes presencial SIN sede. Lo mismo aplica a proveedor
+            # externo sin enlace o aula de otra sede.
+            #
+            # Primero calculamos y validamos TODOS los estados prospectivos.
+            # Solo si todos son coherentes se aplican las mutaciones. Así la
+            # operación es atómica: o quedan todas válidas, o no cambia ninguna.
+            claves_config = {"modality", "meeting_url", "video_provider",
+                             "branch_id", "classroom_id"}
+            plan_valido = []
             for otra in posteriores:
+                mod_futura = (Modality(pedidos["modality"])
+                              if "modality" in pedidos else otra.modality)
+                vp_futuro = ("dorismon" if pedidos.get("video_provider") == "dorismon" else "meet") \
+                    if "video_provider" in pedidos else (getattr(otra, "video_provider", "meet") or "meet")
+                url_futura = pedidos.get("meeting_url", otra.meeting_url)
+                sede_futura = pedidos.get("branch_id", otra.branch_id)
+                aula_futura = pedidos.get("classroom_id", otra.classroom_id)
+
+                sede_norm, aula_norm = sede_futura, aula_futura
+                if claves_config.intersection(pedidos):
+                    try:
+                        sede_norm, aula_norm = await _validar_config_clase(
+                            db, modalidad=mod_futura, video_provider=vp_futuro,
+                            meeting_url=url_futura, branch_id=sede_futura,
+                            classroom_id=aula_futura)
+                    except HTTPException as exc:
+                        _fecha = otra.starts_at_utc.isoformat() if otra.starts_at_utc else otra.id
+                        _detalle = exc.detail
+                        if isinstance(_detalle, dict):
+                            _detalle = _detalle.get("mensaje") or str(_detalle)
+                        raise HTTPException(
+                            exc.status_code,
+                            f"No se puede aplicar el cambio a la clase {_fecha}: {_detalle}"
+                        )
+                plan_valido.append((otra, sede_norm, aula_norm))
+
+            for otra, sede_norm, aula_norm in plan_valido:
                 for field, value in pedidos.items():
                     if field == "modality":
                         otra.modality = Modality(value)
                     elif field == "video_provider":
                         otra.video_provider = "dorismon" if value == "dorismon" else "meet"
+                    elif field == "branch_id":
+                        otra.branch_id = sede_norm
+                    elif field == "classroom_id":
+                        otra.classroom_id = aula_norm
                     else:
                         setattr(otra, field, value)
                 siguientes_tocadas += 1
@@ -3665,6 +3735,23 @@ async def delete_class_series(
             await db.delete(sess)
         s.is_active = False
     else:
+        # v3.9.76 (D1): una serie con información asociada NO se elimina. En PostgreSQL las FK lo
+        # rechazaban con un 500; en SQLite quedaban filas huérfanas. No se borra, desvincula ni
+        # modifica nada: se informa (una sola consulta con todas las dependencias).
+        from app.models import ActivityAudience
+        dependencias = (await db.execute(select(*[
+            select(func.count()).select_from(m).where(m.series_id == series_id).scalar_subquery()
+            for m in (Enrollment, Quiz, Assignment, Material, ActivityAudience)
+        ]))).one()
+        nombres = ("matrícula(s)", "quiz(zes)", "tarea(s)", "material(es)", "asignación(es) de actividades")
+        asociado = [f"{n} {nombre}" for n, nombre in zip(dependencias, nombres) if n]
+        if asociado:
+            raise HTTPException(
+                409,
+                "No se puede eliminar esta serie: tiene información asociada ("
+                + ", ".join(asociado) + "). Puedes eliminar solo las clases futuras (la serie queda "
+                "desactivada) o reasignar o quitar esa información primero.",
+            )
         # Eliminar TODAS las clases de la serie
         all_sessions = (await db.execute(
             select(ClassSession).where(ClassSession.series_id == series_id)
@@ -5080,6 +5167,19 @@ async def list_payment_proofs(
     ]
 
 
+
+async def _enviar_email_pago_despues_del_commit(pendiente):
+    """Hotfix de auditoría: el email de aprobación/rechazo se envía DESPUÉS de confirmar la transacción y es
+    best-effort: si falla, la decisión ya confirmada NO se revierte ni cambia la respuesta."""
+    if not pendiente:
+        return
+    try:
+        from app.services.email_service import send_email
+        to, subject, html = pendiente
+        await send_email(to=to, subject=subject, html=html)
+    except Exception:
+        pass
+
 @router.post("/payment-proofs/{proof_id}/approve")
 async def approve_payment_proof(
     proof_id: str,
@@ -5129,6 +5229,20 @@ async def approve_payment_proof(
     if not level_id or not course_id:
         raise HTTPException(400, "No se pudo determinar curso/nivel. Configura nivel y curso por defecto.")
 
+    # v3.9.76 (P0): RECLAMO ATÓMICO. Antes se leía "pending" sin bloqueo y dos aprobaciones a la vez
+    # creaban DOS inscripciones, DOS pagos, DOS avisos y DOS auditorías. Ahora solo una petición pasa
+    # de pending → approved; la otra espera (PostgreSQL) a que la primera confirme y recibe 400.
+    # Todo lo siguiente va en la misma transacción: si algo falla, el reclamo también se revierte.
+    from sqlalchemy import update as sa_update
+    reclamo = await db.execute(
+        sa_update(PaymentProof)
+        .where(PaymentProof.id == proof_id, PaymentProof.status == PaymentProofStatus.pending)
+        .values(status=PaymentProofStatus.approved)
+        .execution_options(synchronize_session=False))
+    if reclamo.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(400, "Esta prueba ya fue procesada")
+
     # 1. Crear inscripción
     enrollment = Enrollment(
         student_id=proof.student_id,
@@ -5176,9 +5290,11 @@ async def approve_payment_proof(
         link="/dashboard/student",
     ))
 
-    # 6. Email de confirmación
+    # 6. Email de confirmación: se PREPARA aquí pero se ENVÍA después del commit (hotfix de auditoría):
+    # nunca debe llegar un "pago aprobado" si la transacción no se confirma.
+    email_pendiente = None
     try:
-        from app.services.email_service import send_email, is_email_configured, _base_html
+        from app.services.email_service import is_email_configured, _base_html
         if is_email_configured() and student_user.email:
             html = _base_html(f"""
                 <h2>¡Hola, {student_user.full_name}! 🎉</h2>
@@ -5197,18 +5313,16 @@ async def approve_payment_proof(
                     Pronto te asignaremos un profesor y empezarán tus clases. Te avisamos por email cuando esté listo.
                 </p>
             """)
-            await send_email(
-                to=student_user.email,
-                subject="✅ Pago confirmado — Inscripción activa | Dorismon",
-                html=html,
-            )
+            email_pendiente = (student_user.email, "✅ Pago confirmado — Inscripción activa | Dorismon", html)
     except Exception:
-        pass  # No bloquear si email falla
+        email_pendiente = None  # No bloquear si no se puede preparar el email
 
     await log_action(db, admin.user_id, "approve_payment_proof", "admin", target_id=proof_id,
                      details=f"enrollment={enrollment.id}")
+    enrollment_id = enrollment.id
     await db.commit()
-    return {"ok": True, "enrollment_id": enrollment.id}
+    await _enviar_email_pago_despues_del_commit(email_pendiente)
+    return {"ok": True, "enrollment_id": enrollment_id}
 
 
 @router.post("/payment-proofs/{proof_id}/reject")
@@ -5229,6 +5343,17 @@ async def reject_payment_proof(
     if proof.status != PaymentProofStatus.pending:
         raise HTTPException(400, f"Esta prueba ya está {proof.status.value}")
 
+    # v3.9.76 (P0): mismo reclamo atómico que en aprobar (aprobar y rechazar a la vez: un solo ganador)
+    from sqlalchemy import update as sa_update
+    reclamo = await db.execute(
+        sa_update(PaymentProof)
+        .where(PaymentProof.id == proof_id, PaymentProof.status == PaymentProofStatus.pending)
+        .values(status=PaymentProofStatus.rejected)
+        .execution_options(synchronize_session=False))
+    if reclamo.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(400, "Esta prueba ya fue procesada")
+
     proof.status = PaymentProofStatus.rejected
     proof.admin_notes = reason
     proof.reviewed_by_admin_id = admin.user_id
@@ -5244,9 +5369,10 @@ async def reject_payment_proof(
         link="/dashboard/student/payments",
     ))
 
-    # Email
+    # Email: preparado aquí, enviado DESPUÉS del commit (hotfix de auditoría)
+    email_pendiente = None
     try:
-        from app.services.email_service import send_email, is_email_configured, _base_html
+        from app.services.email_service import is_email_configured, _base_html
         if is_email_configured() and student_user and student_user.email:
             html = _base_html(f"""
                 <h2>Hola, {student_user.full_name}</h2>
@@ -5263,17 +5389,14 @@ async def reject_payment_proof(
                     Si crees que hay un error, escríbenos por la sección Ayuda de la plataforma.
                 </p>
             """)
-            await send_email(
-                to=student_user.email,
-                subject="No pudimos verificar tu pago | Dorismon",
-                html=html,
-            )
+            email_pendiente = (student_user.email, "No pudimos verificar tu pago | Dorismon", html)
     except Exception:
-        pass
+        email_pendiente = None
 
     await log_action(db, admin.user_id, "reject_payment_proof", "admin", target_id=proof_id,
                      details=reason[:100])
     await db.commit()
+    await _enviar_email_pago_despues_del_commit(email_pendiente)
     return {"ok": True}
 
 
@@ -6022,6 +6145,21 @@ async def clean_operational_data(
             ],
             "instrucciones": "Para borrar de verdad, envía dry_run=false y confirm='BORRAR DATOS DE PRUEBA'",
         }
+
+    # v3.9.76 (P0): en PRODUCCIÓN el borrado real está DESHABILITADO por defecto (falla cerrado). Borra
+    # matrículas, clases, series, asistencias, comprobantes y pagos a profesores: una cuenta de Dirección
+    # comprometida o un descuido serían irreversibles. Solo se habilita para una limpieza deliberada de
+    # lanzamiento, definiendo ALLOW_DESTRUCTIVE_MAINTENANCE=true y retirándola después. La simulación
+    # (dry_run) sigue disponible porque no borra nada.
+    import os as _os
+    from app.core.config import is_production
+    if is_production() and _os.getenv("ALLOW_DESTRUCTIVE_MAINTENANCE", "").strip().lower() not in {"1", "true", "yes"}:
+        raise HTTPException(
+            403,
+            "El borrado de datos operativos está deshabilitado en producción. Usa dry_run=true para ver "
+            "qué se borraría; para una limpieza de lanzamiento deliberada hay que habilitarlo explícitamente "
+            "en la configuración del servidor.",
+        )
 
     # EJECUCIÓN REAL: requiere confirmación exacta
     if confirm != "BORRAR DATOS DE PRUEBA":

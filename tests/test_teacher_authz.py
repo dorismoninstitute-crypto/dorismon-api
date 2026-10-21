@@ -11,11 +11,11 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
 ESTUDIANTES = [
-    {"email": "maria.estudiante@dorismon.do", "password": "Estudiante2026!"},
-    {"email": "carlos.estudiante@dorismon.do", "password": "Estudiante2026!"},
+    {"email": "maria.estudiante@dorismon.do", "password": "Estu-Test-4823!"},
+    {"email": "carlos.estudiante@dorismon.do", "password": "Estu-Test-4823!"},
 ]
 
 
@@ -87,10 +87,10 @@ async def main():
                                                "confirm_full": True})
 
         ta = (await c.post("/auth/login", json={"email": PA["email"],
-                                                 "password": "Profe2026!"})).json()
+                                                 "password": "Prof-Test-4822!"})).json()
         TA = {"Authorization": f"Bearer {ta['access_token']}"}
         tb = (await c.post("/auth/login", json={"email": PB["email"],
-                                                 "password": "Profe2026!"})).json()
+                                                 "password": "Prof-Test-4822!"})).json()
         TB = {"Authorization": f"Bearer {tb['access_token']}"}
 
         # ---------- 1. GRUPO AJENO ----------

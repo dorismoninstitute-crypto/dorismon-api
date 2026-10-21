@@ -152,15 +152,20 @@ async def inbox(
     user: Annotated[CurrentUser, Depends(get_current_user)],
     db: AsyncSession = Depends(get_db),
 ):
-    """V2.0: Mensajes recibidos por el usuario."""
-    messages = (await db.execute(
-        select(Message).where(Message.to_user_id == user.user_id)
+    """V2.0: Mensajes recibidos por el usuario.
+
+    V3.9.76 — Mensaje + remitente en UNA consulta (antes: 1 consulta por
+    mensaje). OUTER JOIN para conservar el mismo "—" si faltara el remitente.
+    """
+    rows = (await db.execute(
+        select(Message, User)
+        .outerjoin(User, User.id == Message.from_user_id)
+        .where(Message.to_user_id == user.user_id)
         .order_by(Message.created_at.desc()).limit(100)
-    )).scalars().all()
+    )).all()
 
     out = []
-    for m in messages:
-        sender = await db.get(User, m.from_user_id)
+    for m, sender in rows:
         out.append({
             "id": m.id,
             "from_user_id": m.from_user_id,
@@ -185,14 +190,19 @@ async def sent(
     user: Annotated[CurrentUser, Depends(get_current_user)],
     db: AsyncSession = Depends(get_db),
 ):
-    """V2.0: Mensajes enviados por el usuario."""
-    messages = (await db.execute(
-        select(Message).where(Message.from_user_id == user.user_id)
+    """V2.0: Mensajes enviados por el usuario.
+
+    V3.9.76 — Mensaje + destinatario en UNA consulta. OUTER JOIN obligatorio:
+    `to_user_id` puede ser NULL y esos mensajes deben seguir apareciendo.
+    """
+    rows = (await db.execute(
+        select(Message, User)
+        .outerjoin(User, User.id == Message.to_user_id)
+        .where(Message.from_user_id == user.user_id)
         .order_by(Message.created_at.desc()).limit(100)
-    )).scalars().all()
+    )).all()
     out = []
-    for m in messages:
-        recipient = await db.get(User, m.to_user_id) if m.to_user_id else None
+    for m, recipient in rows:
         out.append({
             "id": m.id,
             "to_user_id": m.to_user_id,

@@ -14,7 +14,7 @@ async def run():
         reg = await c.post("/auth/register", json={"email": email, "password": "Test2026!", "full_name": "Conv Test"})
         check("registro público crea cuenta", reg.status_code == 201)
 
-        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"DorismonAdmin2026!"})).json()["access_token"]
+        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"Adm-Test-4821!"})).json()["access_token"]
         AH = {"Authorization": f"Bearer {admin}"}
 
         dup = await c.post("/admin/users", headers=AH, json={"email": email, "password":"x","full_name":"x","role":"teacher"})
@@ -60,7 +60,7 @@ async def run_archived():
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
         email = f"arch{random.randint(10000,99999)}@gmail.com"
         await c.post("/auth/register", json={"email": email, "password": "Test2026!", "full_name": "Arch Test"})
-        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"DorismonAdmin2026!"})).json()["access_token"]
+        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"Adm-Test-4821!"})).json()["access_token"]
         AH = {"Authorization": f"Bearer {admin}"}
         before = (await c.get("/admin/users?role=student", headers=AH)).json()
         before_count = before.get("total", len(before.get("items", [])))
@@ -90,7 +90,7 @@ async def run_block_history():
         results.append((name, cond))
         print(f"  {'✓' if cond else '✗'} {name}")
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as c:
-        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"DorismonAdmin2026!"})).json()["access_token"]
+        admin = (await c.post("/auth/login", json={"email":"admin@dorismon.do","password":"Adm-Test-4821!"})).json()["access_token"]
         AH = {"Authorization": f"Bearer {admin}"}
         # Estudiante con clases (maria del seed) → bloqueado
         u = (await c.get("/admin/users?q=maria.estudiante", headers=AH)).json()

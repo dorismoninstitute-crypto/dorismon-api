@@ -16,12 +16,12 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
 # Se usa a Juana a propósito: María y Carlos los usan otros tests, y este
 # escenario le CAMBIA el curso a su matrícula. Un test no debe dejar el
 # terreno alterado para los demás.
-JUAN = {"email": "juana.estudiante@dorismon.do", "password": "Estudiante2026!"}
+JUAN = {"email": "juana.estudiante@dorismon.do", "password": "Estu-Test-4823!"}
 
 
 async def main():
@@ -66,7 +66,7 @@ async def main():
                                ("me.profb@dorismon.do", "ME Profesor Spanish")]:
             r = await c.post("/admin/users", headers=AH, json={
                 "email": correo, "full_name": nombre,
-                "password": "Profe2026!", "role": "teacher",
+                "password": "Prof-Test-4822!", "role": "teacher",
             })
             # El endpoint solo devuelve el id, así que en ambos casos se
             # busca el usuario para tener también su email.
@@ -140,10 +140,10 @@ async def main():
                          headers=AH, json={"series_id": GS["id"], "confirm_full": True})
 
         ta = (await c.post("/auth/login", json={"email": PA["email"],
-                                                 "password": "Profe2026!"})).json()
+                                                 "password": "Prof-Test-4822!"})).json()
         TA = {"Authorization": f"Bearer {ta['access_token']}"}
         tb = (await c.post("/auth/login", json={"email": PB["email"],
-                                                 "password": "Profe2026!"})).json()
+                                                 "password": "Prof-Test-4822!"})).json()
         TB = {"Authorization": f"Bearer {tb['access_token']}"}
 
         # ══ SOLO EN SPANISH: 3 tareas vencidas sin entregar ══

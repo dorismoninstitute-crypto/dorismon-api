@@ -16,9 +16,9 @@ import datetime
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 SEED_TEACHERS = ("ana@dorismon.do", "luis@dorismon.do", "sara@dorismon.do")
-PASS = "Estudiante2026!"
+PASS = "Estu-Test-4823!"
 LINK = "https://meet.google.com/aud-itor-ia1"
 
 
@@ -46,7 +46,7 @@ async def main():
         _sd = (await c.get("/admin/branches", headers=AH)).json()
         _sd = _sd.get("items", _sd) if isinstance(_sd, dict) else _sd
         SEDE = _sd[0]["id"]
-        TH = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': profe['email'], 'password': 'Profe2026!'})).json()['access_token']}"}
+        TH = {"Authorization": f"Bearer {(await c.post('/auth/login', json={'email': profe['email'], 'password': 'Prof-Test-4822!'})).json()['access_token']}"}
 
         now = datetime.datetime.now(datetime.timezone.utc)
 

@@ -16,7 +16,7 @@ import sqlite3
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
-ADMIN = {"email": "admin@dorismon.do", "password": "DorismonAdmin2026!"}
+ADMIN = {"email": "admin@dorismon.do", "password": "Adm-Test-4821!"}
 DB = "dorismon.db"
 
 
@@ -55,14 +55,14 @@ async def main():
         # Estudiante propio
         await c.post("/admin/users", headers=AH, json={
             "email": "rep.juan@dorismon.do", "full_name": "REP Juan",
-            "password": "Estudiante2026!", "role": "student"})
+            "password": "Estu-Test-4823!", "role": "student"})
         b = (await c.get("/admin/users?q=rep.juan", headers=AH)).json()
         if not b.get("items"):
             print("  (no se creó el estudiante)")
             return 0
         JID = b["items"][0]["id"]
         jl = await c.post("/auth/login", json={"email": "rep.juan@dorismon.do",
-                                                "password": "Estudiante2026!"})
+                                                "password": "Estu-Test-4823!"})
         JH = {"Authorization": f"Bearer {jl.json()['access_token']}"}
 
         # Módulo con lecciones

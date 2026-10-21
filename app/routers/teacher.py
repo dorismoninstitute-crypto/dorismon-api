@@ -20,6 +20,47 @@ from app.models import (
 router = APIRouter(prefix="/teacher", tags=["teacher"])
 
 
+async def _ubicaciones_en_bloque(db: AsyncSession, sesiones) -> dict:
+    """GATE 2 — Sede/aula de varias clases con 2-3 consultas en total (no N+1).
+
+    Devuelve {session_id: ubicación} con la MISMA forma que `_build_location`
+    del estudiante (branch_name, address, phone, classroom_name, maps_url).
+    Solo para clases presenciales o híbridas: una online no muestra ubicación
+    aunque conserve una sede de una configuración anterior.
+    """
+    from urllib.parse import quote
+    con_sitio = [s for s in sesiones
+                 if getattr(s.modality, "value", s.modality) in ("presencial", "hibrida")
+                 and (s.branch_id or s.classroom_id)]
+    if not con_sitio:
+        return {}
+    aulas = {a.id: a for a in (await db.execute(
+        select(Classroom).where(Classroom.id.in_({s.classroom_id for s in con_sitio if s.classroom_id}))
+    )).scalars().all()}
+    ids_sedes = {s.branch_id for s in con_sitio if s.branch_id} | \
+                {a.branch_id for a in aulas.values() if a.branch_id}
+    sedes = {b.id: b for b in (await db.execute(
+        select(Branch).where(Branch.id.in_(ids_sedes))
+    )).scalars().all()} if ids_sedes else {}
+    out = {}
+    for s in con_sitio:
+        aula = aulas.get(s.classroom_id) if s.classroom_id else None
+        sede = sedes.get(s.branch_id) if s.branch_id else None
+        if aula and not sede and aula.branch_id:
+            sede = sedes.get(aula.branch_id)
+        if not sede and not aula:
+            continue
+        out[s.id] = {
+            "branch_name": sede.name if sede else None,
+            "address": sede.address if sede else None,
+            "phone": sede.phone if sede else None,
+            "classroom_name": aula.name if aula else None,
+            "maps_url": (f"https://www.google.com/maps/search/?api=1&query={quote(sede.name + ' ' + sede.address)}"
+                         if sede and sede.address else None),
+        }
+    return out
+
+
 
 
 def _tipo_tarea(valor) -> AssignmentKind:
@@ -126,8 +167,19 @@ async def teacher_dashboard(
     now = datetime.now(tz.utc)
     week_ahead = now + timedelta(days=7)
 
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + timedelta(days=1)
+    # ══ GATE 0 — EL "HOY" DEL PROFESOR ES EL DÍA DE SANTO DOMINGO ══
+    #
+    # Antes "hoy" era la medianoche UTC, o sea las 8:00 PM en RD: una clase de
+    # 7:50 PM desaparecía del panel a las 8:00 PM aunque siguiera en curso, y
+    # una de 8:00 PM no aparecía antes de empezar. Ahora el día se calcula con
+    # la zona horaria real y sus límites se convierten a UTC para consultar.
+    from zoneinfo import ZoneInfo
+    from app.services.livekit_service import MINUTOS_ANTES, MINUTOS_GRACIA_FINAL
+    ahora_rd = now.astimezone(ZoneInfo("America/Santo_Domingo"))
+    inicio_dia_rd = ahora_rd.replace(hour=0, minute=0, second=0, microsecond=0)
+    fin_dia_rd = (inicio_dia_rd + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = inicio_dia_rd.astimezone(tz.utc)
+    today_end = fin_dia_rd.astimezone(tz.utc)
 
     # Filtro: si es teacher solo lo suyo; admin ve agregado
     base_filter = (ClassSession.teacher_id == teacher.user_id) if teacher.role == "teacher" else True
@@ -135,8 +187,18 @@ async def teacher_dashboard(
     today_classes = (await db.execute(
         select(ClassSession).where(
             base_filter,
-            ClassSession.starts_at_utc >= today_start,
-            ClassSession.starts_at_utc < today_end,
+            or_(
+                and_(
+                    ClassSession.starts_at_utc >= today_start,
+                    ClassSession.starts_at_utc < today_end,
+                ),
+                # Una clase cuya sala está abierta AHORA (misma ventana que
+                # /video/.../join) sigue visible aunque cruce el cambio de día.
+                and_(
+                    ClassSession.starts_at_utc <= now + timedelta(minutes=MINUTOS_ANTES),
+                    ClassSession.ends_at_utc >= now - timedelta(minutes=MINUTOS_GRACIA_FINAL),
+                ),
+            ),
             ClassSession.status == SessionStatus.scheduled,
         ).order_by(ClassSession.starts_at_utc)
     )).scalars().all()
@@ -182,11 +244,28 @@ async def teacher_dashboard(
         )).all()
         trial_session_ids = {x for (x,) in trial_rows if x}
 
+    # V3.9.76 — Profesores y niveles de las clases de hoy precargados en bloque
+    # (antes: 2 consultas por clase). El filtro de "hoy" NO cambia aquí.
+    _ids_profes_hoy = {s.teacher_id for s in today_classes if s.teacher_id}
+    _profes_hoy = {
+        t.id: t for t in (await db.execute(
+            select(User).where(User.id.in_(_ids_profes_hoy))
+        )).scalars().all()
+    } if _ids_profes_hoy else {}
+    _ids_niveles_hoy = {s.level_id for s in today_classes if s.level_id}
+    _niveles_hoy = {
+        lv.id: lv for lv in (await db.execute(
+            select(Level).where(Level.id.in_(_ids_niveles_hoy))
+        )).scalars().all()
+    } if _ids_niveles_hoy else {}
+    # GATE 2 — Ubicación de las presenciales/híbridas de hoy, en bloque.
+    _ubic_hoy = await _ubicaciones_en_bloque(db, today_classes)
+
     today_data = []
     for s in today_classes:
-        teacher_user = await db.get(User, s.teacher_id)
+        teacher_user = _profes_hoy.get(s.teacher_id)
         # V1.8: agregar más info útil
-        level = await db.get(Level, s.level_id) if s.level_id else None
+        level = _niveles_hoy.get(s.level_id) if s.level_id else None
         today_data.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
@@ -199,6 +278,7 @@ async def teacher_dashboard(
             "is_open_event": bool(s.is_open_event),  # V3.9.19: para etiqueta 🎉
             "is_trial": s.id in trial_session_ids,  # V3.9.21: para etiqueta 🎯 Prueba
             "video_provider": getattr(s, "video_provider", "meet") or "meet",  # V3.9.26
+            "location": _ubic_hoy.get(s.id),  # GATE 2 — solo presencial/híbrida
         })
 
     # V1.8: Próximas clases de la semana (no solo hoy)
@@ -208,17 +288,42 @@ async def teacher_dashboard(
             ClassSession.starts_at_utc >= today_end,
             ClassSession.starts_at_utc < week_ahead,
             ClassSession.status == SessionStatus.scheduled,
+            # GATE 0 — Si ya está en "hoy" (sala abierta justo tras la
+            # medianoche de RD), no se repite en "Próximas en la semana".
+            ClassSession.id.not_in(today_ids) if today_ids else True,
         ).order_by(ClassSession.starts_at_utc).limit(10)
     )).scalars().all()
+    # V3.9.76 — Niveles de las próximas clases precargados en bloque.
+    _ids_niveles_sem = {s.level_id for s in week_classes_q if s.level_id}
+    _niveles_sem = {
+        lv.id: lv for lv in (await db.execute(
+            select(Level).where(Level.id.in_(_ids_niveles_sem))
+        )).scalars().all()
+    } if _ids_niveles_sem else {}
+    # GATE 1 — Estudiantes concretos (SessionAudience) de las clases de "hoy" y
+    # "próximas": UNA consulta agrupada para ambas listas. 0 = clase normal.
+    _ids_audiencia = list(today_ids) + [s.id for s in week_classes_q]
+    _audiencia = {}
+    if _ids_audiencia:
+        from app.models import SessionAudience
+        _audiencia = dict((await db.execute(
+            select(SessionAudience.session_id, func.count())
+            .where(SessionAudience.session_id.in_(_ids_audiencia))
+            .group_by(SessionAudience.session_id)
+        )).all())
+    for item in today_data:
+        item["audience_count"] = _audiencia.get(item["id"], 0)
+
     week_schedule = []
     for s in week_classes_q:
-        level = await db.get(Level, s.level_id) if s.level_id else None
+        level = _niveles_sem.get(s.level_id) if s.level_id else None
         week_schedule.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
             "starts_at_utc": s.starts_at_utc.isoformat(),
             "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
             "level_code": level.code if level else None,
             "is_private": s.student_id is not None,
+            "audience_count": _audiencia.get(s.id, 0),  # GATE 1
         })
 
     # V1.8: Distribución de estudiantes por nivel
@@ -252,20 +357,33 @@ async def teacher_dashboard(
                 Enrollment.is_active.is_(True),
             )
         )).all()
-        for stu, e, l in my_students_q:
-            # Asistencia del estudiante en mis clases
-            att_rows = (await db.execute(
-                select(SessionAttendance.state)
+        # V3.9.76 — Asistencia de TODOS mis estudiantes en una sola consulta
+        # agregada (antes: una consulta por estudiante). Criterio idéntico:
+        #   total   = TODAS las filas de asistencia en mis clases (incluye
+        #             filas con estado NULL, igual que antes con len()).
+        #   present = solo state == present (late NO cuenta, igual que antes).
+        _ids_mis_est = {stu.id for stu, _, _ in my_students_q}
+        _asist = {}
+        if _ids_mis_est:
+            for sid, total_, present_ in (await db.execute(
+                select(
+                    SessionAttendance.student_id,
+                    func.count(),
+                    func.count().filter(SessionAttendance.state == AttendanceState.present),
+                )
                 .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
                 .where(
-                    SessionAttendance.student_id == stu.id,
+                    SessionAttendance.student_id.in_(_ids_mis_est),
                     ClassSession.teacher_id == teacher.user_id,
                 )
-            )).all()
-            total = len(att_rows)
+                .group_by(SessionAttendance.student_id)
+            )).all():
+                _asist[sid] = (total_, present_)
+        for stu, e, l in my_students_q:
+            # Asistencia del estudiante en mis clases
+            total, present = _asist.get(stu.id, (0, 0))
             if total < 3:
                 continue  # ignorar si tiene menos de 3 clases tomadas (poca data)
-            present = sum(1 for (s,) in att_rows if s == AttendanceState.present)
             pct = round((present / total) * 100, 1)
             if pct < 70:
                 students_at_risk.append({
@@ -337,14 +455,28 @@ async def my_sessions(
 
     stmt = stmt.limit(100)
     sessions = (await db.execute(stmt)).scalars().all()
+    # V3.9.76 — Cursos y niveles precargados en bloque (antes: 2 consultas
+    # por sesión). Mismo filtro y mismo contrato.
+    _ids_cursos = {s.course_id for s in sessions if s.course_id}
+    _cursos = {
+        c.id: c for c in (await db.execute(
+            select(Course).where(Course.id.in_(_ids_cursos))
+        )).scalars().all()
+    } if _ids_cursos else {}
+    _ids_niveles = {s.level_id for s in sessions if s.level_id}
+    _niveles = {
+        lv.id: lv for lv in (await db.execute(
+            select(Level).where(Level.id.in_(_ids_niveles))
+        )).scalars().all()
+    } if _ids_niveles else {}
     out = []
     for s in sessions:
         # V2.9.2: NO mostrar clases canceladas en "Mis clases"
         # (evita que el profe vea/pase asistencia en clases que ya no existen)
         if s.status == SessionStatus.cancelled:
             continue
-        course = await db.get(Course, s.course_id)
-        level = await db.get(Level, s.level_id)
+        course = _cursos.get(s.course_id)
+        level = _niveles.get(s.level_id)
         starts = s.starts_at_utc if s.starts_at_utc.tzinfo else s.starts_at_utc.replace(tzinfo=tz.utc)
         out.append({
             "id": s.id, "title": s.title, "modality": s.modality.value,
@@ -354,6 +486,9 @@ async def my_sessions(
             "meeting_url": s.meeting_url,
             "status": s.status.value,
             "capacity": s.capacity,
+            # GATE 2 — Lo que faltaba para reutilizar el MISMO botón de entrada.
+            "video_provider": getattr(s, "video_provider", "meet") or "meet",
+            "ends_at_utc": s.ends_at_utc.isoformat() if s.ends_at_utc else None,
         })
     return {"items": out, "filter_period": filter_period}
 
@@ -723,6 +858,21 @@ async def finalize_session(
     if starts and starts > now:
         raise HTTPException(400, "La clase aún no ha empezado")
 
+    # GATE 6G-D — Finalizar es IDEMPOTENTE y seguro ante carreras. El paso a
+    # "completed" es un UPDATE condicional (atómico en la base de datos): solo la
+    # petición que lo consigue audita, revoca tokens y cierra la sala (6E / 6G-B).
+    # Las demás (doble clic, 10 a la vez, repetir más tarde) responden de forma
+    # coherente SIN repetir ese trabajo.
+    from sqlalchemy import update as sa_update
+    gano = (await db.execute(
+        sa_update(ClassSession)
+        .where(ClassSession.id == session_id, ClassSession.status != SessionStatus.completed)
+        .values(status=SessionStatus.completed)
+        .execution_options(synchronize_session=False)
+    )).rowcount == 1
+    if not gano:
+        await db.rollback()
+        return await _finalizar_ya_finalizada(db, session_id)
     session.status = SessionStatus.completed
 
     # ¿Se pasó asistencia? (para el recordatorio del frontend)
@@ -733,8 +883,75 @@ async def finalize_session(
         )
     )).scalar() or 0
 
+    # GATE 0 — Finalizar corta la entrada a la clase: debe quedar constancia
+    # de quién lo hizo y cuándo (created_at lo pone el propio AuditLog).
+    await log_action(db, teacher.user_id, "finalize_session", "teacher",
+                     target_id=session_id,
+                     details=f"attendance_taken={att_count > 0}")
     await db.commit()
-    return {"ok": True, "attendance_taken": att_count > 0, "attendance_count": att_count}
+
+    # GATE 6E — "Finalizar clase para todos": si la clase usa Video Dorismon,
+    # se cierra también la sala de LiveKit (desconecta a quien siga dentro).
+    # Va DESPUÉS de guardar "completed" y la auditoría: si LiveKit falla, la
+    # clase queda finalizada igual (/join y heartbeat la rechazan) y se informa.
+    # Zoom / Meet / Teams / enlace de respaldo: nada cambia ("no_aplica").
+    video_room = "no_aplica"
+    from app.services.audience import tiene_entrada_online
+    from app.services.livekit_service import livekit_ready, delete_room
+    if session.video_provider == "dorismon" and tiene_entrada_online(session) and livekit_ready():
+        # GATE 6H-A — PRIMERO se detiene la grabación (StopEgress explícito, se espera
+        # poco a que LiveKit deje de grabar); después se revocan tokens y se cierra la
+        # sala. Si detenerla falla, la clase se finaliza igual (riesgo documentado).
+        from app.services.grabaciones import detener_para_finalizar
+        await detener_para_finalizar(db, session_id, teacher.user_id)
+        # GATE 6G-B — antes de cerrar la sala se revocan los tokens ya emitidos
+        # (quien pasó por /join queda en VideoPresence) para que no la reabran.
+        from app.services.livekit_service import revocar_tokens_de_la_clase
+        con_token = (await db.execute(
+            select(VideoPresence.user_id).where(VideoPresence.session_id == session_id)
+        )).scalars().all()
+        await revocar_tokens_de_la_clase(session_id, con_token)
+        video_room = await delete_room(session_id)
+    from app.services.limites_video import registrar_cierre
+    registrar_cierre(session_id, video_room)   # GATE 6G-D
+    return {"ok": True, "attendance_taken": att_count > 0, "attendance_count": att_count,
+            "video_room": video_room}
+
+
+async def _finalizar_ya_finalizada(db: AsyncSession, session_id: str) -> dict:
+    """GATE 6G-D — La clase ya estaba finalizada (por otra petición o antes).
+
+    No se vuelve a auditar ni a revocar/cerrar la sala. Única excepción (6E): si el
+    cierre anterior de la sala FALLÓ, una nueva petición explícita lo reintenta, y
+    solo una a la vez. video_room: el resultado del cierre anterior si se conoce
+    ("cerrada", "no_existia", "error"…) o "ya_finalizada" (valor nuevo, aditivo).
+    """
+    from app.services.audience import tiene_entrada_online
+    from app.services.livekit_service import livekit_ready, delete_room, revocar_tokens_de_la_clase
+    from app.services.limites_video import cierre_previo, registrar_cierre, tomar_reintento_cierre, soltar_reintento_cierre
+
+    session = await db.get(ClassSession, session_id)
+    att_count = (await db.execute(
+        select(func.count()).select_from(SessionAttendance).where(
+            SessionAttendance.session_id == session_id,
+            SessionAttendance.state.is_not(None),
+        )
+    )).scalar() or 0
+    previo = cierre_previo(session_id)
+    video_room = previo or "ya_finalizada"
+    if (previo == "error" and session.video_provider == "dorismon" and tiene_entrada_online(session)
+            and livekit_ready() and tomar_reintento_cierre(session_id)):
+        try:
+            con_token = (await db.execute(
+                select(VideoPresence.user_id).where(VideoPresence.session_id == session_id)
+            )).scalars().all()
+            await revocar_tokens_de_la_clase(session_id, con_token)
+            video_room = await delete_room(session_id)
+            registrar_cierre(session_id, video_room)
+        finally:
+            soltar_reintento_cierre(session_id)
+    return {"ok": True, "attendance_taken": att_count > 0, "attendance_count": att_count,
+            "video_room": video_room}
 
 
 @router.get("/assignments")
